@@ -1,7 +1,9 @@
 """
 In-app updater for RAW Review.
 
-* check_latest() asks GitHub for the newest release (read-only, no download).
+* check_latest() asks GitHub for the newest version (read-only, no download):
+  the latest GitHub Release if there is one, otherwise version.py on the
+  main branch (release notes then come from CHANGELOG.md).
 * install() runs ONLY after the user clicks "Install" in the app. It downloads
   the release zip, checks it, backs up the current app files to
   .update_backup/<old version>/, then replaces the app's own files.
@@ -19,6 +21,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.error
 import urllib.request
 import zipfile
 
@@ -27,6 +30,9 @@ from version import GITHUB_REPO, __version__
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 RELEASES_PAGE = f"https://github.com/{GITHUB_REPO}/releases"
+REPO_PAGE = f"https://github.com/{GITHUB_REPO}"
+RAW_MAIN = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/"
+MAIN_ZIP = f"https://github.com/{GITHUB_REPO}/archive/refs/heads/main.zip"
 ALLOWED_EXTS = {".py", ".txt", ".md", ".bat"}
 MAIN_FILE = "raw_review_app.py"
 
@@ -44,8 +50,46 @@ def _open(url: str, timeout: float):
     return urllib.request.urlopen(req, timeout=timeout)
 
 
+def _changelog_section(text: str, version: str) -> str:
+    """The '## v1.2.3' section of CHANGELOG.md for this version."""
+    m = re.search(r"^##\s*v?" + re.escape(version) + r"\b.*?$(.*?)(?=^##\s|\Z)", text or "", re.M | re.S)
+    return m.group(1).strip() if m else ""
+
+
+def _from_main(timeout: float) -> dict:
+    with _open(RAW_MAIN + "version.py", timeout) as r:
+        vtext = r.read().decode("utf-8", "replace")
+    m = re.search(r"__version__\s*=\s*[\'\"]([^\'\"]+)", vtext)
+    if not m:
+        raise RuntimeError("Couldn't read the version on GitHub.")
+    ver = m.group(1)
+    notes = ""
+    try:
+        with _open(RAW_MAIN + "CHANGELOG.md", timeout) as r:
+            notes = _changelog_section(r.read().decode("utf-8", "replace"), ver)
+    except Exception:  # noqa: BLE001 - notes are optional
+        pass
+    return {"version": ver, "tag": "v" + ver, "notes": notes, "url": MAIN_ZIP,
+            "page": REPO_PAGE, "newer": parse_version(ver) > parse_version(__version__)}
+
+
 def check_latest(timeout: float = 15) -> dict:
-    """Return info about the latest GitHub release."""
+    """Newest version on GitHub: a published Release, or the main branch - whichever is newer."""
+    found = []
+    try:
+        found.append(_from_release(timeout))
+    except urllib.error.HTTPError as ex:
+        if ex.code != 404:              # 404 = no release published yet
+            raise
+    try:
+        found.append(_from_main(timeout))
+    except Exception:
+        if not found:
+            raise
+    return max(found, key=lambda c: parse_version(c["version"]))   # ties keep the Release
+
+
+def _from_release(timeout: float) -> dict:
     with _open(API_LATEST, timeout) as r:
         data = json.load(r)
     tag = data.get("tag_name") or ""

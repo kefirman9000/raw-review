@@ -7,7 +7,7 @@ white balance and an automatic straighten. You flip through them, **approve** (`
 **tweak** with sliders, or **reject** (`X`). Approved edits are saved as standard Lightroom
 `.xmp` sidecar files, so Lightroom Classic picks them up as normal, fully editable sliders.
 
-**[⬇ Download the latest release](https://github.com/kefirman9000/raw-review/releases/latest)**
+**[⬇ Download (ZIP)](https://github.com/kefirman9000/raw-review/archive/refs/heads/main.zip)** · [What's new](CHANGELOG.md)
 
 ![Auto white balance on a test scene: as shot under tungsten light (left) vs. auto WB (right)](docs/auto-wb-demo.jpg)
 *Test scene under tungsten light. Left: as shot with daylight WB. Right: RAW Review's auto WB. The blue patch
@@ -39,7 +39,7 @@ that looked grey under orange light comes back blue, and the white and black bec
 ## Install (Windows)
 
 1. Install **Python 3.12** from [python.org](https://www.python.org/downloads/).
-2. Download `RAW_Review-vX.Y.Z.zip` from [Releases](https://github.com/kefirman9000/raw-review/releases/latest) and unzip it.
+2. [Download the ZIP](https://github.com/kefirman9000/raw-review/archive/refs/heads/main.zip) (or *Code → Download ZIP* above) and unzip it.
 3. Double-click **`RAW Review.bat`**. The first run sets up its own environment (a few minutes).
 
 Other systems: `pip install -r requirements.txt`, then `python raw_review_app.py`.
@@ -63,7 +63,7 @@ Other systems: `pip install -r requirements.txt`, then `python raw_review_app.py
 
 ## Updating
 
-Click **Check for Updates** in the toolbar. The app also checks quietly at startup and shows an
+Click **Check for Updates** in the toolbar. It compares your version with the newest one on GitHub (a published Release, or the main branch). The app also checks quietly at startup and shows an
 **⬆ Update** button when a new version is out. Nothing is installed until you click *Install & Restart*.
 The previous version is kept in `.update_backup/`. The updater only replaces the app's own files and
 never looks at your photos.
