@@ -2,11 +2,13 @@
 RAW Review - core logic (no GUI).
 
 Colour science, smart auto white balance, auto straighten, preview rendering
-and Lightroom XMP sidecar writing.
+and Lightroom XMP sidecar writing. (Auto exposure / levels / contrast / colour /
+sharpening / noise reduction live in raw_review_auto.py.)
 
 SAFETY CONTRACT
 ---------------
-* RAW files are only ever OPENED FOR READING (via rawpy/LibRaw).
+* RAW files are only ever OPENED FOR READING (via rawpy/LibRaw). The one
+  exception is DNG, whose XMP packet is replaced (see _write_dng).
 * Nothing in this program writes, moves, renames, re-saves or deletes a RAW
   file. The only files ever written are:
     - <photo name>.xmp            the Lightroom sidecar next to the RAW
@@ -22,12 +24,16 @@ import copy
 import math
 import os
 import shutil
+import struct
 import tempfile
+import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 
 import cv2
 import numpy as np
+
+import dng_profile
 
 # --------------------------------------------------------------------------
 # Settings you may want to adjust after testing ONE photo in Lightroom
@@ -45,12 +51,40 @@ PROCESS_VERSION = "11.0"
 # crs:PerspectiveUpright values (as decoded by the ExifTool project).
 UPRIGHT_MODES = {"Off": 0, "Auto": 1, "Full": 2, "Level": 3, "Vertical": 4}
 
+# Straighten / level modes offered in the app.
+#   "rotate" modes are measured by this app and written as a plain crop angle.
+#   "Upright" modes are written as Lightroom's Upright setting; Lightroom itself
+#   does the maths when it reads the sidecar (so they are not shown in the preview).
+LEVEL_MODES = {
+    "Off":                  {"kind": "off"},
+    "Auto (best guess)":    {"kind": "rotate", "source": "auto"},
+    "Horizon (rotate)":     {"kind": "rotate", "source": "horizon"},
+    "Verticals (rotate)":   {"kind": "rotate", "source": "vertical"},
+    "Upright: Level":       {"kind": "upright", "upright": "Level"},     # horizon only
+    "Upright: Vertical":    {"kind": "upright", "upright": "Vertical"},  # keystone, verticals
+    "Upright: Auto":        {"kind": "upright", "upright": "Auto"},      # balanced
+    "Upright: Full":        {"kind": "upright", "upright": "Full"},      # architecture
+    "Manual":               {"kind": "manual"},                          # slider moved by hand
+}
+
+# Exposure the preview adds on top of the raw data, standing in for the
+# "baseline exposure" + default tone curve Lightroom applies to a raw file.
+# Edit.exposure is the Lightroom Exposure value, so this keeps the preview and
+# the automatic exposure in the same ballpark as Lightroom. If photos come out
+# systematically too bright or dark in Lightroom, use the "Exposure bias" entry
+# in the Auto menu (or change this one number).
+PREVIEW_BASE_EV = 0.5
+
 # Long edge of the working preview, in pixels.
 WORK_LONG_EDGE = 1400
 
-# RAW formats that use .xmp sidecars. DNG is deliberately excluded: Lightroom
-# stores DNG edits inside the DNG itself, and this app never modifies RAWs.
+# Formats this app opens. RAW files get a .xmp sidecar and are never touched.
+# DNG is the exception: Lightroom ignores sidecars for DNG, so an EDITED COPY of the
+# DNG (settings embedded in its XMP packet) is exported to its own folder under its
+# own proper name. The source DNG is never modified.
+DNG_EXPORT_DIR = "RAW Review export"     # created next to the source DNG
 RAW_EXTS = {
+    ".dng",
     ".cr2", ".cr3", ".crw", ".nef", ".nrw", ".arw", ".srf", ".sr2", ".raf",
     ".orf", ".rw2", ".pef", ".srw", ".3fr", ".iiq", ".erf", ".kdc", ".mos",
     ".mrw", ".x3f", ".rwl", ".raw",
@@ -148,25 +182,80 @@ def temp_tint_to_xy(temp: float, tint: float) -> tuple[float, float]:
 
 
 class CameraColor:
-    """Camera colour model built from the camera's Adobe XYZ->camera matrix."""
+    """
+    Camera colour model.
 
-    def __init__(self, cam_xyz, as_shot_mul):
+    Normally built from the camera's Adobe XYZ->camera matrix (LibRaw). For a DNG
+    that carries its own profile, the DNG-spec model in dng_profile.py is used
+    instead (see the "Camera profile (DNG)" menu); that is what makes files whose
+    LibRaw matrix is empty (e.g. Google Pixel) show correct colours.
+    """
+
+    def __init__(self, cam_xyz, as_shot_mul, profile=None):
+        self._dng = None
+        if profile is not None:
+            try:
+                self._dng = dng_profile.DngColorModel(profile, xy_to_temp_tint, temp_tint_to_xy)
+            except Exception:  # noqa: BLE001 - fall back to the LibRaw matrix
+                self._dng = None
+        self.profile = profile
+
         m3 = np.asarray(cam_xyz, dtype=np.float64)[:3, :3]
-        self.valid = bool(np.isfinite(m3).all() and abs(np.linalg.det(m3)) > 1e-9)
-        if self.valid:
+        self._legacy_valid = bool(np.isfinite(m3).all() and abs(np.linalg.det(m3)) > 1e-9)
+        if self._legacy_valid:
             cam_rgb = m3 @ XYZ_FROM_SRGB
             cam_rgb = cam_rgb / cam_rgb.sum(axis=1, keepdims=True)
-            self.rgb_cam = np.linalg.inv(cam_rgb).astype(np.float32)
-            self.xyz_to_cam = m3
-            self.cam_to_xyz = np.linalg.inv(m3)
+            self._legacy_rgb_cam = np.linalg.inv(cam_rgb).astype(np.float32)
+            self._legacy_xyz_to_cam = m3
+            self._legacy_cam_to_xyz = np.linalg.inv(m3)
         else:
-            self.rgb_cam = np.eye(3, dtype=np.float32)
-            self.xyz_to_cam = self.cam_to_xyz = None
+            self._legacy_rgb_cam = np.eye(3, dtype=np.float32)
+            self._legacy_xyz_to_cam = self._legacy_cam_to_xyz = None
 
         m = np.asarray(as_shot_mul, dtype=np.float64)[:3]
         if not (np.isfinite(m).all() and (m > 0).all()):
-            m = self.temp_tint_to_mul(5500, 0) if self.valid else np.array([2.0, 1.0, 1.5])
+            if self._dng is not None and self._dng.as_shot_mul is not None:
+                m = self._dng.as_shot_mul.copy()
+            elif self.valid:
+                m = self.temp_tint_to_mul(5500, 0)
+            else:
+                m = np.array([2.0, 1.0, 1.5])
         self.as_shot_mul = m / m[1]
+
+    # -- which model is in charge right now
+    @property
+    def model(self):
+        """The DNG-spec colour model, or None when the LibRaw matrix is used."""
+        return self._dng if (self._dng is not None and dng_profile.OPTIONS.use_profile) else None
+
+    @property
+    def valid(self) -> bool:
+        return True if self.model is not None else self._legacy_valid
+
+    @property
+    def rgb_cam(self):
+        return self._legacy_rgb_cam
+
+    @property
+    def base_ev(self) -> float:
+        """Exposure the preview adds on top of the raw data (stand-in for Lightroom's baseline)."""
+        m = self.model
+        if m is not None and m.base_ev is not None:
+            return float(m.base_ev)
+        return PREVIEW_BASE_EV
+
+    @property
+    def base_contrast(self) -> float:
+        """The preview's own gentle S-curve; reduced when the profile's tone curve is applied."""
+        m = self.model
+        return 0.15 * (m.base_contrast_factor if m is not None else 1.0)
+
+    def cam_to_srgb(self, mul) -> np.ndarray:
+        """3x3 taking (camera RGB * mul) to linear sRGB (plain colorimetric, no profile look)."""
+        m = self.model
+        if m is not None:
+            return m.cam_to_srgb(mul)
+        return self._legacy_rgb_cam
 
     @staticmethod
     def neutral_to_mul(neutral) -> np.ndarray:
@@ -175,18 +264,24 @@ class CameraColor:
         return m / m[1]
 
     def mul_to_temp_tint(self, mul) -> tuple[float, float]:
-        if not self.valid:
+        m = self.model
+        if m is not None:
+            return m.mul_to_temp_tint(mul)
+        if not self._legacy_valid:
             return 5500.0, 0.0
-        xyz = self.cam_to_xyz @ (1.0 / np.asarray(mul, dtype=np.float64))
+        xyz = self._legacy_cam_to_xyz @ (1.0 / np.asarray(mul, dtype=np.float64))
         s = xyz.sum()
         return xy_to_temp_tint(xyz[0] / s, xyz[1] / s)
 
     def temp_tint_to_mul(self, temp, tint) -> np.ndarray:
-        if not self.valid:
+        m = self.model
+        if m is not None:
+            return m.temp_tint_to_mul(temp, tint)
+        if not self._legacy_valid:
             return self.as_shot_mul.copy()
         x, y = temp_tint_to_xy(float(temp), float(tint))
         xyz = np.array([x / y, 1.0, (1.0 - x - y) / y])
-        return self.neutral_to_mul(self.xyz_to_cam @ xyz)
+        return self.neutral_to_mul(self._legacy_xyz_to_cam @ xyz)
 
     @property
     def as_shot_temp_tint(self) -> tuple[float, float]:
@@ -198,11 +293,21 @@ class CameraColor:
 # --------------------------------------------------------------------------
 
 @dataclass
+class ImageQuality:
+    """Noise and softness measured on the decoded image before it is shrunk."""
+    noise_luma: float = 0.0      # luminance noise, std-dev in 0..1 display units
+    noise_chroma: float = 0.0    # colour (R-G, B-G) noise, same units
+    sharp_ratio: float = 0.0     # edge-acuity ratio: ~3 crisp, ~1.5 very soft (0 = unknown)
+    measured: bool = False
+
+
+@dataclass
 class Decoded:
     cam: np.ndarray          # HxWx3 float32, linear camera RGB, NOT white balanced, 0..1
     color: CameraColor
-    baseline: float          # display brightness normalisation for the preview
+    baseline: float          # brightness normalisation used by auto white balance
     source_size: tuple       # (w, h) of the decoded half-size image
+    quality: ImageQuality = field(default_factory=ImageQuality)
 
 
 def decode_raw(path: str) -> Decoded:
@@ -214,6 +319,7 @@ def decode_raw(path: str) -> Decoded:
         output_color=rawpy.ColorSpace.raw, gamma=(1, 1),
         no_auto_bright=True, output_bps=16,
     )
+    profile = dng_profile.read_dng_profile(path) if path.lower().endswith(".dng") else None  # read-only
     with rawpy.imread(path) as raw:          # LibRaw opens the file read-only
         try:
             rgb = raw.postprocess(half_size=True, **kwargs)
@@ -222,27 +328,120 @@ def decode_raw(path: str) -> Decoded:
         cam_xyz = np.array(raw.rgb_xyz_matrix, dtype=np.float64)
         as_shot = np.array(raw.camera_whitebalance, dtype=np.float64)
 
-    return make_decoded(rgb.astype(np.float32) / 65535.0, cam_xyz, as_shot)
+    return make_decoded(rgb.astype(np.float32) / 65535.0, cam_xyz, as_shot, profile)
 
 
-def make_decoded(cam_full: np.ndarray, cam_xyz, as_shot_mul) -> Decoded:
+def _apply_lens_shading(cam_full: np.ndarray, profile) -> np.ndarray:
+    """
+    Flat-field the DNG's lens shading (OpcodeList2 GainMap). Pixel's wide-angle lenses lose
+    a few stops in the corners, and Google's own rendering corrects that. Done on the
+    linear camera data, before anything is measured. Returns cam_full unchanged when the
+    file has no shading maps.
+    """
+    if profile is None or not dng_profile.APPLY_DNG_LENS_SHADING:
+        return cam_full
+    try:
+        gain = profile.lens_shading_gain(*cam_full.shape[:2])
+    except Exception:  # noqa: BLE001 - shading is a nicety; never block loading
+        return cam_full
+    if gain is None:
+        return cam_full
+    return np.minimum(cam_full * gain, 1.0).astype(np.float32)
+
+
+def make_decoded(cam_full: np.ndarray, cam_xyz, as_shot_mul, profile=None) -> Decoded:
     h, w = cam_full.shape[:2]
+    cam_full = _apply_lens_shading(cam_full, profile)
     s = WORK_LONG_EDGE / max(h, w)
     cam = cam_full
     if s < 1.0:
         cam = cv2.resize(cam_full, (max(1, round(w * s)), max(1, round(h * s))),
                          interpolation=cv2.INTER_AREA)
     cam = np.ascontiguousarray(cam, dtype=np.float32)
-    color = CameraColor(cam_xyz, as_shot_mul)
+    color = CameraColor(cam_xyz, as_shot_mul, profile)
     lin = _cam_to_linear_srgb(cam, color.as_shot_mul, color)
     y = lin @ LUMA
     p = float(np.percentile(y, 99.0)) if y.size else 1.0
     baseline = float(np.clip(0.85 / max(p, 1e-6), 1.0, 6.0))
-    return Decoded(cam=cam, color=color, baseline=baseline, source_size=(w, h))
+    try:
+        quality = measure_quality(cam_full, color, baseline)
+    except Exception:  # noqa: BLE001 - quality stats are optional, never block loading
+        quality = ImageQuality()
+    return Decoded(cam=cam, color=color, baseline=baseline, source_size=(w, h), quality=quality)
+
+
+def _grad_mag(a: np.ndarray) -> np.ndarray:
+    gx = np.zeros_like(a)
+    gy = np.zeros_like(a)
+    gx[:, 1:-1] = (a[:, 2:] - a[:, :-2]) * 0.5
+    gy[1:-1, :] = (a[2:, :] - a[:-2, :]) * 0.5
+    return np.hypot(gx, gy)
+
+
+def measure_quality(cam_full: np.ndarray, color: CameraColor, baseline: float) -> ImageQuality:
+    """
+    Estimate noise and softness from the full-resolution decode (the 1400px
+    working copy has the noise averaged away, so it can't be measured there).
+
+    Noise: high-pass residual in the flattest mid-tone 8x8 blocks.
+    Softness: how much a strong edge's gradient shrinks between a fine and a
+    coarse blur. For a crisp edge that ratio is ~3.6 (the sigma ratio); the
+    softer the edge, the closer it gets to 1.
+    Measured in display (gamma) units after the same brightness normalisation
+    as the preview, so an underexposed photo that will need lifting reports
+    the noise you would actually see.
+    """
+    H, W = cam_full.shape[:2]
+    cam = cam_full
+    if H * W > 4_000_000:                       # centre crop keeps this quick on big sensors
+        k = math.sqrt(4_000_000 / (H * W))
+        ch, cw = int(H * k), int(W * k)
+        y0, x0 = (H - ch) // 2, (W - cw) // 2
+        cam = cam_full[y0:y0 + ch, x0:x0 + cw]
+    lin = _cam_to_linear_srgb(cam, color.as_shot_mul, color) * np.float32(baseline)
+    g = _srgb_encode(lin).astype(np.float32)
+    Y = np.ascontiguousarray(g @ LUMA, dtype=np.float32)
+    H, W = Y.shape
+    B = 8
+    h8, w8 = (H // B) * B, (W // B) * B
+    if h8 < 64 or w8 < 64:
+        return ImageQuality()
+
+    def blocks(a):
+        return a[:h8, :w8].reshape(h8 // B, B, w8 // B, B)
+
+    # ---- noise -------------------------------------------------------
+    hp = Y - cv2.GaussianBlur(Y, (0, 0), 1.0)
+    lp = cv2.GaussianBlur(Y, (0, 0), 2.0)
+    structure = blocks(_grad_mag(lp)).mean(axis=(1, 3))
+    mean_y = blocks(Y).mean(axis=(1, 3))
+    var_l = blocks(hp).var(axis=(1, 3))
+    ok = (mean_y > 0.12) & (mean_y < 0.85)
+    if ok.sum() < 40:
+        ok = np.ones_like(ok)
+    cand = np.flatnonzero(ok.ravel())
+    order = cand[np.argsort(structure.ravel()[cand])]
+    pick = order[:max(30, int(0.15 * len(order)))]
+    # a Gaussian(1.0) high-pass keeps ~0.87 of white-noise std-dev
+    noise_l = float(np.sqrt(np.median(var_l.ravel()[pick]))) / 0.87
+    c1, c2 = g[..., 0] - g[..., 1], g[..., 2] - g[..., 1]
+    v1 = blocks(c1 - cv2.GaussianBlur(c1, (0, 0), 1.0)).var(axis=(1, 3))
+    v2 = blocks(c2 - cv2.GaussianBlur(c2, (0, 0), 1.0)).var(axis=(1, 3))
+    noise_c = float(np.sqrt(np.median(((v1 + v2) * 0.5).ravel()[pick]))) / 0.87
+
+    # ---- softness ----------------------------------------------------
+    g1 = _grad_mag(cv2.GaussianBlur(Y, (0, 0), 0.7))
+    g2 = _grad_mag(cv2.GaussianBlur(Y, (0, 0), 2.5))
+    strong = g2 >= np.percentile(g2, 98.0)
+    if strong.sum() < 50 or float(np.median(g2[strong])) < 0.01:
+        ratio = 0.0                              # no real edges: can't tell
+    else:
+        ratio = float(np.median(g1[strong]) / np.median(g2[strong]))
+    return ImageQuality(noise_l, noise_c, ratio, True)
 
 
 def _cam_to_linear_srgb(cam, mul, color) -> np.ndarray:
-    lin = (cam * np.asarray(mul, dtype=np.float32)) @ color.rgb_cam.T
+    lin = (cam * np.asarray(mul, dtype=np.float32)) @ np.asarray(color.cam_to_srgb(mul), dtype=np.float32).T
     return np.maximum(lin, 0.0)
 
 
@@ -260,13 +459,103 @@ class Edit:
     highlights: int = 0
     shadows: int = 0
     vibrance: int = 0
+    whites: int = 0              # -100..100  (white point)
+    blacks: int = 0              # -100..100  (black point)
+    saturation: int = 0
+    sharp_amount: int = 40       # 0..150
+    sharp_radius: float = 1.0    # 0.5..3.0
+    sharp_detail: int = 25       # 0..100
+    sharp_masking: int = 0       # 0..100
+    nr_luma: int = 0             # 0..100
+    nr_luma_detail: int = 50     # 0..100
+    nr_color: int = 25           # 0..100
     angle: float = 0.0           # degrees, + = counter-clockwise
     upright: str = "Off"         # key of UPRIGHT_MODES
+    level_mode: str = "Off"      # key of LEVEL_MODES
     lens_profile: bool = True
+    # Optional settings (whites, blacks, saturation, sharpening, noise) are only
+    # written to the sidecar once they have been set, so an existing sidecar's
+    # values are left alone until you or an auto tool touch them.
+    touched: set = field(default_factory=set)
     notes: list = field(default_factory=list)
 
     def copy(self) -> "Edit":
         return copy.deepcopy(self)
+
+
+@dataclass(frozen=True)
+class Setting:
+    key: str          # Edit attribute
+    label: str
+    lo: float
+    hi: float
+    step: float
+    decimals: int
+    default: float
+    integer: bool = True
+    optional: bool = False     # only written once touched (see Edit.touched)
+
+
+# Every numeric slider, in display order. The UI and the batch editor are both
+# built from this table.
+SETTINGS = {s.key: s for s in [
+    Setting("temp", "Temperature (K)", 2000, 50000, 50, 0, 5500, False),
+    Setting("tint", "Tint", -150, 150, 1, 0, 0, False),
+    Setting("exposure", "Exposure (EV)", -5, 5, 0.05, 2, 0, False),
+    Setting("contrast", "Contrast", -100, 100, 1, 0, 0),
+    Setting("highlights", "Highlights", -100, 100, 1, 0, 0),
+    Setting("shadows", "Shadows", -100, 100, 1, 0, 0),
+    Setting("whites", "Whites", -100, 100, 1, 0, 0, True, True),
+    Setting("blacks", "Blacks", -100, 100, 1, 0, 0, True, True),
+    Setting("vibrance", "Vibrance", -100, 100, 1, 0, 0),
+    Setting("saturation", "Saturation", -100, 100, 1, 0, 0, True, True),
+    Setting("sharp_amount", "Amount", 0, 150, 1, 0, 40, True, True),
+    Setting("sharp_radius", "Radius", 0.5, 3.0, 0.1, 1, 1.0, False, True),
+    Setting("sharp_detail", "Detail", 0, 100, 1, 0, 25, True, True),
+    Setting("sharp_masking", "Masking", 0, 100, 1, 0, 0, True, True),
+    Setting("nr_luma", "Luminance", 0, 100, 1, 0, 0, True, True),
+    Setting("nr_luma_detail", "Luminance detail", 0, 100, 1, 0, 50, True, True),
+    Setting("nr_color", "Color", 0, 100, 1, 0, 25, True, True),
+    Setting("angle", "Straighten (°, + = counter-clockwise)", -15, 15, 0.05, 2, 0, False),
+]}
+
+# Friendly names used in the batch editor (the slider labels above are short
+# because they sit under a group heading).
+SETTING_NAMES = {
+    "sharp_amount": "Sharpening amount", "sharp_radius": "Sharpening radius",
+    "sharp_detail": "Sharpening detail", "sharp_masking": "Sharpening masking",
+    "nr_luma": "Noise reduction: luminance", "nr_luma_detail": "Noise reduction: luminance detail",
+    "nr_color": "Noise reduction: color", "angle": "Straighten angle",
+}
+
+
+def setting_name(key: str) -> str:
+    return SETTING_NAMES.get(key) or SETTINGS[key].label
+
+
+def change_setting(edit: Edit, key: str, action: str, amount: float = 0.0):
+    """Increase / decrease / set / reset one setting, clamped to its range."""
+    s = SETTINGS[key]
+    cur = float(getattr(edit, key))
+    if action == "increase":
+        val = cur + abs(amount)
+    elif action == "decrease":
+        val = cur - abs(amount)
+    elif action == "set":
+        val = amount
+    elif action == "reset":
+        val = s.default
+    else:
+        raise ValueError(action)
+    val = min(max(val, s.lo), s.hi)
+    val = int(round(val)) if s.integer else round(val, s.decimals)
+    setattr(edit, key, val)
+    if s.optional:
+        edit.touched.add(key)
+    if key in ("temp", "tint"):
+        edit.wb_mode = "custom"
+    if key == "angle":
+        edit.level_mode = "Manual"
 
 
 def as_shot_edit(dec: Decoded) -> Edit:
@@ -327,6 +616,54 @@ def _srgb_encode(x):
                     1.055 * np.power(np.maximum(x, 0.0031308), 1 / 2.4) - 0.055)
 
 
+def base_gamma(cam: np.ndarray, color: CameraColor, mul, exposure: float) -> np.ndarray:
+    """White balance + exposure + highlight shoulder + sRGB curve (no tone sliders)."""
+    model = color.model
+    if model is not None:
+        # DNG with its own profile: colour matrices + hue/sat map + look + tone curve
+        lin = model.render_linear(cam, mul, exposure, color.base_ev)
+    else:
+        lin = _cam_to_linear_srgb(cam, mul, color)
+        lin *= np.float32(2.0 ** (exposure + PREVIEW_BASE_EV))
+        knee = 0.8                                   # soft highlight shoulder
+        lin = np.where(lin < knee, lin, knee + (1 - knee) * np.tanh((lin - knee) / (1 - knee)))
+    return _srgb_encode(lin).astype(np.float32)
+
+
+def apply_tone(g: np.ndarray, e: Edit, stop: str | None = None, base_c: float = 0.15) -> np.ndarray:
+    """
+    Tone sliders, in order: "levels" (whites/blacks) -> "shhi" (shadows/highlights)
+    -> "contrast". `stop` ends after that stage (used by the auto tools to
+    measure the image at each step); None applies everything.
+    """
+    L = np.clip(g @ LUMA, 1e-4, 1.0)
+    L1 = L
+    lo = -0.15 * e.blacks / 100.0                # blacks +: lift, -: crush
+    hi = 1.0 - 0.30 * e.whites / 100.0           # whites +: brighten, -: pull down
+    if lo != 0.0 or hi != 1.0:
+        L1 = np.clip((L1 - lo) / max(hi - lo, 0.2), 0, 1)
+    if stop != "levels":
+        ms = 6.75 * L1 * (1 - L1) ** 2           # shadow mask, peaks at L=1/3
+        mh = 6.75 * L1 ** 2 * (1 - L1)           # highlight mask, peaks at L=2/3
+        L1 = np.clip(L1 + 0.25 * (e.shadows / 100.0 * ms + e.highlights / 100.0 * mh), 0, 1)
+        if stop != "shhi":
+            c = base_c + e.contrast / 100.0      # small base S-curve, like a raw default
+            S = L1 * L1 * (3 - 2 * L1)
+            L1 = np.clip(L1 + c * (S - L1), 0, 1)
+    return g * (L1 / L)[..., None]
+
+
+def apply_colour(g: np.ndarray, e: Edit) -> np.ndarray:
+    if e.vibrance:
+        mean = g.mean(axis=2, keepdims=True)
+        sat = (g.max(axis=2) - g.min(axis=2))[..., None]
+        g = mean + (g - mean) * (1 + e.vibrance / 100.0 * (1 - np.clip(sat, 0, 1)))
+    if e.saturation:
+        mean = g.mean(axis=2, keepdims=True)
+        g = mean + (g - mean) * (1 + e.saturation / 100.0)
+    return g
+
+
 def render(dec: Decoded, edit: Edit, original: bool = False, rotate: bool = True):
     """Return (uint8 RGB image, Geometry). original=True shows the as-shot file."""
     color = dec.color
@@ -335,31 +672,10 @@ def render(dec: Decoded, edit: Edit, original: bool = False, rotate: bool = True
     else:
         mul = color.temp_tint_to_mul(edit.temp, edit.tint)
 
-    lin = _cam_to_linear_srgb(dec.cam, mul, color)
-    ev = 0.0 if original else edit.exposure
-    lin *= np.float32(dec.baseline * (2.0 ** ev))
-
-    knee = 0.8                                   # soft highlight shoulder
-    lin = np.where(lin < knee, lin, knee + (1 - knee) * np.tanh((lin - knee) / (1 - knee)))
-    g = _srgb_encode(lin).astype(np.float32)
-
-    if original:
-        e = Edit()
-    else:
-        e = edit
-    L = np.clip(g @ LUMA, 1e-4, 1.0)
-    ms = 6.75 * L * (1 - L) ** 2                 # shadow mask, peaks at L=1/3
-    mh = 6.75 * L ** 2 * (1 - L)                 # highlight mask, peaks at L=2/3
-    L1 = np.clip(L + 0.25 * (e.shadows / 100.0 * ms + e.highlights / 100.0 * mh), 0, 1)
-    c = 0.15 + e.contrast / 100.0                # small base S-curve, like a raw default
-    S = L1 * L1 * (3 - 2 * L1)
-    L2 = np.clip(L1 + c * (S - L1), 0, 1)
-    g = g * (L2 / L)[..., None]
-
-    if e.vibrance:
-        mean = g.mean(axis=2, keepdims=True)
-        sat = (g.max(axis=2) - g.min(axis=2))[..., None]
-        g = mean + (g - mean) * (1 + e.vibrance / 100.0 * (1 - np.clip(sat, 0, 1)))
+    g = base_gamma(dec.cam, color, mul, 0.0 if original else edit.exposure)
+    e = Edit() if original else edit
+    g = apply_tone(g, e, None, color.base_contrast)
+    g = apply_colour(g, e)
 
     img = (np.clip(g, 0, 1) * 255 + 0.5).astype(np.uint8)
     if rotate and not original:
@@ -579,12 +895,17 @@ def _weighted_median(vals, wts):
     return float(v[np.searchsorted(c, c[-1] / 2.0)])
 
 
-def auto_straighten(rgb: np.ndarray, allow_upright: bool = True) -> StraightenResult:
+def auto_straighten(rgb: np.ndarray, allow_upright: bool = True,
+                    source: str = "auto") -> StraightenResult:
     """
     Detect straight lines; near-vertical ones (buildings, door frames, poles)
     are trusted most, near-horizontal ones (horizons) are the fallback.
     If verticals converge strongly (camera tilted up at a building), suggest
     Lightroom's Upright 'Vertical' instead of a plain rotation.
+
+    source = "auto"      best guess from both kinds of line (default)
+             "horizon"   use ONLY near-horizontal lines (horizon, sea, shelves)
+             "vertical"  use ONLY near-vertical lines (walls, poles, door frames)
     Angle convention: + = rotate counter-clockwise.
     """
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
@@ -626,7 +947,7 @@ def auto_straighten(rgb: np.ndarray, allow_upright: bool = True) -> StraightenRe
         return StraightenResult(0.0, "Off", 0.0, "Straighten: no near-level lines found")
 
     # Keystone check (verticals converging toward the top).
-    if allow_upright and len(verts) >= 4:
+    if source == "auto" and allow_upright and len(verts) >= 4:
         left = [v for v in verts if v[2] < 0.45]
         right = [v for v in verts if v[2] > 0.55]
         if len(left) >= 2 and len(right) >= 2:
@@ -639,21 +960,28 @@ def auto_straighten(rgb: np.ndarray, allow_upright: bool = True) -> StraightenRe
                     f"Straighten: verticals converge {converge:.1f}° -> Upright Vertical "
                     "(Lightroom computes the correction)")
 
-    if len(verts) >= 2 and vw >= 0.35 * (vw + hw):
+    if source == "vertical":
+        cands = [(v[0], v[1]) for v in verts]
+        src = "vertical"
+    elif source == "horizon":
+        cands = [(-h_[0], h_[1]) for h_ in horiz]
+        src = "horizontal"
+    elif len(verts) >= 2 and vw >= 0.35 * (vw + hw):
         cands = [(v[0], v[1]) for v in verts]
         src = "vertical"
     else:
         cands = [(-h_[0], h_[1]) for h_ in horiz]
         src = "horizontal"
-    if not cands:
-        return StraightenResult(0.0, "Off", 0.0, "Straighten: not enough lines")
+    if len(cands) < (2 if source != "auto" else 1):
+        what = {"vertical": "vertical", "horizon": "horizon-like"}.get(source, "")
+        return StraightenResult(0.0, "Off", 0.0, f"Straighten: not enough {what} lines".replace("  ", " "))
 
     vals = np.array([c[0] for c in cands])
     wts = np.array([c[1] for c in cands])
     angle = _weighted_median(vals, wts)
     conf = float(wts[np.abs(vals - angle) <= 1.0].sum() / wts.sum())
 
-    if abs(angle) > 12:
+    if abs(angle) > (12 if source == "auto" else 15):
         return StraightenResult(0.0, "Off", conf,
                                 f"Straighten: {angle:.1f}° looks intentional, left alone")
     if abs(angle) < 0.15 or conf < 0.25:
@@ -662,26 +990,6 @@ def auto_straighten(rgb: np.ndarray, allow_upright: bool = True) -> StraightenRe
     return StraightenResult(angle, "Off", conf,
                             f"Straighten: {angle:+.2f}° from {len(cands)} {src} lines "
                             f"(confidence {conf:.0%})")
-
-
-# --------------------------------------------------------------------------
-# One-shot proposal
-# --------------------------------------------------------------------------
-
-def propose_edit(dec: Decoded, auto_wb=True, straighten=True, allow_upright=True):
-    edit = as_shot_edit(dec)
-    wb = st = None
-    if auto_wb:
-        wb = auto_white_balance(dec)
-        if wb.applied:
-            edit.wb_mode, edit.temp, edit.tint = "custom", round(wb.temp), round(wb.tint)
-        edit.notes.append(wb.note)
-    if straighten:
-        img, _ = render(dec, edit, rotate=False)
-        st = auto_straighten(img, allow_upright)
-        edit.angle, edit.upright = st.angle, st.upright
-        edit.notes.append(st.note)
-    return edit, wb, st
 
 
 # --------------------------------------------------------------------------
@@ -733,6 +1041,22 @@ def crs_values(edit: Edit):
         "AutoLateralCA": "1" if edit.lens_profile else "0",
         "PerspectiveUpright": str(UPRIGHT_MODES.get(edit.upright, 0)),
     }
+    t = edit.touched
+    if "whites" in t:
+        v["Whites2012"] = f"{int(round(edit.whites)):+d}"
+    if "blacks" in t:
+        v["Blacks2012"] = f"{int(round(edit.blacks)):+d}"
+    if "saturation" in t:
+        v["Saturation"] = f"{int(round(edit.saturation)):+d}"
+    if t & {"sharp_amount", "sharp_radius", "sharp_detail", "sharp_masking"}:
+        v["Sharpness"] = str(int(round(edit.sharp_amount)))
+        v["SharpenRadius"] = f"{edit.sharp_radius:+.1f}"
+        v["SharpenDetail"] = str(int(round(edit.sharp_detail)))
+        v["SharpenEdgeMasking"] = str(int(round(edit.sharp_masking)))
+    if t & {"nr_luma", "nr_luma_detail", "nr_color"}:
+        v["LuminanceSmoothing"] = str(int(round(edit.nr_luma)))
+        v["LuminanceNoiseReductionDetail"] = str(int(round(edit.nr_luma_detail)))
+        v["ColorNoiseReduction"] = str(int(round(edit.nr_color)))
     remove = []
     if edit.wb_mode == "custom":
         v["WhiteBalance"] = "Custom"
@@ -795,7 +1119,7 @@ def _remove(desc, key):
         desc.remove(child)
 
 
-def write_xmp(raw_path: str, edit: Edit, src_size=(3, 2)) -> str:
+def _write_sidecar(raw_path: str, edit: Edit, src_size=(3, 2)) -> str:
     """
     Write/update the Lightroom sidecar for raw_path. The RAW itself is never
     opened for writing; its size and timestamp are verified unchanged.
@@ -875,6 +1199,145 @@ def write_xmp(raw_path: str, edit: Edit, src_size=(3, 2)) -> str:
     if raw_fingerprint(raw_path) != before:
         raise RawSafetyError(f"{raw_path} changed while its sidecar was written - stopping.")
     return f"{'Updated' if existed else 'Wrote'} {os.path.basename(target)}{backup_msg}"
+
+
+# --------------------------------------------------------------------------
+# DNG: settings go INSIDE the DNG (Lightroom ignores sidecars for DNG)
+# --------------------------------------------------------------------------
+
+_XMP_TAG = 700
+
+
+def _tiff_layout(data: bytes):
+    if data[:2] == b"II":
+        e = "<"
+    elif data[:2] == b"MM":
+        e = ">"
+    else:
+        raise RawSafetyError("This DNG isn't a TIFF-based file, so it can't be updated safely.")
+    if struct.unpack(e + "H", data[2:4])[0] != 42:
+        raise RawSafetyError("This DNG uses the BigTIFF layout, which isn't supported. Nothing was changed.")
+    ifd0 = struct.unpack(e + "I", data[4:8])[0]
+    n = struct.unpack(e + "H", data[ifd0:ifd0 + 2])[0]
+    return e, ifd0, n
+
+
+def _extract_tiff_xmp(data: bytes):
+    """The XMP packet stored in IFD0 (tag 700), or None."""
+    e, ifd0, n = _tiff_layout(data)
+    for i in range(n):
+        pos = ifd0 + 2 + 12 * i
+        tag, _typ, count, off = struct.unpack(e + "HHII", data[pos:pos + 12])
+        if tag == _XMP_TAG:
+            return bytes(data[off:off + count]).rstrip(b"\x00 \r\n\t") if count > 4 else None
+    return None
+
+
+def _embed_xmp_in_tiff(data: bytes, xmp: bytes) -> bytes:
+    """
+    Return a copy of the TIFF/DNG with `xmp` as its XMP packet. The image data is not
+    touched: the new packet is appended at the end and only the 12-byte directory entry
+    (or, if there was none, a copy of the directory) is changed.
+    """
+    e, ifd0, n = _tiff_layout(data)
+    out = bytearray(data)
+    if len(out) % 2:
+        out.append(0)
+    xmp_off = len(out)
+    out += xmp
+    if len(out) % 2:
+        out.append(0)
+    entry = struct.pack(e + "HHII", _XMP_TAG, 1, len(xmp), xmp_off)
+    base = ifd0 + 2
+    for i in range(n):
+        pos = base + 12 * i
+        if struct.unpack(e + "H", data[pos:pos + 2])[0] == _XMP_TAG:
+            out[pos:pos + 12] = entry
+            return bytes(out)
+    entries = [bytes(data[base + 12 * i: base + 12 * i + 12]) for i in range(n)] + [entry]
+    entries.sort(key=lambda b: struct.unpack(e + "H", b[:2])[0])
+    next_ifd = bytes(data[base + 12 * n: base + 12 * n + 4])
+    new_ifd = len(out)
+    out += struct.pack(e + "H", n + 1) + b"".join(entries) + next_ifd
+    out[4:8] = struct.pack(e + "I", new_ifd)
+    return bytes(out)
+
+
+def _write_dng(dng_path: str, edit: Edit, src_size=(3, 2), out_dir: str | None = None) -> str:
+    """
+    Export an edited COPY of the DNG for Lightroom: <out_dir>/<name>.dng, with the develop
+    settings embedded in its XMP packet. The source DNG is only read, never changed, and
+    no .original / backup files are made. The output name is built here from the source's
+    base name plus a plain ".dng" extension; nothing is inherited from existing files.
+    Default out_dir is a "RAW Review export" folder next to the source.
+    """
+    src = os.path.abspath(dng_path)
+    if not os.path.isfile(src):
+        raise FileNotFoundError(dng_path)
+    before = raw_fingerprint(src)
+    stem = os.path.splitext(os.path.basename(src))[0]
+    out_dir = os.path.abspath(out_dir or os.path.join(os.path.dirname(src), DNG_EXPORT_DIR))
+    target = os.path.join(out_dir, stem + ".dng")
+    if os.path.normcase(target) == os.path.normcase(src):
+        raise RawSafetyError("The export folder is the source folder; refusing to overwrite the original DNG.")
+    os.makedirs(out_dir, exist_ok=True)
+
+    with open(src, "rb") as f:
+        data = f.read()
+    existing = _extract_tiff_xmp(data)         # only used to keep ratings / keywords; unreadable XMP is replaced
+
+    with tempfile.TemporaryDirectory(prefix="rawreview-") as td:
+        fake = os.path.join(td, "x.dng")                 # lets the normal sidecar merge logic run
+        open(fake, "wb").close()
+        side = os.path.join(td, "x.xmp")
+        if existing:
+            with open(side, "wb") as f:
+                f.write(existing)
+        _write_sidecar(fake, edit, src_size)
+        with open(side, "rb") as f:
+            body = f.read().decode("utf-8")
+    packet = ('<?xpacket begin="\ufeff" id="W5M0MpCehiHzreSzNTczkc9d"?>\n' + body
+              + '\n<?xpacket end="w"?>').encode("utf-8")
+    new = _embed_xmp_in_tiff(data, packet)
+    if _extract_tiff_xmp(new) != packet.rstrip(b"\x00 \r\n\t"):
+        raise RawSafetyError("Couldn't verify the new settings inside the DNG. Nothing was exported.")
+
+    fd, tmp = tempfile.mkstemp(prefix=".rawreview-", suffix=".dng.tmp", dir=out_dir)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(new)
+        try:                                              # the result must still open as a raw file
+            import rawpy
+            with rawpy.imread(tmp):
+                pass
+        except ImportError:
+            pass
+        except Exception as ex:  # noqa: BLE001
+            raise RawSafetyError(f"The exported DNG didn't open cleanly ({ex}). Nothing was exported.")
+        last = None
+        for _ in range(5):                                # Windows: Lightroom/Explorer may briefly lock the target
+            try:
+                os.replace(tmp, target)
+                last = None
+                break
+            except PermissionError as ex:
+                last = ex
+                time.sleep(0.4)
+        if last is not None:
+            raise RawSafetyError(f"Couldn't write {target} (is it open in another program?): {last}")
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)                                # only ever our own .dng.tmp file
+    if raw_fingerprint(src) != before:
+        raise RawSafetyError(f"{src} changed during export - stopping.")
+    return f"Exported {stem}.dng to {out_dir} (import this folder into Lightroom)"
+
+
+def write_xmp(raw_path: str, edit: Edit, src_size=(3, 2), out_dir: str | None = None) -> str:
+    """Write the Lightroom settings: a .xmp sidecar for RAW files, an exported edited .dng copy for DNG."""
+    if os.path.splitext(raw_path)[1].lower() == ".dng":
+        return _write_dng(raw_path, edit, src_size, out_dir)
+    return _write_sidecar(raw_path, edit, src_size)
 
 
 def is_raw(path: str) -> bool:

@@ -2,12 +2,12 @@
 
 **Batch auto-edit RAW photos, review each one, and send the approved edits to Lightroom without ever touching the RAW files.**
 
-RAW Review analyzes every photo you drop into it and proposes an edit: a smart automatic
-white balance and an automatic straighten. You flip through them, **approve** (`A`),
+RAW Review analyzes every photo you drop into it and proposes an edit: white balance, straighten,
+exposure, levels, contrast, colour, sharpening and noise reduction. You flip through them, **approve** (`A`),
 **tweak** with sliders, or **reject** (`X`). Approved edits are saved as standard Lightroom
 `.xmp` sidecar files, so Lightroom Classic picks them up as normal, fully editable sliders.
 
-**[⬇ Download (ZIP)](https://github.com/kefirman9000/raw-review/archive/refs/heads/main.zip)** · [What's new](CHANGELOG.md)
+**[⬇ Download the latest release](https://github.com/kefirman9000/raw-review/releases/latest)** · [ZIP of main](https://github.com/kefirman9000/raw-review/archive/refs/heads/main.zip) · [What's new](CHANGELOG.md)
 
 ![RAW Review interface: photo list with review status, preview, and white balance, tone and geometry controls](docs/app.png)
 
@@ -25,11 +25,16 @@ Space Station (public domain). A tungsten-light cast was simulated, then removed
   - Rejects physically implausible light, so a blue shirt under tungsten won't fool it.
   - Low-confidence results are flagged **"check WB"**, and you can show exactly which spots it used.
 - **Eyedropper** WB: click anything that should be white, grey or black.
-- **Auto straighten** from verticals (buildings, door frames) or the horizon. When verticals converge strongly, it sets Lightroom's **Upright: Vertical** instead.
-- **Sliders:** Temperature, Tint, Exposure, Contrast, Highlights, Shadows, Vibrance, Straighten, Upright mode, and lens profile corrections.
+- **Straighten modes:** Off · Auto (best guess) · Horizon (rotate) · Verticals (rotate) · Lightroom **Upright: Level / Vertical / Auto / Full** (Full = architecture).
+- **Auto tone, each one separate:** exposure, levels (blacks & whites), shadows & highlights, contrast, colour (vibrance & saturation). Aims for a normal-looking photo; strength and an exposure bias are adjustable under *Auto options*.
+- **Auto sharpening and noise reduction**, from noise and softness measured on the full-resolution image.
+- **Check boxes per photo** plus **Batch edit…**: run any auto tool, or increase / decrease / set / reset any setting, on this photo, the selected ones, the checked ones or all. *Undo batch* reverts the last one.
+- **Auto-write Lightroom XMP** option: writes each sidecar as soon as a photo is analysed.
+- **DNG colour profiles:** colours come from the colour matrices and embedded profile inside the DNG (dual-illuminant matrices, forward matrices, hue/sat map, look table, tone curve, baseline exposure), so files like Google Pixel DNGs render with correct colour. Pixel's local HDR tone map (`ProfileGainTableMap`) and lens shading are applied too, so the preview matches the camera's own rendering. Adjust under *Auto options -> Camera profile (DNG colour)*.
+- **RAW and DNG** are both supported. Lightroom ignores sidecars for DNG, so for DNG an *edited copy* is exported as `name.dng` into a `RAW Review export` folder next to the original (settings embedded in its XMP packet, image data untouched). The original DNG is never modified and no `.original` files are made. Import that folder into Lightroom.
+- **Sliders:** Temperature, Tint, Exposure, Contrast, Highlights, Shadows, Whites, Blacks, Vibrance, Saturation, Sharpening (amount, radius, detail, masking), Noise reduction (luminance, detail, color), Straighten, and lens profile corrections.
 - **Before/after** toggle, copy/paste settings to many photos, and "Approve all".
 - Temperature/Tint use the same conversion as Adobe's DNG SDK, so the numbers line up with Lightroom's sliders.
-- **Built-in updater:** checks GitHub for new releases and installs only when you click *Install*.
 
 ## Your RAW files are never touched
 
@@ -37,12 +42,11 @@ Space Station (public domain). A tungsten-light cast was simulated, then removed
 - The only file written is `photo.xmp` next to `photo.CR3` (Lightroom's normal sidecar).
 - An existing sidecar is backed up once as `photo.xmp.bak`. Only the settings this app controls are changed; ratings, keywords, Clarity, masks etc. are kept.
 - Every write checks the RAW's size and timestamp before and after, and refuses any filename that looks like a photo (RAW/DNG/JPG/TIFF…).
-- **DNG files are skipped**, because Lightroom stores DNG edits *inside* the DNG.
 
 ## Install (Windows)
 
 1. Install **Python 3.12** from [python.org](https://www.python.org/downloads/).
-2. [Download the ZIP](https://github.com/kefirman9000/raw-review/archive/refs/heads/main.zip) (or *Code → Download ZIP* above) and unzip it.
+2. Download the ZIP from [Releases](https://github.com/kefirman9000/raw-review/releases/latest) (or *Code → Download ZIP*) and unzip it anywhere.
 3. Double-click **`RAW Review.bat`**. The first run sets up its own environment (a few minutes).
 
 Other systems: `pip install -r requirements.txt`, then `python raw_review_app.py`.
@@ -56,6 +60,8 @@ Other systems: `pip install -r requirements.txt`, then `python raw_review_app.py
 | `←` `→` | Previous / next photo |
 | `\` | Before / after |
 | `W` | Re-run auto WB |
+| `E` | Auto-enhance this photo (all ticked auto tools) |
+| `C` | Check / uncheck this photo |
 | `Ctrl+C` / `Ctrl+V` | Copy settings / paste to the photos selected in the list |
 
 ## Getting the edits into Lightroom Classic
@@ -66,17 +72,28 @@ Other systems: `pip install -r requirements.txt`, then `python raw_review_app.py
 
 ## Updating
 
-Click **Check for Updates** in the toolbar. It compares your version with the newest one on GitHub (a published Release, or the main branch). The app also checks quietly at startup and shows an
-**⬆ Update** button when a new version is out. Nothing is installed until you click *Install & Restart*.
-The previous version is kept in `.update_backup/`. The updater only replaces the app's own files and
-never looks at your photos.
+Click **Check for Updates** in the toolbar. The app also checks quietly at startup and shows an
+**⬆ Update** button when a newer version is on GitHub (a published Release or the main branch, whichever is newer).
+Nothing is installed until you click *Install & Restart*. The previous version is kept in `.update_backup/`.
+The updater only replaces the app's own files and never looks at your photos.
 
 ## Good to know
 
 - The preview approximates Lightroom's rendering. What counts is the values written to the sidecar.
+- **Pixel DNGs:** the preview applies the DNG's local HDR tone map (`ProfileGainTableMap`) and lens shading, so it matches Google's own rendering. The tone map stays inside the DNG (only the XMP packet is ever rewritten), and Lightroom reads it from there. I could not test that in Lightroom itself. If a Pixel photo looks *darker in Lightroom than in the preview*, your Lightroom isn't applying the table: turn off *Auto options -> Camera profile -> Pixel local HDR tone map*, and the auto tools will brighten with Exposure and Shadows instead (a close approximation, not identical).
+- Not applied: the DNG's geometric lens-distortion opcodes (ultrawide Pixel shots keep their distortion in the preview; Lightroom's lens profile corrects it) and the newer `ProfileGainTableMap2` layout.
+- `TARGET_KEY_HDR` in `raw_review_auto.py` sets how bright Auto exposure aims for files with a tone map. It is calibrated on two Pixel 7 Pro files; use *Exposure bias* if yours run consistently lighter or darker.
 - Upright is calculated by Lightroom itself, so it isn't shown in the preview.
+- Sharpening and noise reduction are written to Lightroom but not shown in the preview. Their auto values come from measurements that were tuned by estimate, so check a few photos at 100% in Lightroom and use *Auto strength* to adjust.
+- Auto exposure assumes Lightroom adds about +0.5 EV before your Exposure slider (`PREVIEW_BASE_EV` in `raw_review_core.py`). If photos come out consistently too bright or dark in Lightroom, use *Auto options → Exposure bias*.
+- Only settings you or an auto tool have set (whites, blacks, saturation, sharpening, noise) are written, so an existing sidecar's values are left alone otherwise.
 - If straightened photos tilt the wrong way in Lightroom, change `XMP_ANGLE_SIGN` at the top of `raw_review_core.py`.
 
 ## Built with
 
 [rawpy](https://github.com/letmaik/rawpy) / LibRaw (read-only RAW decoding), NumPy, OpenCV, PySide6.
+
+## Support
+
+RAW Review is free. If it saves you editing time, you can support development through
+**[GitHub Sponsors](https://github.com/sponsors/kefirman9000)**. Thank you!

@@ -1,0 +1,371 @@
+"""
+RAW Review - automatic corrections (no GUI).
+
+Auto exposure, levels (blacks/whites), shadows/highlights, contrast, colour
+(vibrance/saturation), sharpening and noise reduction, the straighten modes,
+and the helpers the batch editor uses.
+
+Every tool works the same way: it measures the photo as it currently looks
+(white balance and exposure included), then proposes slider values that make
+it look "normal". All values are plain Lightroom-style slider numbers, so you
+can tweak them afterwards. `strength` scales how far an auto tool moves a
+slider away from its default (1.0 = full, 0.5 = half, 1.5 = push harder).
+
+None of this touches a RAW file: it only reads the decoded preview data.
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass, field
+
+import cv2
+import numpy as np
+
+import raw_review_core as core
+
+LUMA = core.LUMA
+
+# (key, label). The order here is the order the tools run in, because later
+# tools measure the photo after the earlier ones have been applied.
+AUTO_GROUPS = [
+    ("wb", "White balance"),
+    ("level", "Straighten / level"),
+    ("exposure", "Exposure"),
+    ("levels", "Levels (blacks & whites)"),
+    ("shhi", "Shadows & highlights"),
+    ("contrast", "Contrast"),
+    ("colour", "Colour (vibrance & saturation)"),
+    ("sharpen", "Sharpening"),
+    ("noise", "Noise reduction"),
+]
+GROUP_ORDER = [k for k, _ in AUTO_GROUPS]
+GROUP_LABEL = dict(AUTO_GROUPS)
+
+# ---- tuning knobs (what "normal" means) -----------------------------------
+TARGET_KEY = 0.15          # target log-average scene brightness (linear, ~mid grey)
+# Same idea for DNGs that carry a local HDR tone map (Pixel). Google's own rendering of those
+# files lands at about 0.20-0.24, so aiming there treats the camera's exposure as the intent
+# and only corrects scenes it got clearly wrong. (Used whether or not the tone map is switched on
+# in the preview: with it off, Auto exposure and Shadows make up the difference.) Calibrated on Pixel 7 Pro files; nudge it with
+# "Exposure bias" in the Auto menu if your photos come out consistently lighter or darker.
+TARGET_KEY_HDR = 0.21
+EXPOSURE_DAMPING = 0.75    # move only this far toward the target (keeps low/high-key scenes moody)
+HIGHLIGHT_ALLOWANCE = 1.0  # the 99th percentile may reach this (linear, i.e. just white) and no more
+TARGET_SPREAD = 0.72       # target p5..p95 tonal spread in display units
+TARGET_SATURATION = 0.30   # target average saturation of coloured pixels
+SHARP_RATIO_CRISP = 2.8    # edge-acuity ratio of a crisp photo (see core.measure_quality)
+SHARP_RATIO_SOFT = 1.6     # ... and of a very soft one
+NOISE_FLOOR = 0.005        # luminance noise below this needs no reduction
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class AutoOptions:
+    groups: set = field(default_factory=lambda: set(GROUP_ORDER))
+    level_mode: str = "Auto (best guess)"
+    allow_upright: bool = True
+    strength: float = 1.0
+    exposure_bias: float = 0.0       # EV added to auto exposure (your taste / calibration)
+
+
+# --------------------------------------------------------------------------
+# helpers
+# --------------------------------------------------------------------------
+
+def _small(dec: core.Decoded, long_edge: int = 600) -> np.ndarray:
+    cam = dec.cam
+    h, w = cam.shape[:2]
+    s = long_edge / max(h, w)
+    if s < 1.0:
+        cam = cv2.resize(cam, (max(1, round(w * s)), max(1, round(h * s))),
+                         interpolation=cv2.INTER_AREA)
+    return cam
+
+
+def _mul(dec: core.Decoded, edit: core.Edit):
+    if edit.wb_mode == "custom":
+        return dec.color.temp_tint_to_mul(edit.temp, edit.tint)
+    return dec.color.as_shot_mul
+
+
+def _stage(dec: core.Decoded, edit: core.Edit, stage: str):
+    """
+    The photo (gamma RGB, luminance) after the tone steps up to `stage`:
+    "base" = WB + exposure only, "levels", "shhi", or "final" = all tone
+    sliders (colour sliders are never included).
+    """
+    g = core.base_gamma(_small(dec), dec.color, _mul(dec, edit), edit.exposure)
+    if stage != "base":
+        g = core.apply_tone(g, edit, None if stage == "final" else stage, dec.color.base_contrast)
+    return g, g @ LUMA
+
+
+def _scaled(value: float, default: float, strength: float) -> float:
+    return default + (value - default) * strength
+
+
+def replace_note(edit: core.Edit, prefix: str, note: str):
+    edit.notes = [n for n in edit.notes if not n.startswith(prefix)] + [note]
+
+
+def _set(edit: core.Edit, key: str, value):
+    s = core.SETTINGS[key]
+    value = min(max(value, s.lo), s.hi)
+    setattr(edit, key, int(round(value)) if s.integer else round(float(value), s.decimals))
+    if s.optional:
+        edit.touched.add(key)
+
+
+# --------------------------------------------------------------------------
+# Exposure / levels / shadows+highlights / contrast
+# --------------------------------------------------------------------------
+
+def auto_exposure(dec, edit, strength=1.0, bias=0.0) -> str:
+    """Exposure so the scene's overall brightness looks normal; bright highlights are protected."""
+    cam, mul = _small(dec), _mul(dec, edit)
+    lin = core._cam_to_linear_srgb(cam, mul, dec.color)
+    Y = lin @ LUMA
+    # A DNG with a local HDR tone map (Pixel) is brightened unevenly: shadows lifted, highlights
+    # held. Judge the photo as it will actually look, or the exposure would be counted twice.
+    model = dec.color.model
+    target = TARGET_KEY
+    if model is not None and model.p.gain_table is not None:
+        target = TARGET_KEY_HDR              # the camera's own brightness is the aim, tone map on or off
+        if model.has_hdr_tone_map:
+            gain = model.local_gain(cam, mul, 0.0, dec.color.base_ev)
+            if gain is not None:
+                Y = Y * gain
+    Y = Y.ravel()
+    Y = Y[Y > 1e-5]
+    if Y.size < 100:
+        return "Auto exposure: image too dark to measure"
+    lo, hi = np.percentile(Y, [5, 98])
+    core_px = Y[(Y >= lo) & (Y <= hi)]
+    key = float(np.exp(np.mean(np.log(core_px))))
+    ev = EXPOSURE_DAMPING * (math.log2(target / key) - dec.color.base_ev)
+    guard = math.log2(HIGHLIGHT_ALLOWANCE / max(float(np.percentile(Y, 99)), 1e-4)) - dec.color.base_ev
+    limited = ev > guard
+    ev = min(ev, guard)
+    ev = min(max(ev, -2.5), 3.0) * strength + bias
+    ev = round(round(ev / 0.05) * 0.05, 2)
+    edit.exposure = float(min(max(ev, -5.0), 5.0))
+    return (f"Auto exposure: {edit.exposure:+.2f} EV"
+            + (" (held back to protect highlights)" if limited else ""))
+
+
+def auto_levels(dec, edit, strength=1.0) -> str:
+    """Whites/Blacks so the darkest and brightest real tones sit just inside the range."""
+    _g, L = _stage(dec, edit, "base")
+    pb, pw = (float(v) for v in np.percentile(L, [0.3, 99.7]))
+    if pw - pb < 0.05:
+        return "Auto levels: image has almost no tonal range, left alone"
+    full = (pw - pb) / 0.97
+    lo = pb - 0.015 * full
+    hi = lo + full
+    blacks = min(max(-lo / 0.15 * 100.0, -100.0), 15.0)
+    whites = min(max((1.0 - hi) / 0.30 * 100.0, -60.0), 10.0)   # never push whites into clipping
+    _set(edit, "blacks", _scaled(blacks, 0, strength))
+    _set(edit, "whites", _scaled(whites, 0, strength))
+    return f"Auto levels: blacks {edit.blacks:+d}, whites {edit.whites:+d}"
+
+
+def auto_shadows_highlights(dec, edit, strength=1.0) -> str:
+    """Open up deep shadows and pull back bright areas, only as much as the photo needs."""
+    _g, L = _stage(dec, edit, "levels")
+    p15, p50, p92 = (float(v) for v in np.percentile(L, [15, 50, 92]))
+    shadows = min(max((0.16 - p15) / 0.16 * 60.0, 0.0), 60.0)
+    if p50 < 0.25:                       # a genuinely dark scene (night): keep it moody
+        shadows *= 0.5
+    highlights = -min(max((p92 - 0.68) / 0.25 * 80.0, 0.0), 80.0)
+    clipped = float((L > 0.97).mean())           # share of near-white pixels
+    highlights -= min(clipped * 500.0, 30.0)
+    highlights = max(highlights, -100.0)
+    _set(edit, "shadows", _scaled(shadows, 0, strength))
+    _set(edit, "highlights", _scaled(highlights, 0, strength))
+    return f"Auto shadows/highlights: shadows {edit.shadows:+d}, highlights {edit.highlights:+d}"
+
+
+def auto_contrast(dec, edit, strength=1.0) -> str:
+    """Contrast from how much of the tonal range the photo actually uses."""
+    _g, L = _stage(dec, edit, "shhi")
+    p5, p95 = (float(v) for v in np.percentile(L, [5, 95]))
+    contrast = min(max((TARGET_SPREAD - (p95 - p5)) / TARGET_SPREAD * 80.0, -15.0), 25.0)
+    _set(edit, "contrast", _scaled(contrast, 0, strength))
+    return f"Auto contrast: {edit.contrast:+d}"
+
+
+# --------------------------------------------------------------------------
+# Colour
+# --------------------------------------------------------------------------
+
+def auto_colour(dec, edit, strength=1.0) -> str:
+    """Vibrance up for flat colours, saturation down for over-cooked ones."""
+    g, L = _stage(dec, edit, "final")
+    mx, mn = g.max(axis=2), g.min(axis=2)
+    sat = (mx - mn) / np.maximum(mx, 1e-4)
+    m = (L > 0.08) & (L < 0.92)
+    if m.sum() < 100:
+        return "Auto colour: not enough midtones to judge"
+    s = sat[m]
+    if float((s > 0.08).mean()) < 0.10:            # basically black & white / neutral scene
+        _set(edit, "vibrance", 0)
+        _set(edit, "saturation", 0)
+        return "Auto colour: scene is nearly neutral, left alone"
+    mean_sat = float(s.mean())
+    vib = min(max((TARGET_SATURATION - mean_sat) / TARGET_SATURATION * 50.0, -20.0), 35.0)
+    sat_adj = -min(max((mean_sat - 0.50) * 60.0, 0.0), 20.0)
+    _set(edit, "vibrance", _scaled(vib, 0, strength))
+    _set(edit, "saturation", _scaled(sat_adj, 0, strength))
+    return f"Auto colour: vibrance {edit.vibrance:+d}, saturation {edit.saturation:+d}"
+
+
+# --------------------------------------------------------------------------
+# Sharpening / noise reduction
+# --------------------------------------------------------------------------
+
+def auto_sharpen(dec, edit, strength=1.0) -> str:
+    """Sharpening from measured softness; masking rises with noise so grain isn't sharpened."""
+    q = dec.quality
+    if q.measured and q.sharp_ratio > 0:
+        soft = min(max((SHARP_RATIO_CRISP - q.sharp_ratio)
+                       / (SHARP_RATIO_CRISP - SHARP_RATIO_SOFT), 0.0), 1.0)
+    else:
+        soft = 0.25
+    nn = min(max((q.noise_luma - 0.006) / 0.03, 0.0), 1.0) if q.measured else 0.0
+    amount = (40 + 50 * soft) * (1 - 0.4 * nn)
+    _set(edit, "sharp_amount", min(max(_scaled(amount, 40, strength), 15), 120))
+    _set(edit, "sharp_radius", _scaled(1.0 + 0.4 * soft, 1.0, strength))
+    _set(edit, "sharp_detail", _scaled(25 + 20 * soft * (1 - nn), 25, strength))
+    _set(edit, "sharp_masking", _scaled(80 * nn, 0, strength))
+    why = "measured" if q.measured else "not measured, typical values"
+    return (f"Auto sharpening: amount {edit.sharp_amount}, radius {edit.sharp_radius:.1f}, "
+            f"detail {edit.sharp_detail}, masking {edit.sharp_masking} ({why})")
+
+
+def auto_noise(dec, edit, strength=1.0) -> str:
+    """Luminance and colour noise reduction from the noise measured in flat mid-tone areas."""
+    q = dec.quality
+    if not q.measured:
+        _set(edit, "nr_luma", 0)
+        _set(edit, "nr_luma_detail", 50)
+        _set(edit, "nr_color", 25)
+        return "Auto noise reduction: noise not measured, defaults used"
+    lum = min(max(2000.0 * (q.noise_luma - NOISE_FLOOR), 0.0), 75.0)
+    color = min(max(25.0 + 800.0 * (q.noise_chroma - 0.006), 25.0), 75.0)
+    detail = min(max(50.0 - 0.2 * lum, 25.0), 50.0)
+    _set(edit, "nr_luma", _scaled(lum, 0, strength))
+    _set(edit, "nr_luma_detail", detail)
+    _set(edit, "nr_color", _scaled(color, 25, strength))
+    return (f"Auto noise reduction: luminance {edit.nr_luma}, color {edit.nr_color} "
+            f"(measured noise {q.noise_luma * 100:.1f}%)")
+
+
+# --------------------------------------------------------------------------
+# Straighten / level modes
+# --------------------------------------------------------------------------
+
+def apply_level_mode(dec, edit, mode: str, allow_upright: bool = True):
+    """Run one of core.LEVEL_MODES on this photo. Returns a StraightenResult for rotate modes."""
+    spec = core.LEVEL_MODES.get(mode, core.LEVEL_MODES["Off"])
+    kind = spec["kind"]
+    if kind == "manual":
+        return None
+    edit.level_mode = mode
+    if kind == "off":
+        edit.angle, edit.upright = 0.0, "Off"
+        replace_note(edit, "Straighten", "Straighten: off")
+        return None
+    if kind == "upright":
+        edit.angle, edit.upright = 0.0, spec["upright"]
+        replace_note(edit, "Straighten",
+                     f"Straighten: Lightroom Upright {spec['upright']} (Lightroom computes the correction)")
+        return None
+    img, _ = core.render(dec, edit, rotate=False)
+    st = core.auto_straighten(img, allow_upright, spec["source"])
+    edit.angle, edit.upright = st.angle, st.upright
+    if st.upright != "Off":                         # best guess chose Upright Vertical
+        edit.level_mode = "Upright: " + st.upright
+    replace_note(edit, "Straighten", st.note)
+    return st
+
+
+# --------------------------------------------------------------------------
+# Running the tools
+# --------------------------------------------------------------------------
+
+def run_auto(dec, edit, groups, opts: AutoOptions | None = None) -> dict:
+    """Run the chosen auto groups (in the right order) on `edit`. Returns {"wb": .., "level": ..}."""
+    opts = opts or AutoOptions()
+    groups = set(groups)
+    s = opts.strength
+    out = {}
+    for g in GROUP_ORDER:
+        if g not in groups:
+            continue
+        if g == "wb":
+            wb = core.auto_white_balance(dec)
+            if wb.applied:
+                edit.wb_mode, edit.temp, edit.tint = "custom", round(wb.temp), round(wb.tint)
+            replace_note(edit, "Auto WB", wb.note)
+            out["wb"] = wb
+        elif g == "level":
+            out["level"] = apply_level_mode(dec, edit, opts.level_mode, opts.allow_upright)
+        elif g == "exposure":
+            replace_note(edit, "Auto exposure", auto_exposure(dec, edit, s, opts.exposure_bias))
+        elif g == "levels":
+            replace_note(edit, "Auto levels", auto_levels(dec, edit, s))
+        elif g == "shhi":
+            replace_note(edit, "Auto shadows", auto_shadows_highlights(dec, edit, s))
+        elif g == "contrast":
+            replace_note(edit, "Auto contrast", auto_contrast(dec, edit, s))
+        elif g == "colour":
+            replace_note(edit, "Auto colour", auto_colour(dec, edit, s))
+        elif g == "sharpen":
+            replace_note(edit, "Auto sharpening", auto_sharpen(dec, edit, s))
+        elif g == "noise":
+            replace_note(edit, "Auto noise", auto_noise(dec, edit, s))
+    return out
+
+
+def propose_edit(dec, opts: AutoOptions | None = None):
+    """The first proposal for a freshly added photo. Returns (edit, wb result, straighten result)."""
+    opts = opts or AutoOptions()
+    edit = core.as_shot_edit(dec)
+    res = run_auto(dec, edit, opts.groups, opts)
+    return edit, res.get("wb"), res.get("level")
+
+
+# --------------------------------------------------------------------------
+# Batch editing
+# --------------------------------------------------------------------------
+
+@dataclass
+class BatchSpec:
+    scope: str = "checked"                     # "current" | "selected" | "checked" | "all"
+    groups: list = field(default_factory=list)  # auto groups to run
+    level_mode: str = "Auto (best guess)"
+    allow_upright: bool = True
+    strength: float = 1.0
+    exposure_bias: float = 0.0
+    changes: list = field(default_factory=list)  # (setting key, action, amount)
+
+    @property
+    def needs_decode(self) -> bool:
+        return bool(self.groups)
+
+
+def apply_batch(dec, edit, spec: BatchSpec) -> dict:
+    """Apply a BatchSpec to one photo's edit: auto tools first, then manual changes."""
+    out = {}
+    if spec.groups:
+        out = run_auto(dec, edit, spec.groups,
+                       AutoOptions(set(spec.groups), spec.level_mode, spec.allow_upright,
+                                   spec.strength, spec.exposure_bias))
+    apply_changes(edit, spec.changes)
+    return out
+
+
+def apply_changes(edit, changes):
+    for key, action, amount in changes:
+        core.change_setting(edit, key, action, amount)
