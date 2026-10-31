@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+*.pyc
+.update_backup/
+*.xmp
+*.xmp.bak
