@@ -97,3 +97,16 @@ The updater only replaces the app's own files and never looks at your photos.
 
 RAW Review is free. If it saves you editing time, you can support development through
 **[GitHub Sponsors](https://github.com/sponsors/kefirman9000)**. Thank you!
+
+## License and disclaimer
+
+Copyright © 2026 kefirman9000. All rights reserved. RAW Review is free to use; see [LICENSE](LICENSE) for what is and isn't allowed.
+
+- **Back up your photos.** RAW Review only reads your RAW files and never changes them, but always keep backups of anything you can't replace.
+- Auto edits are suggestions. Check each photo before you rely on it.
+
+RAW Review is provided **as is**, without warranty of any kind. Use it at your own risk; the author is not liable for any damage, data loss or other loss arising from its use.
+
+RAW Review is an independent project and is not affiliated with, endorsed by or sponsored by any of the companies or products named here. Adobe, Lightroom and Photoshop are trademarks of Adobe Inc. Google and Pixel are trademarks of Google LLC.
+
+Found a security problem? Please report it privately; see [SECURITY.md](SECURITY.md).
