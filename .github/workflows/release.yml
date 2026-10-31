@@ -1,0 +1,50 @@
+name: Release
+# Publishes a GitHub Release with a ready-to-run zip whenever version.py changes on main.
+# The in-app updater picks up the newest Release (or main, whichever is newer).
+on:
+  push:
+    branches: [main]
+    paths: [version.py, .github/workflows/release.yml]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read version
+        id: v
+        run: |
+          V=$(python3 -c "import re;print(re.search(r'__version__\s*=\s*[\"\x27]([^\"\x27]+)', open('version.py').read()).group(1))")
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+      - name: Skip if this version is already released
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "v${{ steps.v.outputs.version }}" >/dev/null 2>&1; then echo "exists=1" >> "$GITHUB_OUTPUT"; fi
+      - name: Check the app compiles
+        if: steps.check.outputs.exists != '1'
+        run: python3 -m py_compile *.py
+      - name: Build zip and notes
+        if: steps.check.outputs.exists != '1'
+        run: |
+          V=${{ steps.v.outputs.version }}
+          mkdir -p dist
+          git archive --format=zip --prefix=raw_review/ -o "dist/RAW_Review-v$V.zip" HEAD
+          (cd dist && sha256sum "RAW_Review-v$V.zip" > SHA256SUMS)
+          {
+            echo "**Download:** \`RAW_Review-v$V.zip\` below. Unzip it and double-click **RAW Review.bat** (needs Python 3.12)."
+            echo "Already have RAW Review? Click **Check for Updates** in the app instead."
+            echo
+            awk -v v="v$V" '/^## /{p = ($2 == v)} p' CHANGELOG.md | tail -n +2
+          } > dist/notes.md
+      - name: Publish release
+        if: steps.check.outputs.exists != '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          V=${{ steps.v.outputs.version }}
+          gh release create "v$V" "dist/RAW_Review-v$V.zip" dist/SHA256SUMS \
+            --title "RAW Review v$V" --notes-file dist/notes.md --target "${{ github.sha }}" --latest

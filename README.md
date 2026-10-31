@@ -72,6 +72,8 @@ Other systems: `pip install -r requirements.txt`, then `python raw_review_app.py
 
 ## Updating
 
+New versions are published automatically as [GitHub Releases](https://github.com/kefirman9000/raw-review/releases) whenever the version number changes.
+
 Click **Check for Updates** in the toolbar. The app also checks quietly at startup and shows an
 **⬆ Update** button when a newer version is on GitHub (a published Release or the main branch, whichever is newer).
 Nothing is installed until you click *Install & Restart*. The previous version is kept in `.update_backup/`.
