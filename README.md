@@ -9,9 +9,12 @@ white balance and an automatic straighten. You flip through them, **approve** (`
 
 **[⬇ Download (ZIP)](https://github.com/kefirman9000/raw-review/archive/refs/heads/main.zip)** · [What's new](CHANGELOG.md)
 
-![Auto white balance on a test scene: as shot under tungsten light (left) vs. auto WB (right)](docs/auto-wb-demo.jpg)
-*Test scene under tungsten light. Left: as shot with daylight WB. Right: RAW Review's auto WB. The blue patch
-that looked grey under orange light comes back blue, and the white and black become neutral.*
+![RAW Review interface: photo list with review status, preview, and white balance, tone and geometry controls](docs/app.png)
+
+![Before and after: a warm tungsten cast removed with one eyedropper click on the white spacecraft](docs/before-after.png)
+
+<sub>Interface illustration and before/after rendered with RAW Review's own colour engine. Photo: NASA, International
+Space Station (public domain). A tungsten-light cast was simulated, then removed with one eyedropper click (2998K / +12; the true cast was 3000K / +12).</sub>
 
 ## Features
 
