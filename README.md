@@ -42,7 +42,7 @@ Space Station (public domain). A tungsten-light cast was simulated, then removed
 - **DNG colour profiles:** colours come from the colour matrices and embedded profile inside the DNG (dual-illuminant matrices, forward matrices, hue/sat map, look table, tone curve, baseline exposure), so files like Google Pixel DNGs render with correct colour. Pixel's local HDR tone map (`ProfileGainTableMap`) and lens shading are applied too, so the preview matches the camera's own rendering. Adjust under *Auto options -> Camera profile (DNG colour)*.
 - **RAW and DNG** are both supported. Lightroom ignores sidecars for DNG, so for DNG an *edited copy* is exported as `name.dng` into a `RAW Review export` folder next to the original (settings embedded in its XMP packet, image data untouched). The original DNG is never modified and no `.original` files are made. Import that folder into Lightroom.
 - **Sliders:** Temperature, Tint, Exposure, Contrast, Highlights, Shadows, Whites, Blacks, Vibrance, Saturation, Sharpening (amount, radius, detail, masking), Noise reduction (luminance, detail, color), Straighten, and lens profile corrections.
-- **Before/after** toggle, copy/paste settings to many photos, and "Approve all".
+- **Hold-to-compare and split before/after**, copy/paste settings to many photos, and "Approve all".
 - Temperature/Tint use the same conversion as Adobe's DNG SDK, so the numbers line up with Lightroom's sliders.
 
 ## Your RAW files are never touched
@@ -67,7 +67,7 @@ Other systems: `pip install -r requirements.txt`, then `python raw_review_app.py
 | `A` | Approve: write the XMP, go to the next unreviewed photo |
 | `X` | Reject: nothing is written |
 | `←` `→` | Previous / next photo |
-| `\` | Before / after |
+| hold `\` | Show the original while held (tick *Split* for a draggable before/after) |
 | `W` | Re-run auto WB |
 | `E` | Auto-enhance this photo (all ticked auto tools) |
 | `C` | Check / uncheck this photo |
