@@ -18,6 +18,8 @@ Space Station (public domain). A tungsten-light cast was simulated, then removed
 
 ## Features
 
+- **Edit many photos at once:** *Edits apply to → Selected / Checked photos* copies each slider change to them, either the exact value or as a relative nudge.
+- **Grid view** (`G`) to see the whole shoot at a glance.
 - **Drag and drop** photos or whole folders (subfolders included).
 - **Smart auto white balance**
   - Looks for the surfaces most likely to be truly neutral: the brightest unclipped *near-whites* and the darkest *near-blacks*.
@@ -62,6 +64,7 @@ Other systems: `pip install -r requirements.txt`, then `python raw_review_app.py
 | `W` | Re-run auto WB |
 | `E` | Auto-enhance this photo (all ticked auto tools) |
 | `C` | Check / uncheck this photo |
+| `G` | Grid view on / off (double-click or `Enter` opens a photo; with several selected, `A` / `X` act on all of them) |
 | `Ctrl+C` / `Ctrl+V` | Copy settings / paste to the photos selected in the list |
 
 ## Getting the edits into Lightroom Classic

@@ -1,5 +1,19 @@
 # Changelog
 
+## v1.3.0
+
+- **Edit several photos at once.** New *Edits apply to* box at the top of the controls: *This photo*, *Selected photos*
+  or *Checked photos*. Any slider, white balance or lens change you make on the photo shown is applied to the others
+  too, like Lightroom's Auto Sync. Only the setting you change is copied; everything else on each photo stays as it was.
+  - **Relative** off: every photo gets the same value (e.g. Exposure +0.50).
+  - **Relative** on: the same change is added to each photo's own value (e.g. +0.3 EV brighter on all of them, each
+    from its own starting point). Values are kept inside each slider's range.
+- **Grid view** (toolbar button or **G**): all photos as large thumbnails with their review colour and ☑ marks.
+  Selecting in the grid selects in the list, double-click or **Enter** opens a photo, **G** goes back.
+  With several photos selected in the grid, **A** approves and **X** rejects all of them.
+- Thumbnails are now made larger and refresh in the background when settings change on photos you aren't looking at
+  (multi-photo edits, Paste, Undo batch).
+
 ## v1.2.2
 
 - **In-app updater is back.** A *Check for Updates* button in the toolbar, plus a quiet check at startup that turns it into

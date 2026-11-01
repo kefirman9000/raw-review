@@ -29,7 +29,8 @@ import updater
 from version import __version__
 
 CACHE_SIZE = 24          # decoded previews kept in memory
-THUMB_W, THUMB_H = 120, 80
+THUMB_W, THUMB_H = 120, 80      # list icons
+GRID_W, GRID_H = 240, 160        # grid view thumbnails (also the size thumbnails are made at)
 
 STATUS_STYLE = {
     "loading":  ("Analyzing…", QtGui.QColor(90, 90, 90)),
@@ -52,6 +53,7 @@ class Item:
         self.src_size = (3, 2)
         self.error = ""
         self.list_item: QtWidgets.QListWidgetItem | None = None
+        self.grid_item: QtWidgets.QListWidgetItem | None = None
 
 
 # --------------------------------------------------------------------------
@@ -66,7 +68,7 @@ def make_thumb(dec, edit):
     import cv2
     img, _ = core.render(dec, edit)
     h, w = img.shape[:2]
-    s = min(THUMB_W / w, THUMB_H / h)
+    s = min(GRID_W / w, GRID_H / h)
     return np.ascontiguousarray(
         cv2.resize(img, (max(1, int(w * s)), max(1, int(h * s))), interpolation=cv2.INTER_AREA))
 
@@ -87,6 +89,27 @@ class DecodeTask(QRunnable):
         except Exception as ex:  # noqa: BLE001
             traceback.print_exc()
             self.signals.done.emit(self.gen, self.path, None, f"{type(ex).__name__}: {ex}")
+
+
+class ThumbSignals(QObject):
+    done = Signal(int, str, object, object)   # generation, path, thumb, newly decoded image (or None)
+
+
+class ThumbTask(QRunnable):
+    """Re-render one photo's thumbnail after its settings changed (off the UI thread)."""
+    def __init__(self, gen, path, edit, dec, signals):
+        super().__init__()
+        self.gen, self.path, self.edit, self.dec, self.signals = gen, path, edit.copy(), dec, signals
+
+    def run(self):
+        try:
+            dec = self.dec
+            fresh = None
+            if dec is None:
+                dec = fresh = core.decode_raw(self.path)      # read-only
+            self.signals.done.emit(self.gen, self.path, make_thumb(dec, self.edit), fresh)
+        except Exception:  # noqa: BLE001 - a stale thumbnail is harmless
+            traceback.print_exc()
 
 
 class BatchSignals(QObject):
@@ -423,6 +446,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self._undo = {}
         self._batch_progress = None
         self._batch_total = self._batch_done = self._batch_errors = 0
+        self.thumb_signals = ThumbSignals()
+        self.thumb_signals.done.connect(self.on_thumb_done)
+        self._thumb_pending = set()
+        self.thumb_timer = QTimer(self)
+        self.thumb_timer.setSingleShot(True)
+        self.thumb_timer.setInterval(350)
+        self.thumb_timer.timeout.connect(self._flush_thumbs)
+        self._syncing = False
         self.upd = UpdateSignals()
         self.upd.checked.connect(self.on_update_checked)
         self.upd.progress.connect(self.on_update_progress)
@@ -590,6 +621,12 @@ class MainWindow(QtWidgets.QMainWindow):
         tb.addAction("Add Files…", self.open_files)
         tb.addAction("Add Folder…", self.open_folder)
         tb.addSeparator()
+        self.act_grid = tb.addAction("▦ Grid view (G)")
+        self.act_grid.setCheckable(True)
+        self.act_grid.setToolTip("Switch between one large photo and a grid of all photos (G). "
+                                 "Double-click or Enter opens a photo.")
+        self.act_grid.toggled.connect(self.set_grid)
+        tb.addSeparator()
         tb.addWidget(self._build_auto_menu())
         self.act_batch = tb.addAction("Batch edit…", self.open_batch)
         self.act_batch.setToolTip("Run auto tools or raise/lower/set settings on checked, selected or all photos")
@@ -622,7 +659,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.list.setIconSize(QtCore.QSize(THUMB_W, THUMB_H))
         self.list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
         self.list.currentRowChanged.connect(self.on_row)
-        self.list.itemChanged.connect(lambda _i: self._update_checked_label())
+        self.list.itemChanged.connect(self._on_list_item_changed)
+        self.list.itemSelectionChanged.connect(self._sync_grid_from_list)
         self.count_lbl = QtWidgets.QLabel("No photos")
         self.checked_lbl = QtWidgets.QLabel("0 checked")
         chk_btn = QtWidgets.QToolButton()
@@ -652,7 +690,24 @@ class MainWindow(QtWidgets.QMainWindow):
         cl.setContentsMargins(4, 4, 4, 4)
         self.view = ImageView()
         self.view.clicked.connect(self.on_image_click)
-        cl.addWidget(self.view, 1)
+        self.grid = QtWidgets.QListWidget()
+        self.grid.setViewMode(QtWidgets.QListView.ViewMode.IconMode)
+        self.grid.setIconSize(QtCore.QSize(GRID_W, GRID_H))
+        self.grid.setGridSize(QtCore.QSize(GRID_W + 24, GRID_H + 52))
+        self.grid.setResizeMode(QtWidgets.QListView.ResizeMode.Adjust)
+        self.grid.setMovement(QtWidgets.QListView.Movement.Static)
+        self.grid.setWordWrap(True)
+        self.grid.setUniformItemSizes(True)
+        self.grid.setSpacing(4)
+        self.grid.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.grid.setStyleSheet("QListWidget{background:#1c1c1e;}")
+        self.grid.itemSelectionChanged.connect(self._sync_list_from_grid)
+        self.grid.currentRowChanged.connect(self._grid_current_changed)
+        self.grid.itemActivated.connect(lambda _i: self.act_grid.setChecked(False))   # double-click / Enter
+        self.stack = QtWidgets.QStackedWidget()
+        self.stack.addWidget(self.view)
+        self.stack.addWidget(self.grid)
+        cl.addWidget(self.stack, 1)
         self.notes_lbl = QtWidgets.QLabel("")
         self.notes_lbl.setWordWrap(True)
         self.notes_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -683,6 +738,25 @@ class MainWindow(QtWidgets.QMainWindow):
         # Right: controls
         panel = QtWidgets.QWidget()
         pl = QtWidgets.QVBoxLayout(panel)
+
+        g_scope = QtWidgets.QGroupBox("Edits apply to")
+        sl = QtWidgets.QGridLayout(g_scope)
+        self.scope_combo = QtWidgets.QComboBox()
+        self.scope_combo.addItems(["This photo", "Selected photos", "Checked photos"])
+        self.scope_combo.setToolTip("Slider and white-balance changes go to this photo only, or to every "
+                                    "selected / checked photo as well (like Lightroom's Auto Sync)")
+        self.chk_relative = QtWidgets.QCheckBox("Relative")
+        self.chk_relative.setToolTip("Off: every photo gets the same value (e.g. Exposure +0.50).\n"
+                                     "On: the same change is added to each photo's own value "
+                                     "(e.g. +0.3 EV brighter on all of them).")
+        self.scope_lbl = QtWidgets.QLabel("")
+        self.scope_lbl.setStyleSheet("color:#9ab;")
+        sl.addWidget(self.scope_combo, 0, 0)
+        sl.addWidget(self.chk_relative, 0, 1)
+        sl.addWidget(self.scope_lbl, 1, 0, 1, 2)
+        self.scope_combo.currentIndexChanged.connect(lambda _i: self._update_scope_label())
+        self.chk_relative.toggled.connect(lambda _v: self._update_scope_label())
+        pl.addWidget(g_scope)
 
         def group(title, auto_groups=None):
             box = QtWidgets.QGroupBox(title)
@@ -801,6 +875,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_paste.clicked.connect(self.paste_settings)
 
         self.statusBar().showMessage("Drag RAW / DNG photos or folders onto the window to start.")
+        self._update_scope_label()
 
     def _build_shortcuts(self):
         def sc(key, fn):
@@ -816,6 +891,7 @@ class MainWindow(QtWidgets.QMainWindow):
         sc("W", self.do_auto_wb)
         sc("E", self.auto_enhance)
         sc("C", self.toggle_check_current)
+        sc("G", lambda: self.act_grid.toggle())
 
     def _set_controls_enabled(self, on):
         widgets = [self.wb_combo, self.btn_auto_wb, self.btn_eyedrop, self.level_combo, self.btn_level,
@@ -874,8 +950,14 @@ class MainWindow(QtWidgets.QMainWindow):
             li.setFlags(li.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             li.setCheckState(Qt.CheckState.Unchecked)
             it.list_item = li
+            gi = QtWidgets.QListWidgetItem(os.path.basename(f))
+            gi.setData(Qt.ItemDataRole.UserRole, f)
+            gi.setToolTip(f)
+            gi.setTextAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
+            it.grid_item = gi
             self.items[f] = it
             self.list.addItem(li)
+            self.grid.addItem(gi)
             self._update_list_item(it)
             self._requested.add(f)
             self.pool.start(DecodeTask(self.gen, f, True, opts, self.signals))
@@ -902,6 +984,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._undo = {}
         self.act_undo_batch.setEnabled(False)
         self.list.clear()
+        self.grid.clear()
+        self._thumb_pending.clear()
         self.view.set_image(None)
         self.view.set_message("Drag RAW photos or folders here")
         self.notes_lbl.setText("")
@@ -931,7 +1015,7 @@ class MainWindow(QtWidgets.QMainWindow):
             it.edit, it.auto_edit, it.wb = res["edit"], res["edit"].copy(), res["wb"]
             if it.status == "loading":
                 it.status = "ready"
-            it.list_item.setIcon(QtGui.QIcon(QtGui.QPixmap.fromImage(to_qimage(res["thumb"]))))
+            self._set_thumb(it, res["thumb"])
             self._update_list_item(it)
             self._update_count()
             if self.chk_autowrite.isChecked() and it.status == "ready":
@@ -968,6 +1052,182 @@ class MainWindow(QtWidgets.QMainWindow):
         it.list_item.setForeground(QtGui.QBrush(QtGui.QColor("white")) if col else QtGui.QBrush())
         if it.error:
             it.list_item.setToolTip(f"{it.path}\n{it.error}")
+        self._update_grid_item(it)
+
+    def _update_grid_item(self, it):
+        gi = it.grid_item
+        if gi is None or it.list_item is None:
+            return
+        label, col = STATUS_STYLE[it.status]
+        mark = "☑ " if it.list_item.checkState() == Qt.CheckState.Checked else ""
+        low = " · check WB" if (it.wb is not None and it.wb.applied and it.wb.confidence < 0.5
+                                and it.status == "ready") else ""
+        gi.setText(f"{mark}{os.path.basename(it.path)}\n{label}{low}")
+        gi.setBackground(QtGui.QBrush(col) if col else QtGui.QBrush())
+        gi.setForeground(QtGui.QBrush(QtGui.QColor("white")))
+        if it.error:
+            gi.setToolTip(f"{it.path}\n{it.error}")
+
+    def _set_thumb(self, it, rgb):
+        icon = QtGui.QIcon(QtGui.QPixmap.fromImage(to_qimage(rgb)))
+        if it.list_item is not None:
+            it.list_item.setIcon(icon)
+        if it.grid_item is not None:
+            it.grid_item.setIcon(icon)
+
+    def _queue_thumb(self, it):
+        self._thumb_pending.add(it.path)
+        self.thumb_timer.start()
+
+    def _flush_thumbs(self):
+        pending, self._thumb_pending = self._thumb_pending, set()
+        for path in pending:
+            it = self.items.get(path)
+            if it is None or it.edit is None:
+                continue
+            self.pool.start(ThumbTask(self.gen, path, it.edit, self.cache.get(path), self.thumb_signals))
+
+    def on_thumb_done(self, gen, path, thumb, fresh):
+        it = self.items.get(path)
+        if gen != self.gen or it is None:
+            return
+        if fresh is not None and path not in self.cache:
+            self._cache_put(path, fresh)
+        self._set_thumb(it, thumb)
+
+    # ---------------- grid view / selection sync ----------------
+    def set_grid(self, on):
+        self.stack.setCurrentIndex(1 if on else 0)
+        if on:
+            self._sync_grid_from_list()
+            cur = self.list.currentRow()
+            if cur >= 0:
+                self.grid.scrollToItem(self.grid.item(cur))
+            self.grid.setFocus()
+        else:
+            self.refresh_view()
+            self.view.setFocus()
+        self.act_grid.setText("▣ Single view (G)" if on else "▦ Grid view (G)")
+
+    def in_grid(self):
+        return self.stack.currentIndex() == 1
+
+    def _sync_grid_from_list(self):
+        if self._syncing:
+            return
+        self._syncing = True
+        try:
+            rows = {self.list.row(li) for li in self.list.selectedItems()}
+            for r in range(self.grid.count()):
+                self.grid.item(r).setSelected(r in rows)
+            cur = self.list.currentRow()
+            if cur >= 0 and self.grid.currentRow() != cur:
+                self.grid.setCurrentRow(cur, QtCore.QItemSelectionModel.SelectionFlag.NoUpdate)
+        finally:
+            self._syncing = False
+        self._update_scope_label()
+
+    def _sync_list_from_grid(self):
+        if self._syncing:
+            return
+        self._syncing = True
+        try:
+            rows = {self.grid.row(gi) for gi in self.grid.selectedItems()}
+            for r in range(self.list.count()):
+                self.list.item(r).setSelected(r in rows)
+        finally:
+            self._syncing = False
+        self._update_scope_label()
+
+    def _grid_current_changed(self, row):
+        if self._syncing or row < 0 or row == self.list.currentRow():
+            return
+        self._syncing = True
+        try:
+            self.list.setCurrentRow(row, QtCore.QItemSelectionModel.SelectionFlag.NoUpdate)
+        finally:
+            self._syncing = False
+        self.on_row(row)
+
+    def _on_list_item_changed(self, li):
+        self._update_checked_label()
+        it = self.items.get(li.data(Qt.ItemDataRole.UserRole))
+        if it is not None:
+            self._update_grid_item(it)
+        self._update_scope_label()
+
+    # ---------------- "Edits apply to" ----------------
+    def edit_scope(self):
+        return ("current", "selected", "checked")[self.scope_combo.currentIndex()]
+
+    def _scope_targets(self):
+        """Photos (other than the current one) that slider changes are copied to."""
+        sc = self.edit_scope()
+        if sc == "current":
+            return []
+        return [t for t in self.scope_items(sc) if t is not self.current and t.edit is not None]
+
+    def _update_scope_label(self):
+        if not hasattr(self, "scope_lbl"):
+            return
+        sc = self.edit_scope()
+        if sc == "current":
+            self.scope_lbl.setText("Changes affect only the photo shown.")
+            return
+        n = len(self._scope_targets())
+        how = "added to each photo's own values" if self.chk_relative.isChecked() else "copied exactly"
+        word = "selected" if sc == "selected" else "checked"
+        self.scope_lbl.setText(f"This photo + {n} other {word} photo(s) · changes {how}"
+                               if n else f"No other {word} photos – only this photo changes.")
+
+    def _propagate(self, old, new):
+        """Copy the settings that just changed on the current photo to the scope's other photos."""
+        targets = self._scope_targets()
+        if not targets:
+            return
+        relative = self.chk_relative.isChecked()
+        changed = [k for k in core.SETTINGS if getattr(old, k) != getattr(new, k)]
+        wb_to_shot = new.wb_mode == "as_shot" and old.wb_mode != "as_shot"
+        lens = old.lens_profile != new.lens_profile
+        if not changed and not wb_to_shot and not lens and old.wb_mode == new.wb_mode:
+            return
+        for t in targets:
+            te = t.edit
+            if new.wb_mode == "as_shot":
+                if wb_to_shot:
+                    te.wb_mode = "as_shot"
+                    if t.color is not None:
+                        te.temp, te.tint = (round(v) for v in t.color.as_shot_temp_tint)
+            elif old.wb_mode != new.wb_mode and not relative:
+                te.wb_mode, te.temp, te.tint = "custom", new.temp, new.tint
+            for k in changed:
+                st = core.SETTINGS[k]
+                if k in ("temp", "tint"):
+                    if new.wb_mode == "as_shot":
+                        continue                     # the sliders just snapped to this photo's as-shot
+                    if relative:
+                        if te.wb_mode != "custom" and t.color is not None:
+                            te.temp, te.tint = (round(v) for v in t.color.as_shot_temp_tint)
+                        val = getattr(te, k) + (getattr(new, k) - getattr(old, k))
+                    else:
+                        val = getattr(new, k)
+                    te.wb_mode = "custom"
+                else:
+                    val = (getattr(te, k) + (getattr(new, k) - getattr(old, k))) if relative else getattr(new, k)
+                val = min(max(val, st.lo), st.hi)
+                val = int(round(val)) if st.integer else round(val, st.decimals)
+                setattr(te, k, val)
+                if st.optional:
+                    te.touched.add(k)
+                if k == "angle":
+                    te.level_mode = "Manual"
+            if lens:
+                te.lens_profile = new.lens_profile
+            self._mark_changed(t)
+            self._queue_thumb(t)
+        self.statusBar().showMessage(
+            f"Change applied to this photo and {len(targets)} other photo(s)"
+            + (" (relative)." if relative else "."), 4000)
 
     def _update_count(self):
         n = len(self.items)
@@ -986,7 +1246,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.current = self.items.get(path)
         self.btn_eyedrop.setChecked(False)
         self.load_controls()
-        self.refresh_view()
+        if not self.in_grid():
+            self.refresh_view()
+        if not self._syncing and self.grid.currentRow() != row:
+            self._syncing = True
+            try:
+                self.grid.setCurrentRow(row, QtCore.QItemSelectionModel.SelectionFlag.NoUpdate)
+                self.grid.scrollToItem(self.grid.item(row))
+            finally:
+                self._syncing = False
+        self._update_scope_label()
 
     def step(self, d):
         if self.list.count() == 0:
@@ -1037,6 +1306,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._loading_controls or it is None or it.edit is None:
             return
         e = it.edit
+        old = e.copy()
         e.wb_mode = "custom" if self.wb_combo.currentIndex() == 1 else "as_shot"
         if e.wb_mode == "as_shot" and it.color is not None:
             t, ti = it.color.as_shot_temp_tint
@@ -1062,6 +1332,7 @@ class MainWindow(QtWidgets.QMainWindow):
             setattr(e, key, val)
         e.lens_profile = self.chk_lens.isChecked()
         self._mark_changed(it)
+        self._propagate(old, e)
         self.render_timer.start()
 
     def _mark_changed(self, it):
@@ -1089,9 +1360,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if not before and it.list_item is not None:
             import cv2
             h, w = img.shape[:2]
-            k = min(THUMB_W / w, THUMB_H / h)
+            k = min(GRID_W / w, GRID_H / h)
             small = cv2.resize(img, (max(1, int(w * k)), max(1, int(h * k))), interpolation=cv2.INTER_AREA)
-            it.list_item.setIcon(QtGui.QIcon(QtGui.QPixmap.fromImage(to_qimage(small))))
+            self._set_thumb(it, small)
+            self._thumb_pending.discard(it.path)
         overlay = []
         if (self.chk_samples.isChecked() and not before and it.wb is not None and it.wb.applied):
             for pts, col in ((it.wb.bright_pts, QtGui.QColor(0, 230, 255)),
@@ -1211,6 +1483,7 @@ class MainWindow(QtWidgets.QMainWindow):
             it.edit = self.clip_edit.copy()
             it.edit.notes = ["Pasted settings"]
             self._mark_changed(it)
+            self._queue_thumb(it)
             n += 1
         self.load_controls()
         self.refresh_view()
@@ -1243,6 +1516,9 @@ class MainWindow(QtWidgets.QMainWindow):
             it.list_item.setCheckState(Qt.CheckState.Checked if pred(it) else Qt.CheckState.Unchecked)
         self.list.blockSignals(False)
         self._update_checked_label()
+        for it in self.items.values():
+            self._update_grid_item(it)
+        self._update_scope_label()
 
     def check_selected(self):
         sel = {id(it) for it in self.selected_items()}
@@ -1305,7 +1581,7 @@ class MainWindow(QtWidgets.QMainWindow):
             it.edit = res["edit"]
             if res.get("wb") is not None:
                 it.wb = res["wb"]
-            it.list_item.setIcon(QtGui.QIcon(QtGui.QPixmap.fromImage(to_qimage(res["thumb"]))))
+            self._set_thumb(it, res["thumb"])
             self._after_batch_item(it)
         self._batch_done += 1
         if self._batch_progress:
@@ -1345,6 +1621,7 @@ class MainWindow(QtWidgets.QMainWindow):
             it.edit, it.wb = edit, wb
             it.status = "modified" if status == "approved" else status
             self._update_list_item(it)
+            self._queue_thumb(it)
         n = len(self._undo)
         self._undo = {}
         self.act_undo_batch.setEnabled(False)
@@ -1372,7 +1649,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.statusBar().showMessage(msg, 8000)
         return True
 
+    def _grid_selection(self):
+        """In grid view with several photos selected, Approve/Reject act on all of them."""
+        if not self.in_grid():
+            return []
+        sel = [it for it in self.selected_items() if it.edit is not None and it.status != "loading"]
+        return sel if len(sel) > 1 else []
+
     def approve(self):
+        many = self._grid_selection()
+        if many:
+            self._approve_many(many)
+            return
         it = self.current
         if it is None or it.edit is None:
             return
@@ -1380,6 +1668,14 @@ class MainWindow(QtWidgets.QMainWindow):
             self.next_to_review()
 
     def reject(self):
+        many = self._grid_selection()
+        if many:
+            for t in many:
+                t.status = "rejected"
+                self._update_list_item(t)
+            self._update_count()
+            self.statusBar().showMessage(f"Rejected {len(many)} photo(s). Nothing was written or deleted.", 6000)
+            return
         it = self.current
         if it is None or it.edit is None:
             return
