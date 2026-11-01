@@ -1,5 +1,28 @@
 # Changelog
 
+## v1.6.0
+
+- **My auto settings** (toolbar ★): your own recipe for automatic edits, applied to every photo you add, to
+  Auto-enhance (E) and to batch auto runs, as if it were part of the AI edit.
+  - *How auto edits should look*: Brightness (EV added to auto exposure), Punch (contrast), Colour (vibrance) and
+    the Strength of auto corrections.
+  - A rule for every setting: **Auto** (the app decides), **Always set to** a value, **Add to auto** (auto's value +
+    yours) or **Don't touch** (keep the camera's / Lightroom's value). Also *Always on / Never* for lens corrections and
+    the sky / subject masks.
+  - Save / load your settings as a file to share or keep several looks; optionally re-apply them right away to every
+    photo you haven't reviewed yet.
+- **Hold \\ to compare** with the original (let go to come back), and a **Split** before / after view with a
+  draggable divider.
+- **Finer sliders**: click a slider, then the mouse wheel nudges it (Shift = finest steps); click the number to type.
+  The wheel only moves a slider you've clicked, so scrolling the panel never changes a setting by accident.
+- **Undo approval**: puts the photo's sidecar (or DNG export) back exactly as it was before you approved, or removes it
+  if there wasn't one. Refuses if Lightroom has saved to it since, so nothing of Lightroom's is lost.
+- **Find a photo** by file name (Ctrl+F) and a **thumbnail size** slider for the grid.
+- **Analysis progress with time left**, and **Pause / Resume** for big folders.
+- **Keyboard shortcuts & tips** on **?** / F1, and a short **welcome tour** on first launch (View menu shows it again).
+- **Fold panels** you don't use by clicking their title (remembered), and **Interface size** 85-150% in the View menu.
+- *Auto strength* and *Exposure bias* moved from the Auto options menu into My auto settings.
+
 ## v1.5.0
 
 - **Starts from your existing Lightroom edits.** When a photo already has settings (its `.xmp` sidecar, or for a DNG

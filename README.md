@@ -25,6 +25,8 @@ Space Station (public domain). A tungsten-light cast was simulated, then removed
 - **Starts from your existing Lightroom edits** when a photo already has them, and keeps your own Lightroom crop and masks.
 - **Star ratings and colour labels**, written to Lightroom on approve.
 - **Remembers your settings and the photos you had open**, even across updates.
+- **My auto settings:** make auto edits brighter or moodier, punchier or softer, and set rules like *Sharpening always 60* or *never touch white balance*. Every new photo follows them.
+- **Hold-to-compare and split view**, finer sliders, **undo approval**, find by name, analysis progress with pause, foldable panels and interface sizing.
 - **Drag and drop** photos or whole folders (subfolders included).
 - **Smart auto white balance**
   - Looks for the surfaces most likely to be truly neutral: the brightest unclipped *near-whites* and the darkest *near-blacks*.
@@ -73,6 +75,8 @@ Other systems: `pip install -r requirements.txt`, then `python raw_review_app.py
 | `Ctrl+Z` / `Ctrl+Y` | Undo / redo the last change to this photo (each photo has its own history) |
 | `1`–`5` / `0` | Star rating / clear (several selected photos at once) |
 | `6` `7` `8` `9` | Red / yellow / green / blue label (press again to clear) |
+| `Ctrl+F` | Find a photo by name |
+| `?` / `F1` | All shortcuts and tips |
 | `Ctrl+C` / `Ctrl+V` | Copy settings / paste to the photos selected in the list |
 
 ## Getting the edits into Lightroom Classic

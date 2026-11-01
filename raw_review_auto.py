@@ -69,6 +69,9 @@ class AutoOptions:
     strength: float = 1.0
     exposure_bias: float = 0.0       # EV added to auto exposure (your taste / calibration)
     use_existing: bool = True        # start from settings the photo already has (Lightroom), if any
+    punch: float = 0.0               # -50..50  "My auto settings": more / less contrast than auto picks
+    colour: float = 0.0              # -50..50  more / less colour (vibrance) than auto picks
+    rules: dict = field(default_factory=dict)   # {setting: [mode, value]}  see apply_rules()
 
 
 # --------------------------------------------------------------------------
@@ -357,12 +360,78 @@ def auto_masks(dec, edit, strength=1.0) -> str:
             + " (Lightroom computes the exact masks; use Update AI Settings if it asks)")
 
 
-def run_auto(dec, edit, groups, opts: AutoOptions | None = None) -> dict:
-    """Run the chosen auto groups (in the right order) on `edit`. Returns {"wb": .., "level": ..}."""
+# --------------------------------------------------------------------------
+# "My auto settings": the user's own rules, applied after the automatic tools
+# --------------------------------------------------------------------------
+RULE_MODES = ["auto", "set", "add", "keep"]     # app decides / always this value / auto + value / don't touch
+FLAG_RULES = {"lens_profile": "Lens corrections", "sky_on": "Sky mask", "subj_on": "Subject mask"}
+FLAG_MODES = ["auto", "on", "off"]
+
+
+def apply_rules(edit, base, rules) -> int:
+    """
+    Apply the user's rules to an auto edit. `base` is the edit before the auto tools ran (As Shot for a
+    new photo), used by "keep" (don't touch). Returns how many rules changed something.
+    """
+    n = 0
+    for key, rule in (rules or {}).items():
+        try:
+            mode, value = rule[0], float(rule[1]) if len(rule) > 1 else 0.0
+        except (TypeError, ValueError, IndexError):
+            continue
+        if key in FLAG_RULES:
+            if mode in ("on", "off"):
+                want = mode == "on"
+                if getattr(edit, key) != want:
+                    n += 1
+                setattr(edit, key, want)
+            continue
+        st = core.SETTINGS.get(key)
+        if st is None or mode not in ("set", "add", "keep"):
+            continue
+        before = getattr(edit, key)
+        if mode == "set":
+            v = value
+        elif mode == "add":
+            v = getattr(edit, key) + value
+        else:
+            v = getattr(base, key)
+        v = min(max(v, st.lo), st.hi)
+        v = int(round(v)) if st.integer else round(v, st.decimals)
+        setattr(edit, key, v)
+        if st.optional:
+            if mode == "keep" and key not in base.touched:
+                edit.touched.discard(key)
+            elif mode != "keep":
+                edit.touched.add(key)
+        if key in ("temp", "tint"):
+            if mode == "keep":
+                edit.wb_mode = base.wb_mode
+                edit.temp, edit.tint = base.temp, base.tint
+            else:
+                edit.wb_mode = "custom"
+        if key == "angle":
+            if mode == "keep":
+                edit.level_mode, edit.upright = base.level_mode, base.upright
+            else:
+                edit.level_mode = "Manual"
+        if getattr(edit, key) != before:
+            n += 1
+    return n
+
+
+def active_rules(rules) -> dict:
+    return {k: r for k, r in (rules or {}).items() if r and r[0] not in ("auto",)}
+
+
+def run_auto(dec, edit, groups, opts: AutoOptions | None = None, user_rules: bool = False) -> dict:
+    """Run the chosen auto groups (in the right order) on `edit`. Returns {"wb": .., "level": ..}.
+    user_rules=True also applies "My auto settings" (new photos, Auto-enhance, re-apply)."""
     opts = opts or AutoOptions()
     groups = set(groups)
     s = opts.strength
     out = {}
+    base = edit.copy()
     for g in GROUP_ORDER:
         if g not in groups:
             continue
@@ -382,14 +451,24 @@ def run_auto(dec, edit, groups, opts: AutoOptions | None = None) -> dict:
             replace_note(edit, "Auto shadows", auto_shadows_highlights(dec, edit, s))
         elif g == "contrast":
             replace_note(edit, "Auto contrast", auto_contrast(dec, edit, s))
+            if opts.punch:
+                _set(edit, "contrast", edit.contrast + 0.4 * opts.punch)
         elif g == "colour":
             replace_note(edit, "Auto colour", auto_colour(dec, edit, s))
+            if opts.colour:
+                _set(edit, "vibrance", edit.vibrance + 0.5 * opts.colour)
         elif g == "masks":
             replace_note(edit, "Auto masks", auto_masks(dec, edit, s))
         elif g == "sharpen":
             replace_note(edit, "Auto sharpening", auto_sharpen(dec, edit, s))
         elif g == "noise":
             replace_note(edit, "Auto noise", auto_noise(dec, edit, s))
+    if user_rules:
+        rules = active_rules(opts.rules)
+        if rules:
+            changed = apply_rules(edit, base, rules)
+            replace_note(edit, "My auto settings", f"My auto settings: {len(rules)} rule(s) applied"
+                         + (f", {changed} changed the auto edit" if changed else ""))
     return out
 
 
@@ -397,7 +476,7 @@ def propose_edit(dec, opts: AutoOptions | None = None):
     """The first proposal for a freshly added photo. Returns (edit, wb result, straighten result)."""
     opts = opts or AutoOptions()
     edit = core.as_shot_edit(dec)
-    res = run_auto(dec, edit, opts.groups, opts)
+    res = run_auto(dec, edit, opts.groups, opts, user_rules=True)
     return edit, res.get("wb"), res.get("level")
 
 
@@ -414,6 +493,10 @@ class BatchSpec:
     strength: float = 1.0
     exposure_bias: float = 0.0
     changes: list = field(default_factory=list)  # (setting key, action, amount)
+    punch: float = 0.0
+    colour: float = 0.0
+    rules: dict = field(default_factory=dict)
+    user_rules: bool = False                     # also apply "My auto settings"
 
     @property
     def needs_decode(self) -> bool:
@@ -425,8 +508,11 @@ def apply_batch(dec, edit, spec: BatchSpec) -> dict:
     out = {}
     if spec.groups:
         out = run_auto(dec, edit, spec.groups,
-                       AutoOptions(set(spec.groups), spec.level_mode, spec.allow_upright,
-                                   spec.strength, spec.exposure_bias))
+                       AutoOptions(groups=set(spec.groups), level_mode=spec.level_mode,
+                                   allow_upright=spec.allow_upright, strength=spec.strength,
+                                   exposure_bias=spec.exposure_bias, punch=spec.punch, colour=spec.colour,
+                                   rules=spec.rules),
+                       user_rules=spec.user_rules)
     apply_changes(edit, spec.changes)
     return out
 

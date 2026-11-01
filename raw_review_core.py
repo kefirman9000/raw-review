@@ -1819,3 +1819,87 @@ def edit_from_dict(d: dict) -> Edit:
         if k in e.__dataclass_fields__:
             setattr(e, k, set(v) if k == "touched" else v)
     return e
+
+
+# --------------------------------------------------------------------------
+# Undo an approval: put back the sidecar / DNG export exactly as it was
+# --------------------------------------------------------------------------
+
+def output_path(raw_path: str) -> str:
+    """The file RAW Review writes for this photo (never the photo itself)."""
+    return dng_export_path(raw_path) if raw_path.lower().endswith(".dng") else sidecar_path(raw_path)
+
+
+def _check_output(raw_path: str, target: str):
+    t, r = os.path.normcase(os.path.abspath(target)), os.path.normcase(os.path.abspath(raw_path))
+    if t == r or t != os.path.normcase(os.path.abspath(output_path(raw_path))):
+        raise RawSafetyError(f"Refusing to touch {target}: it isn't RAW Review's own output for this photo.")
+    ext = os.path.splitext(t)[1]
+    if ext not in (".xmp", ".dng") or (ext == ".dng" and os.path.basename(os.path.dirname(t)) !=
+                                       os.path.normcase(DNG_EXPORT_DIR)):
+        raise RawSafetyError(f"Refusing to touch {target}.")
+
+
+def file_hash(path: str):
+    import hashlib
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
+
+
+def snapshot_output(raw_path: str, store_dir: str) -> dict:
+    """Remember the output file as it is now (before an approval writes it)."""
+    target = output_path(raw_path)
+    snap = {"target": target, "existed": os.path.isfile(target), "data": None, "copy": None}
+    if snap["existed"]:
+        if target.lower().endswith(".xmp"):
+            with open(target, "rb") as f:
+                snap["data"] = f.read()
+        else:                                           # DNG export: keep a copy on disk, not in memory
+            os.makedirs(store_dir, exist_ok=True)
+            snap["copy"] = os.path.join(store_dir, uuid.uuid4().hex + ".dng")
+            shutil.copy2(target, snap["copy"])
+    return snap
+
+
+def restore_output(raw_path: str, snap: dict, written_hash) -> str:
+    """
+    Undo an approval. Only works while the file is still exactly what the approval wrote (so nothing
+    Lightroom saved since is lost). An output that didn't exist before is removed again; the photo
+    itself is never touched.
+    """
+    target = snap["target"]
+    _check_output(raw_path, target)
+    before = raw_fingerprint(raw_path)
+    if os.path.isfile(target) and written_hash and file_hash(target) != written_hash:
+        raise RawSafetyError(f"{os.path.basename(target)} has changed since it was approved (Lightroom may have "
+                             "saved to it), so it was left alone.")
+    if snap["existed"]:
+        folder = os.path.dirname(target)
+        fd, tmp = tempfile.mkstemp(prefix=".rawreview-", suffix=os.path.splitext(target)[1] + ".tmp", dir=folder)
+        try:
+            with os.fdopen(fd, "wb") as f:
+                if snap["data"] is not None:
+                    f.write(snap["data"])
+                else:
+                    with open(snap["copy"], "rb") as src:
+                        shutil.copyfileobj(src, f)
+            os.replace(tmp, target)
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        msg = f"Put back the previous {os.path.basename(target)}"
+    else:
+        if os.path.isfile(target):
+            os.remove(target)                               # RAW Review's own new file, unchanged since
+        msg = f"Removed {os.path.basename(target)} (it didn't exist before this approval)"
+    if snap.get("copy") and os.path.isfile(snap["copy"]):
+        os.remove(snap["copy"])
+    if raw_fingerprint(raw_path) != before:
+        raise RawSafetyError(f"{raw_path} changed during undo - stopping.")
+    return msg

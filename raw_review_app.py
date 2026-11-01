@@ -14,7 +14,9 @@ RAW files are NEVER modified, moved, renamed or deleted - they are only read.
 from __future__ import annotations
 
 import base64
+import copy
 import json
+from collections import deque
 import os
 import sys
 import time
@@ -35,9 +37,60 @@ CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".raw_review")   # settings +
 SETTINGS_FILE = os.path.join(CONFIG_DIR, "settings.json")
 SESSION_FILE = os.path.join(CONFIG_DIR, "session.json")
 LABEL_COLOURS = {"Red": "#d9534f", "Yellow": "#e6c229", "Green": "#4caf50", "Blue": "#3f7fd9", "Purple": "#9c5bd6"}
+HELP_HTML = """
+<h3>Keyboard</h3>
+<table cellpadding="3">
+<tr><td><b>A</b> / <b>X</b></td><td>Approve (write to Lightroom) / reject. In grid view: all selected photos</td></tr>
+<tr><td><b>← →</b></td><td>Previous / next photo</td></tr>
+<tr><td><b>Hold \\</b></td><td>Show the original while held. Tick <i>Split</i> for a draggable before/after view</td></tr>
+<tr><td><b>G</b></td><td>Grid view on / off (double-click or Enter opens a photo)</td></tr>
+<tr><td><b>1-5</b>, <b>0</b></td><td>Star rating, clear rating</td></tr>
+<tr><td><b>6 7 8 9</b></td><td>Red / yellow / green / blue label (press again to clear)</td></tr>
+<tr><td><b>E</b> / <b>W</b></td><td>Auto-enhance (uses <i>My auto settings</i>) / auto white balance</td></tr>
+<tr><td><b>C</b></td><td>Check / uncheck this photo</td></tr>
+<tr><td><b>Ctrl+Z</b> / <b>Ctrl+Y</b></td><td>Undo / redo the last change to this photo</td></tr>
+<tr><td><b>Ctrl+C</b> / <b>Ctrl+V</b></td><td>Copy settings / paste to checked or selected photos</td></tr>
+<tr><td><b>Ctrl+F</b></td><td>Find a photo by file name</td></tr>
+<tr><td><b>? or F1</b></td><td>This help</td></tr>
+</table>
+<h3>Sliders</h3>
+<p>Click a slider, then use the mouse wheel to nudge it (hold <b>Shift</b> for the finest steps). Click the number to
+type a value. Double-click a slider's name to reset it. (The wheel only moves a slider you've clicked, so scrolling the
+panel never changes settings by accident.)</p>
+<h3>Tips</h3>
+<ul>
+<li><b>My auto settings</b> (toolbar) is your own recipe: how bright / punchy / colourful auto edits should be, and a
+rule for any setting (always this value, add to auto, or don't touch). It's applied to every new photo automatically.</li>
+<li><b>Edits apply to</b> (top of the controls) copies slider changes to selected or checked photos.</li>
+<li>Click a panel's title to fold it away. <b>View</b> menu: interface size, fold / unfold all panels.</li>
+<li>Your RAW files are only ever read. Approving writes a .xmp sidecar (or an edited DNG copy); <b>Undo approval</b>
+puts it back exactly as it was.</li>
+</ul>
+"""
+
+TOUR_PAGES = [
+    ("Welcome to RAW Review",
+     "Drag photos or whole folders onto the window. Each photo gets an automatic edit: white balance, straighten, "
+     "exposure, tone, colour, sky / subject masks, sharpening and noise reduction.<br><br>"
+     "Your RAW files are never changed: approved edits go to Lightroom as standard .xmp sidecars."),
+    ("Review fast",
+     "Press <b>A</b> to approve (write to Lightroom) or <b>X</b> to reject, and the next photo opens.<br>"
+     "Hold <b>\\</b> to see the original. Press <b>G</b> for a grid of the whole shoot. "
+     "<b>1-5</b> rate, <b>6-9</b> colour-label."),
+    ("Make auto edits yours",
+     "Open <b>My auto settings</b> in the toolbar: make auto edits brighter or moodier, punchier or softer, and set rules "
+     "such as <i>Sharpening always 60</i> or <i>never touch white balance</i>. Every new photo follows them."),
+    ("Tweak many at once",
+     "Change <b>Edits apply to</b> (top of the controls) to <i>Selected</i> or <i>Checked photos</i> and every slider "
+     "move goes to all of them. <b>Ctrl+Z</b> undoes per photo."),
+    ("You're set",
+     "Press <b>?</b> any time for all the keys. In Lightroom, import the folder (or use <i>Metadata → Read Metadata "
+     "from Files</i> for photos already in your catalog)."),
+]
+
 CACHE_SIZE = 24          # decoded previews kept in memory
 THUMB_W, THUMB_H = 120, 80      # list icons
-GRID_W, GRID_H = 240, 160        # grid view thumbnails (also the size thumbnails are made at)
+GRID_W, GRID_H = 320, 213        # size thumbnails are made at (grid shows them at the chosen size)
 
 STATUS_STYLE = {
     "loading":  ("Analyzing…", QtGui.QColor(90, 90, 90)),
@@ -64,6 +117,7 @@ class Item:
         self.rating: int | None = None    # 0-5 stars (None = leave the file's rating alone)
         self.label: str | None = None     # Lightroom colour label ("" = clear, None = leave alone)
         self.lr_edit = None               # the settings the photo already had (Lightroom), if any
+        self.approve_undo = None          # (snapshot, written hash, status before) of the last approval
         self.undo: list = []          # earlier versions of .edit (newest last)
         self.redo: list = []
         self.undo_key = None          # what the last undo step was about (merges one slider drag)
@@ -181,6 +235,7 @@ def to_qimage(rgb: np.ndarray) -> QtGui.QImage:
 
 class ImageView(QtWidgets.QWidget):
     clicked = Signal(float, float)       # pixel coords in the displayed image
+    splitMoved = Signal(float)           # 0..1 position of the before/after divider
 
     def __init__(self):
         super().__init__()
@@ -190,6 +245,9 @@ class ImageView(QtWidgets.QWidget):
         self.message = "Drag RAW photos or folders here"
         self.badge = ""
         self.crosshair = False
+        self.split_on = False
+        self.split_pos = 0.5
+        self._dragging = False
         self.setMouseTracking(True)
 
     def set_image(self, img, overlay=None, badge=""):
@@ -217,6 +275,21 @@ class ImageView(QtWidgets.QWidget):
             for x, y, col in self.overlay:
                 p.setPen(QtGui.QPen(col, 1.5))
                 p.drawEllipse(QtCore.QPointF(r.x() + x * s, r.y() + y * s), 3, 3)
+            if self.split_on:
+                x = r.x() + self.split_pos * r.width()
+                p.setPen(QtGui.QPen(QtGui.QColor(255, 255, 255), 2))
+                p.drawLine(QtCore.QPointF(x, r.y()), QtCore.QPointF(x, r.bottom()))
+                p.setBrush(QtGui.QColor(255, 255, 255))
+                p.drawEllipse(QtCore.QPointF(x, r.center().y()), 9, 9)
+                p.setFont(QtGui.QFont(self.font().family(), 9, QtGui.QFont.Weight.Bold))
+                for text, left in (("BEFORE", True), ("AFTER", False)):
+                    fm = p.fontMetrics()
+                    br = fm.boundingRect(text).adjusted(-6, -3, 6, 3)
+                    br.moveTop(int(r.bottom()) - br.height() - 8)
+                    br.moveLeft(int(x) - br.width() - 8 if left else int(x) + 8)
+                    p.fillRect(br, QtGui.QColor(0, 0, 0, 160))
+                    p.setPen(QtGui.QColor(240, 240, 240))
+                    p.drawText(br, Qt.AlignmentFlag.AlignCenter, text)
         if self.badge:
             p.setFont(QtGui.QFont(self.font().family(), 10))
             fm = p.fontMetrics()
@@ -235,16 +308,65 @@ class ImageView(QtWidgets.QWidget):
                            Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignLeft, self.message)
         p.end()
 
+    def _split_to(self, pos):
+        r, _s = self._target()
+        self.split_pos = min(max((pos.x() - r.x()) / max(r.width(), 1.0), 0.0), 1.0)
+        self.splitMoved.emit(self.split_pos)
+
     def mousePressEvent(self, e):
         if self.img is None or e.button() != Qt.MouseButton.LeftButton:
             return
         r, s = self._target()
         pos = e.position()
+        if self.split_on and not self.crosshair:
+            self._dragging = True
+            self._split_to(pos)
+            return
         if r.contains(pos):
             self.clicked.emit((pos.x() - r.x()) / s, (pos.y() - r.y()) / s)
 
+    def mouseReleaseEvent(self, e):
+        self._dragging = False
+
     def mouseMoveEvent(self, e):
-        self.setCursor(Qt.CursorShape.CrossCursor if self.crosshair else Qt.CursorShape.ArrowCursor)
+        if self._dragging and self.img is not None:
+            self._split_to(e.position())
+            return
+        if self.crosshair:
+            self.setCursor(Qt.CursorShape.CrossCursor)
+        elif self.split_on:
+            self.setCursor(Qt.CursorShape.SplitHCursor)
+        else:
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+
+
+class FineSlider(QtWidgets.QSlider):
+    """Mouse wheel nudges only a slider you've clicked (so scrolling the panel is safe); Shift = finest."""
+    def __init__(self, *a):
+        super().__init__(*a)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def wheelEvent(self, e):
+        if not self.hasFocus():
+            e.ignore()
+            return
+        d = e.angleDelta().y() or e.angleDelta().x()
+        notches = d / 120.0
+        fine = bool(e.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+        self.setValue(self.value() + int(round(notches * (1 if fine else 4))) or (1 if d > 0 else -1))
+        e.accept()
+
+
+class FineSpin(QtWidgets.QDoubleSpinBox):
+    def __init__(self, *a):
+        super().__init__(*a)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def wheelEvent(self, e):
+        if not self.hasFocus():
+            e.ignore()
+            return
+        super().wheelEvent(e)
 
 
 class SliderRow(QtWidgets.QWidget):
@@ -258,9 +380,10 @@ class SliderRow(QtWidgets.QWidget):
         lay.setContentsMargins(0, 2, 0 , 2)
         self.lbl = QtWidgets.QLabel(label)
         self.lbl.setToolTip("Double-click to reset")
-        self.slider = QtWidgets.QSlider(Qt.Orientation.Horizontal)
+        self.slider = FineSlider(Qt.Orientation.Horizontal)
         self.slider.setRange(int(round(lo * self.scale)), int(round(hi * self.scale)))
-        self.spin = QtWidgets.QDoubleSpinBox()
+        self.slider.setToolTip("Click, then mouse wheel to nudge (Shift = finest). Double-click the name to reset.")
+        self.spin = FineSpin()
         self.spin.setRange(lo, hi)
         self.spin.setDecimals(decimals)
         self.spin.setSingleStep(step)
@@ -298,6 +421,234 @@ class SliderRow(QtWidgets.QWidget):
             w.blockSignals(False)
         if emit:
             self.changed.emit(val)
+
+
+class MyAutoDialog(QtWidgets.QDialog):
+    """The user's own recipe for automatic edits: look targets + a rule per setting."""
+
+    MODE_LABELS = ["Auto", "Always set to", "Add to auto", "Don't touch"]
+    FLAG_LABELS = ["Auto", "Always on", "Never"]
+    SECTIONS = [
+        ("White balance", ["temp", "tint"]),
+        ("Tone", ["exposure", "contrast", "highlights", "shadows", "whites", "blacks"]),
+        ("Colour", ["vibrance", "saturation"]),
+        ("Sharpening", ["sharp_amount", "sharp_radius", "sharp_detail", "sharp_masking"]),
+        ("Noise reduction", ["nr_luma", "nr_luma_detail", "nr_color"]),
+        ("Straighten", ["angle"]),
+    ]
+
+    def __init__(self, parent, opts):
+        super().__init__(parent)
+        self.setWindowTitle("My auto settings")
+        self.resize(640, 760)
+        lay = QtWidgets.QVBoxLayout(self)
+        intro = QtWidgets.QLabel(
+            "Your own recipe for automatic edits. It's applied to every photo you add, to <b>Auto-enhance (E)</b> "
+            "and to batch auto runs, as if it were part of the AI edit. Single auto buttons (e.g. Auto WB) are not "
+            "affected.")
+        intro.setWordWrap(True)
+        lay.addWidget(intro)
+
+        look = QtWidgets.QGroupBox("How auto edits should look")
+        ll = QtWidgets.QVBoxLayout(look)
+        self.s_bright = SliderRow("Brightness (EV added to auto exposure)", -1.5, 1.5, 0.05, 2, 0.0)
+        self.s_punch = SliderRow("Punch (contrast compared with auto)", -50, 50, 1, 0, 0)
+        self.s_colour = SliderRow("Colour (vibrance compared with auto)", -50, 50, 1, 0, 0)
+        self.s_strength = SliderRow("Strength of auto corrections (%)", 25, 150, 5, 0, 100)
+        self.s_bright.setValue(opts.exposure_bias)
+        self.s_punch.setValue(opts.punch)
+        self.s_colour.setValue(opts.colour)
+        self.s_strength.setValue(round(opts.strength * 100))
+        for w in (self.s_bright, self.s_punch, self.s_colour, self.s_strength):
+            ll.addWidget(w)
+        lay.addWidget(look)
+
+        rules_box = QtWidgets.QGroupBox("Rules for individual settings")
+        rb = QtWidgets.QVBoxLayout(rules_box)
+        hint = QtWidgets.QLabel("<i>Always set to</i> = that value on every photo · <i>Add to auto</i> = auto's value "
+                                "plus yours · <i>Don't touch</i> = keep the camera's / Lightroom's value")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#9ab;")
+        rb.addWidget(hint)
+        inner = QtWidgets.QWidget()
+        grid = QtWidgets.QGridLayout(inner)
+        grid.setColumnStretch(0, 1)
+        self.rows = {}
+        rules = opts.rules or {}
+        r = 0
+        for title, keys in self.SECTIONS:
+            h = QtWidgets.QLabel(f"<b>{title}</b>")
+            grid.addWidget(h, r, 0, 1, 3)
+            r += 1
+            for key in keys:
+                r = self._add_row(grid, r, key, rules.get(key))
+        for title, prefix in (("Sky mask adjustments", "sky_"), ("Subject mask adjustments", "subj_")):
+            grid.addWidget(QtWidgets.QLabel(f"<b>{title}</b>"), r, 0, 1, 3)
+            r += 1
+            for key in [k for k in core.SETTINGS if k.startswith(prefix)]:
+                r = self._add_row(grid, r, key, rules.get(key))
+        grid.addWidget(QtWidgets.QLabel("<b>On / off</b>"), r, 0, 1, 3)
+        r += 1
+        self.flags = {}
+        for key, label in auto.FLAG_RULES.items():
+            grid.addWidget(QtWidgets.QLabel(label), r, 0)
+            cb = QtWidgets.QComboBox()
+            cb.addItems(self.FLAG_LABELS)
+            mode = (rules.get(key) or ["auto"])[0]
+            cb.setCurrentIndex(auto.FLAG_MODES.index(mode) if mode in auto.FLAG_MODES else 0)
+            grid.addWidget(cb, r, 1)
+            self.flags[key] = cb
+            r += 1
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(inner)
+        rb.addWidget(scroll)
+        lay.addWidget(rules_box, 1)
+
+        self.chk_reapply = QtWidgets.QCheckBox("Also re-apply now to photos I haven't reviewed yet")
+        self.chk_reapply.setToolTip("Re-runs the auto edit with these settings on every photo still marked "
+                                    "'To review'. Approved and rejected photos are left alone.")
+        lay.addWidget(self.chk_reapply)
+        row = QtWidgets.QHBoxLayout()
+        b_reset = QtWidgets.QPushButton("Reset all to Auto")
+        b_save = QtWidgets.QPushButton("Save to file…")
+        b_load = QtWidgets.QPushButton("Load from file…")
+        b_reset.clicked.connect(self._reset)
+        b_save.clicked.connect(self._save)
+        b_load.clicked.connect(self._load)
+        for b in (b_reset, b_save, b_load):
+            row.addWidget(b)
+        row.addStretch(1)
+        bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Ok
+                                        | QtWidgets.QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        row.addWidget(bb)
+        lay.addLayout(row)
+
+    def _add_row(self, grid, r, key, rule):
+        st = core.SETTINGS[key]
+        grid.addWidget(QtWidgets.QLabel(core.SETTINGS[key].label if key.startswith(("sky_", "subj_"))
+                                        else core.setting_name(key)), r, 0)
+        cb = QtWidgets.QComboBox()
+        cb.addItems(self.MODE_LABELS)
+        spin = QtWidgets.QDoubleSpinBox()
+        spin.setDecimals(st.decimals)
+        spin.setSingleStep(st.step)
+        spin.setFixedWidth(90)
+        mode, value = (rule or ["auto", st.default])[0], float((rule or ["auto", st.default])[1])
+
+        def on_mode(i, spin=spin, st=st):
+            if i == 2:
+                span = st.hi - st.lo
+                spin.setRange(-span, span)
+            else:
+                spin.setRange(st.lo, st.hi)
+            spin.setEnabled(i in (1, 2))
+        cb.currentIndexChanged.connect(on_mode)
+        idx = auto.RULE_MODES.index(mode) if mode in auto.RULE_MODES else 0
+        cb.setCurrentIndex(idx)
+        on_mode(idx)
+        spin.setValue(value if idx in (1, 2) else (0.0 if idx == 2 else st.default))
+        grid.addWidget(cb, r, 1)
+        grid.addWidget(spin, r, 2)
+        self.rows[key] = (cb, spin)
+        return r + 1
+
+    def _reset(self):
+        for key, (cb, spin) in self.rows.items():
+            cb.setCurrentIndex(0)
+            spin.setValue(core.SETTINGS[key].default)
+        for cb in self.flags.values():
+            cb.setCurrentIndex(0)
+        for w, v in ((self.s_bright, 0.0), (self.s_punch, 0), (self.s_colour, 0), (self.s_strength, 100)):
+            w.setValue(v)
+
+    def values(self):
+        rules = {}
+        for key, (cb, spin) in self.rows.items():
+            mode = auto.RULE_MODES[cb.currentIndex()]
+            if mode != "auto":
+                rules[key] = [mode, spin.value()]
+        for key, cb in self.flags.items():
+            mode = auto.FLAG_MODES[cb.currentIndex()]
+            if mode != "auto":
+                rules[key] = [mode, 0]
+        return {"exposure_bias": round(self.s_bright.value(), 2), "punch": self.s_punch.value(),
+                "colour": self.s_colour.value(), "strength": self.s_strength.value() / 100.0, "rules": rules}
+
+    def _apply_values(self, v):
+        self.s_bright.setValue(float(v.get("exposure_bias", 0.0)))
+        self.s_punch.setValue(float(v.get("punch", 0)))
+        self.s_colour.setValue(float(v.get("colour", 0)))
+        self.s_strength.setValue(float(v.get("strength", 1.0)) * 100)
+        rules = v.get("rules", {})
+        for key, (cb, spin) in self.rows.items():
+            mode, val = (rules.get(key) or ["auto", core.SETTINGS[key].default])[:2]
+            cb.setCurrentIndex(auto.RULE_MODES.index(mode) if mode in auto.RULE_MODES else 0)
+            spin.setValue(float(val))
+        for key, cb in self.flags.items():
+            mode = (rules.get(key) or ["auto"])[0]
+            cb.setCurrentIndex(auto.FLAG_MODES.index(mode) if mode in auto.FLAG_MODES else 0)
+
+    def _save(self):
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save my auto settings", "my auto settings.json",
+                                                        "Auto settings (*.json)")
+        if path:
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(self.values(), f, indent=1)
+            except OSError as ex:
+                QtWidgets.QMessageBox.warning(self, "Save", str(ex))
+
+    def _load(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load auto settings", "", "Auto settings (*.json)")
+        if path:
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    self._apply_values(json.load(f))
+            except (OSError, ValueError) as ex:
+                QtWidgets.QMessageBox.warning(self, "Load", f"Couldn't read that file:\n{ex}")
+
+
+class TourDialog(QtWidgets.QDialog):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setWindowTitle("Welcome")
+        self.resize(520, 300)
+        lay = QtWidgets.QVBoxLayout(self)
+        self.stack = QtWidgets.QStackedWidget()
+        for title, body in TOUR_PAGES:
+            w = QtWidgets.QLabel(f"<h2>{title}</h2><p style='font-size:13px'>{body}</p>")
+            w.setWordWrap(True)
+            w.setAlignment(Qt.AlignmentFlag.AlignTop)
+            self.stack.addWidget(w)
+        lay.addWidget(self.stack, 1)
+        row = QtWidgets.QHBoxLayout()
+        self.lbl = QtWidgets.QLabel("")
+        self.b_back = QtWidgets.QPushButton("Back")
+        self.b_next = QtWidgets.QPushButton("Next")
+        b_skip = QtWidgets.QPushButton("Skip")
+        self.b_back.clicked.connect(lambda: self._go(-1))
+        self.b_next.clicked.connect(lambda: self._go(1))
+        b_skip.clicked.connect(self.accept)
+        row.addWidget(self.lbl)
+        row.addStretch(1)
+        for b in (b_skip, self.b_back, self.b_next):
+            row.addWidget(b)
+        lay.addLayout(row)
+        self._go(0)
+
+    def _go(self, d):
+        i = self.stack.currentIndex() + d
+        if i >= self.stack.count():
+            self.accept()
+            return
+        self.stack.setCurrentIndex(max(0, i))
+        i = self.stack.currentIndex()
+        self.lbl.setText(f"{i + 1} / {self.stack.count()}")
+        self.b_back.setEnabled(i > 0)
+        self.b_next.setText("Done" if i == self.stack.count() - 1 else "Next")
 
 
 class BatchDialog(QtWidgets.QDialog):
@@ -488,6 +839,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._restore_map = {}
         self._last_session_text = ""
         self.last_dir = ""
+        self._queue = deque()                 # photos waiting to be analysed
+        self._analyzing = set()
+        self._an_total = self._an_done = 0
+        self._an_t0 = 0.0
+        self._paused = False
+        self._hold_before = False
+        self._split_cache = None              # (before, after) images for the split view
         self._build_ui()
         self._build_shortcuts()
         self._set_controls_enabled(False)
@@ -497,13 +855,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.autosave.timeout.connect(self.save_state)
         self.autosave.start()
         QTimer.singleShot(0, self.restore_session)
+        QtWidgets.QApplication.instance().installEventFilter(self)
+        if not self._settings.get("tour_done"):
+            QTimer.singleShot(600, self.show_tour)
         QTimer.singleShot(2500, lambda: self.check_updates(manual=False))   # quiet check
 
     # ---------------- UI ----------------
     def _opts_snapshot(self) -> "auto.AutoOptions":
-        o = self.opts
-        return auto.AutoOptions(set(o.groups), o.level_mode, o.allow_upright, o.strength, o.exposure_bias,
-                                o.use_existing)
+        return copy.deepcopy(self.opts)
 
     def _opts_changed(self, *_):
         groups = {k for k, a in self.auto_actions.items() if a.isChecked()}
@@ -552,22 +911,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.act_upright.setChecked(self.opts.allow_upright)
         self.act_upright.toggled.connect(self._opts_changed)
         menu.addSeparator()
-        sm = menu.addMenu("Auto strength")
-        g2 = QtGui.QActionGroup(sm)
-        for pct in (50, 75, 100, 125, 150):
-            a = sm.addAction(f"{pct}%")
-            a.setCheckable(True)
-            g2.addAction(a)
-            a.setChecked(pct == round(self.opts.strength * 100))
-            a.triggered.connect(lambda _c=False, p=pct: setattr(self.opts, "strength", p / 100.0))
-        bm = menu.addMenu("Exposure bias (brighter / darker)")
-        g3 = QtGui.QActionGroup(bm)
-        for ev in (-1.0, -0.5, -0.25, 0.0, 0.25, 0.5, 1.0):
-            a = bm.addAction(f"{ev:+.2f} EV" if ev else "0 EV")
-            a.setCheckable(True)
-            g3.addAction(a)
-            a.setChecked(abs(ev - self.opts.exposure_bias) < 1e-6)
-            a.triggered.connect(lambda _c=False, v=ev: setattr(self.opts, "exposure_bias", v))
+        menu.addAction("My auto settings… (brightness, strength, your rules)", self.open_my_auto)
         menu.addSeparator()
         pm = menu.addMenu("Camera profile (DNG colour)")
         popt = dng_profile.OPTIONS
@@ -666,6 +1010,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.act_grid.toggled.connect(self.set_grid)
         tb.addSeparator()
         tb.addWidget(self._build_auto_menu())
+        self.act_myauto = tb.addAction("★ My auto settings…", self.open_my_auto)
+        self.act_myauto.setToolTip("Your own recipe for auto edits: brightness, punch, colour, and a rule per setting")
         self.act_batch = tb.addAction("Batch edit…", self.open_batch)
         self.act_batch.setToolTip("Run auto tools or raise/lower/set settings on checked, selected or all photos")
         self.act_undo_batch = tb.addAction("Undo batch", self.undo_batch)
@@ -683,6 +1029,8 @@ class MainWindow(QtWidgets.QMainWindow):
         spacer = QtWidgets.QWidget()
         spacer.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Preferred)
         tb.addWidget(spacer)
+        tb.addWidget(self._build_view_menu())
+        tb.addAction("? Help", self.show_help)
         self.act_update = tb.addAction("Check for Updates", lambda: self.check_updates(manual=True))
         self.act_update.setToolTip(f"You have v{__version__}. Checks github.com/{updater.GITHUB_REPO}")
 
@@ -700,6 +1048,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.list.itemChanged.connect(self._on_list_item_changed)
         self.list.itemSelectionChanged.connect(self._sync_grid_from_list)
         self.count_lbl = QtWidgets.QLabel("No photos")
+        self.count_lbl.setWordWrap(True)
         self.checked_lbl = QtWidgets.QLabel("0 checked")
         chk_btn = QtWidgets.QToolButton()
         chk_btn.setText("Check ▾")
@@ -720,6 +1069,11 @@ class MainWindow(QtWidgets.QMainWindow):
         ll.addLayout(top)
         ll.addWidget(self.list)
         ll.addWidget(self.count_lbl)
+        self.btn_pause = QtWidgets.QPushButton("⏸ Pause analysis")
+        self.btn_pause.setCheckable(True)
+        self.btn_pause.setVisible(False)
+        self.btn_pause.toggled.connect(self.set_paused)
+        ll.addWidget(self.btn_pause)
         split.addWidget(left)
 
         # Center: image + nav
@@ -745,7 +1099,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stack = QtWidgets.QStackedWidget()
         self.stack.addWidget(self.view)
         self.stack.addWidget(self.grid)
+        bar = QtWidgets.QHBoxLayout()
+        self.search = QtWidgets.QLineEdit()
+        self.search.setPlaceholderText("Find photo by name…  (Ctrl+F)")
+        self.search.setClearButtonEnabled(True)
+        self.search.textChanged.connect(self.apply_filter)
+        bar.addWidget(self.search, 1)
+        self.thumb_lbl = QtWidgets.QLabel("Thumbnail size")
+        self.thumb_size = QtWidgets.QSlider(Qt.Orientation.Horizontal)
+        self.thumb_size.setRange(110, GRID_W)
+        self.thumb_size.setValue(240)
+        self.thumb_size.setFixedWidth(160)
+        self.thumb_size.valueChanged.connect(self.set_thumb_size)
+        bar.addWidget(self.thumb_lbl)
+        bar.addWidget(self.thumb_size)
+        cl.addLayout(bar)
         cl.addWidget(self.stack, 1)
+        self.view.splitMoved.connect(lambda _p: self._compose_split())
         self.notes_lbl = QtWidgets.QLabel("")
         self.notes_lbl.setWordWrap(True)
         self.notes_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -755,10 +1125,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_reject = QtWidgets.QPushButton("✗ Reject  (X)")
         self.btn_approve = QtWidgets.QPushButton("✓ Approve && write XMP  (A)")
         self.btn_next = QtWidgets.QPushButton("Next ▶")
-        self.chk_before = QtWidgets.QCheckBox("Before  (\\)")
+        self.chk_before = QtWidgets.QCheckBox("Before  (hold \\)")
+        self.chk_split = QtWidgets.QCheckBox("Split")
+        self.chk_split.setToolTip("Before / after side by side: drag the divider")
+        self.chk_split.toggled.connect(self._split_toggled)
         self.btn_reject.setStyleSheet("QPushButton{background:#6b2a2a;color:white;padding:8px 16px;}")
         self.btn_approve.setStyleSheet("QPushButton{background:#2a6b3a;color:white;padding:8px 16px;font-weight:bold;}")
-        for w in (self.btn_prev, self.chk_before):
+        for w in (self.btn_prev, self.chk_before, self.chk_split):
             nav.addWidget(w)
         nav.addStretch(1)
         nav.addWidget(self.btn_reject)
@@ -796,11 +1169,32 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chk_relative.toggled.connect(lambda _v: self._update_scope_label())
         pl.addWidget(g_scope)
 
+        self._panels = {}
+        collapsed = set(self._settings.get("collapsed", []))
+
         def group(title, auto_groups=None):
-            box = QtWidgets.QGroupBox(title)
-            lay = QtWidgets.QVBoxLayout(box)
+            box = QtWidgets.QGroupBox()
+            outer = QtWidgets.QVBoxLayout(box)
+            outer.setContentsMargins(6, 4, 6, 6)
+            head = QtWidgets.QHBoxLayout()
+            btn = QtWidgets.QToolButton()
+            btn.setStyleSheet("QToolButton{border:none;font-weight:bold;}")
+            btn.setToolTip("Click to fold / unfold")
+            head.addWidget(btn, 1, Qt.AlignmentFlag.AlignLeft)
             if auto_groups:
-                lay.addWidget(self._auto_button(auto_groups), 0, Qt.AlignmentFlag.AlignRight)
+                head.addWidget(self._auto_button(auto_groups), 0, Qt.AlignmentFlag.AlignRight)
+            outer.addLayout(head)
+            content = QtWidgets.QWidget()
+            lay = QtWidgets.QVBoxLayout(content)
+            lay.setContentsMargins(0, 0, 0, 0)
+            outer.addWidget(content)
+
+            def set_open(on, btn=btn, content=content, title=title):
+                content.setVisible(on)
+                btn.setText(("▾  " if on else "▸  ") + title)
+            btn.clicked.connect(lambda _c=False, c=content, f=set_open: f(not c.isVisible()))
+            set_open(title not in collapsed)
+            self._panels[title] = (content, set_open)
             pl.addWidget(box)
             return lay
 
@@ -913,6 +1307,11 @@ class MainWindow(QtWidgets.QMainWindow):
         ml.addWidget(self.btn_undo, 3, 0)
         ml.addWidget(self.btn_redo, 3, 1)
         ml.addWidget(self.btn_reset_lr, 4, 0, 1, 2)
+        self.btn_undo_approve = QtWidgets.QPushButton("Undo approval")
+        self.btn_undo_approve.setToolTip("Put this photo's sidecar / DNG export back exactly as it was before you "
+                                         "approved it (only while Lightroom hasn't changed it since)")
+        self.btn_undo_approve.clicked.connect(self.undo_approval)
+        ml.addWidget(self.btn_undo_approve, 6, 0, 1, 2)
         self.rating_lbl = QtWidgets.QLabel("")
         self.rating_lbl.setToolTip("Star rating 1-5 (0 clears) and colour label 6 red, 7 yellow, 8 green, 9 blue "
                                    "(press again to clear). Written to Lightroom when you approve.")
@@ -967,7 +1366,9 @@ class MainWindow(QtWidgets.QMainWindow):
         sc("X", self.reject)
         sc("Right", lambda: self.step(1))
         sc("Left", lambda: self.step(-1))
-        sc("\\", lambda: self.chk_before.toggle())
+        sc("?", self.show_help)
+        sc("F1", self.show_help)
+        sc("Ctrl+F", lambda: (self.search.setFocus(), self.search.selectAll()))
         sc("Ctrl+C", self.copy_settings)
         sc("Ctrl+V", self.paste_settings)
         sc("W", self.do_auto_wb)
@@ -990,6 +1391,8 @@ class MainWindow(QtWidgets.QMainWindow):
         widgets += [w for k, w in self.sliders.items() if k not in mask_keys]
         widgets += [self.box_sky, self.box_subj, self.chk_masks, self.btn_undo, self.btn_redo]
         self.btn_reset_lr.setEnabled(bool(on and self.current is not None and self.current.lr_edit is not None))
+        self.btn_undo_approve.setEnabled(bool(on and self.current is not None
+                                              and getattr(self.current, "approve_undo", None)))
         for w in widgets:
             w.setEnabled(on)
         if on:
@@ -1060,7 +1463,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self.grid.addItem(gi)
             self._update_list_item(it)
             self._requested.add(f)
-            self.pool.start(DecodeTask(self.gen, f, True, opts, self.signals))
+            self._queue.append((self.gen, f, opts))
+        if new:
+            if not self._analyzing and self._an_done >= self._an_total:
+                self._an_total = self._an_done = 0
+                self._an_t0 = time.monotonic()
+            self._an_total += len(new)
+            self._pump()
 
         msg = f"Added {len(new)} photo(s)."
         if len(found) > len(new):
@@ -1084,6 +1493,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._undo = {}
         self.act_undo_batch.setEnabled(False)
         self._restore_map = {}
+        self._queue.clear()
+        self._analyzing.clear()
+        self._an_total = self._an_done = 0
         self.list.clear()
         self.grid.clear()
         self._thumb_pending.clear()
@@ -1095,7 +1507,28 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_checked_label()
 
     # ---------------- background results ----------------
+    def _pump(self):
+        limit = max(1, self.pool.maxThreadCount())
+        while self._queue and not self._paused and len(self._analyzing) < limit:
+            gen, f, opts = self._queue.popleft()
+            if gen != self.gen or f not in self.items:
+                continue
+            self._analyzing.add(f)
+            self.pool.start(DecodeTask(gen, f, True, opts, self.signals))
+        self._update_count()
+
+    def set_paused(self, on):
+        self._paused = bool(on)
+        self.btn_pause.setText("▶ Resume analysis" if on else "⏸ Pause analysis")
+        if not on:
+            self._pump()
+        self._update_count()
+
     def on_decoded(self, gen, path, res, err):
+        if path in self._analyzing and gen == self.gen:
+            self._analyzing.discard(path)
+            self._an_done += 1
+            self._pump()
         if gen != self.gen or path not in self.items:
             return
         self._requested.discard(path)
@@ -1363,10 +1796,22 @@ class MainWindow(QtWidgets.QMainWindow):
         c = {k: 0 for k in STATUS_STYLE}
         for it in self.items.values():
             c[it.status] += 1
+        busy = bool(self._queue or self._analyzing)
+        prog = ""
+        if busy and self._an_total:
+            done = self._an_done
+            prog = f"\nAnalyzing {min(done + 1, self._an_total)} of {self._an_total}"
+            if self._paused:
+                prog += " · paused"
+            elif done >= 2:
+                left = (time.monotonic() - self._an_t0) / done * (self._an_total - done)
+                prog += f" · about {int(left // 60)} min {int(left % 60):02d} s left" if left >= 60 else \
+                    f" · about {int(left)} s left"
         self.count_lbl.setText(
             f"{n} photos · {c['ready'] + c['modified']} to review · {c['approved']} approved · "
-            f"{c['rejected']} rejected" + (f" · {c['loading']} analyzing" if c['loading'] else "")
-            + (f" · {c['error']} errors" if c['error'] else ""))
+            f"{c['rejected']} rejected" + (f" · {c['error']} errors" if c['error'] else "") + prog)
+        if hasattr(self, "btn_pause"):
+            self.btn_pause.setVisible(busy or self._paused)
 
     def on_row(self, row):
         if row < 0:
@@ -1387,10 +1832,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_scope_label()
 
     def step(self, d):
-        if self.list.count() == 0:
-            return
-        r = min(max(0, self.list.currentRow() + d), self.list.count() - 1)
-        self.list.setCurrentRow(r)
+        n = self.list.count()
+        r = self.list.currentRow()
+        while 0 <= r + d < n:
+            r += d
+            if not self.list.item(r).isHidden():
+                self.list.setCurrentRow(r)
+                return
 
     def next_to_review(self):
         """Move to the next photo that still needs a decision."""
@@ -1497,9 +1945,17 @@ class MainWindow(QtWidgets.QMainWindow):
             self.view.set_image(None)
             self.view.set_message("Loading preview…")
             return
-        before = self.chk_before.isChecked()
+        before = self.chk_before.isChecked() or self._hold_before
+        split = self.chk_split.isChecked() and not before
         img, self.geom = core.render(dec, it.edit, original=before,
                                      show_masks=self.chk_masks.isChecked() and not before)
+        if split:
+            orig, _g = core.render(dec, it.edit, original=True, rotate=False)
+            orig, _g = core.rotate_and_crop(orig, it.edit.angle)
+            if orig.shape != img.shape:
+                import cv2
+                orig = cv2.resize(orig, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_AREA)
+            self._split_cache = (orig, img)
         if not before and it.list_item is not None:
             import cv2
             h, w = img.shape[:2]
@@ -1521,6 +1977,12 @@ class MainWindow(QtWidgets.QMainWindow):
         elif not before and (it.edit.sky_on or it.edit.subj_on):
             on = " + ".join(n for n, f in (("Sky", it.edit.sky_on), ("Subject", it.edit.subj_on)) if f)
             badge = f"{on} mask: approximate preview – Lightroom computes the exact mask"
+        self.view.split_on = split
+        if split:
+            img = self._split_image()
+            badge = ""
+        else:
+            self._split_cache = None
         self.view.set_image(to_qimage(img), overlay, badge)
         self.view.set_message("Click a neutral spot…" if self.btn_eyedrop.isChecked() else "")
 
@@ -1537,12 +1999,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self.statusBar().showMessage("Still loading this photo, try again in a moment.", 4000)
         return it, dec
 
-    def run_auto_groups(self, groups):
+    def run_auto_groups(self, groups, user_rules=False):
         it, dec = self._current_dec()
         if dec is None:
             return
         self._record_undo(it, it.edit.copy())
-        res = auto.run_auto(dec, it.edit, groups, self._opts_snapshot())
+        res = auto.run_auto(dec, it.edit, groups, self._opts_snapshot(), user_rules=user_rules)
         if res.get("wb") is not None:
             it.wb = res["wb"]
             self.chk_samples.setChecked(True)
@@ -1555,7 +2017,7 @@ class MainWindow(QtWidgets.QMainWindow):
         groups.discard("level")                 # straightening has its own control
         if "wb" in groups and self.current and self.current.edit and self.current.edit.wb_mode == "custom":
             pass                                 # re-running WB is fine; it is the user's choice
-        self.run_auto_groups(list(groups))
+        self.run_auto_groups(list(groups), user_rules=True)
 
     def do_level(self, mode):
         it, dec = self._current_dec()
@@ -1702,6 +2164,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if not items:
             self.statusBar().showMessage("No analysed photos in that selection.", 5000)
             return
+        self._run_batch_on(items, spec)
+
+    def _run_batch_on(self, items, spec):
         self._undo = {it.path: (it.edit.copy(), it.status, it.wb) for it in items}
         self.act_undo_batch.setEnabled(True)
         if not spec.needs_decode:                      # plain setting changes are instant
@@ -1786,6 +2251,152 @@ class MainWindow(QtWidgets.QMainWindow):
         self.refresh_view()
         self.statusBar().showMessage(f"Undid the last batch edit ({n} photo(s)). "
                                      "Any XMP already written is left as it was.", 8000)
+
+    # ---------------- compare ----------------
+    def eventFilter(self, obj, ev):
+        t = ev.type()
+        if t in (QtCore.QEvent.Type.KeyPress, QtCore.QEvent.Type.KeyRelease) and ev.key() == Qt.Key.Key_Backslash:
+            fw = QtWidgets.QApplication.focusWidget()
+            if (self.isActiveWindow() and not isinstance(fw, (QtWidgets.QLineEdit, QtWidgets.QAbstractSpinBox))):
+                if not ev.isAutoRepeat():
+                    self._hold_before = t == QtCore.QEvent.Type.KeyPress
+                    self.refresh_view()
+                return True
+        return super().eventFilter(obj, ev)
+
+    def _split_toggled(self, on):
+        self.refresh_view()
+
+    def _split_image(self):
+        before, after = self._split_cache
+        x = int(round(self.view.split_pos * after.shape[1]))
+        img = after.copy()
+        img[:, :x] = before[:, :x]
+        return img
+
+    def _compose_split(self):
+        if self._split_cache is not None and self.view.split_on:
+            self.view.set_image(to_qimage(self._split_image()), [], "")
+
+    # ---------------- find / grid size ----------------
+    def apply_filter(self, text):
+        q = text.strip().lower()
+        shown = 0
+        for r in range(self.list.count()):
+            li = self.list.item(r)
+            hide = bool(q) and q not in os.path.basename(li.data(Qt.ItemDataRole.UserRole)).lower()
+            li.setHidden(hide)
+            gi = self.grid.item(r)
+            if gi is not None:
+                gi.setHidden(hide)
+            shown += not hide
+        if q:
+            self.statusBar().showMessage(f"{shown} photo(s) match '{text.strip()}'", 3000)
+            cur = self.list.currentItem()
+            if cur is None or cur.isHidden():
+                for r in range(self.list.count()):
+                    if not self.list.item(r).isHidden():
+                        self.list.setCurrentRow(r)
+                        break
+
+    def set_thumb_size(self, w):
+        h = int(w * GRID_H / GRID_W)
+        self.grid.setIconSize(QtCore.QSize(w, h))
+        self.grid.setGridSize(QtCore.QSize(w + 24, h + 52))
+
+    # ---------------- my auto settings ----------------
+    def open_my_auto(self):
+        dlg = MyAutoDialog(self, self.opts)
+        if dlg.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        v = dlg.values()
+        self.opts.exposure_bias, self.opts.punch, self.opts.colour = v["exposure_bias"], v["punch"], v["colour"]
+        self.opts.strength, self.opts.rules = v["strength"], v["rules"]
+        self.save_state()
+        n = len(auto.active_rules(v["rules"]))
+        self.statusBar().showMessage(f"My auto settings saved ({n} rule(s)). New photos and Auto-enhance use them.", 6000)
+        if dlg.chk_reapply.isChecked():
+            self.reapply_my_auto()
+
+    def reapply_my_auto(self):
+        items = [it for it in self.items.values() if it.status == "ready" and it.edit is not None]
+        if not items:
+            self.statusBar().showMessage("No photos waiting for review to re-apply to.", 5000)
+            return
+        o = self.opts
+        groups = [g for g in auto.GROUP_ORDER if g in o.groups]
+        spec = auto.BatchSpec(scope="all", groups=groups, level_mode=o.level_mode, allow_upright=o.allow_upright,
+                              strength=o.strength, exposure_bias=o.exposure_bias, punch=o.punch, colour=o.colour,
+                              rules=dict(o.rules), user_rules=True)
+        self._run_batch_on(items, spec)
+
+    # ---------------- view menu / help ----------------
+    def _build_view_menu(self):
+        btn = QtWidgets.QToolButton()
+        btn.setText("View ▾")
+        btn.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
+        menu = QtWidgets.QMenu(btn)
+        menu.addAction("Fold all panels", lambda: self._set_all_panels(False))
+        menu.addAction("Unfold all panels", lambda: self._set_all_panels(True))
+        menu.addSeparator()
+        sm = menu.addMenu("Interface size (after restart)")
+        g = QtGui.QActionGroup(sm)
+        cur = float(self._settings.get("ui_scale", 1.0))
+        for pct in (85, 100, 115, 130, 150):
+            a = sm.addAction(f"{pct}%")
+            a.setCheckable(True)
+            g.addAction(a)
+            a.setChecked(abs(cur * 100 - pct) < 1)
+            a.triggered.connect(lambda _c=False, p=pct: self._set_ui_scale(p / 100.0))
+        menu.addSeparator()
+        menu.addAction("Keyboard shortcuts && tips (?)", self.show_help)
+        menu.addAction("Show the welcome tour again", self.show_tour)
+        btn.setMenu(menu)
+        return btn
+
+    def _set_all_panels(self, on):
+        for content, set_open in self._panels.values():
+            set_open(on)
+
+    def _set_ui_scale(self, v):
+        self._settings["ui_scale"] = v
+        self.save_state()
+        QtWidgets.QMessageBox.information(self, "Interface size",
+                                          f"Interface size {int(v * 100)}% applies the next time RAW Review starts.")
+
+    def show_help(self):
+        box = QtWidgets.QMessageBox(self)
+        box.setWindowTitle("Keyboard shortcuts & tips")
+        box.setTextFormat(Qt.TextFormat.RichText)
+        box.setText(HELP_HTML)
+        box.exec()
+
+    def show_tour(self):
+        TourDialog(self).exec()
+        self._settings["tour_done"] = True
+        self.save_state()
+
+    # ---------------- undo an approval ----------------
+    def undo_approval(self):
+        it = self.current
+        if it is None or not it.approve_undo:
+            return
+        snap, written, status_before = it.approve_undo
+        try:
+            msg = core.restore_output(it.path, snap, written)
+        except core.RawSafetyError as ex:
+            QtWidgets.QMessageBox.warning(self, "Undo approval", str(ex))
+            return
+        except OSError as ex:
+            QtWidgets.QMessageBox.warning(self, "Undo approval", f"Couldn't undo: {ex}")
+            return
+        it.approve_undo = None
+        it.status = status_before if status_before in ("ready", "modified", "rejected") else "ready"
+        self._update_list_item(it)
+        self._update_count()
+        self.load_controls()
+        self.statusBar().showMessage(msg + ". In Lightroom, read the metadata again if the photo is in your catalog.",
+                                     8000)
 
     # ---------------- ratings & colour labels ----------------
     def _meta_text(self, it):
@@ -1883,7 +2494,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.opts.groups = set(g for g in o["groups"] if g in auto.GROUP_ORDER)
             known = set(o.get("known_groups", auto.GROUP_ORDER))
             self.opts.groups |= {g for g in auto.GROUP_ORDER if g not in known}   # tools added in an update: on
-        for k in ("level_mode", "allow_upright", "strength", "exposure_bias", "use_existing"):
+        for k in ("level_mode", "allow_upright", "strength", "exposure_bias", "use_existing", "punch", "colour",
+                  "rules"):
             if k in o:
                 setattr(self.opts, k, o[k])
         if self.opts.level_mode not in core.LEVEL_MODES:
@@ -1906,13 +2518,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self.scope_combo.setCurrentIndex(int(st.get("scope", 0)) if str(st.get("scope", 0)).isdigit() else 0)
         self.chk_samples.setChecked(bool(st.get("show_wb_samples", False)))
         self.chk_masks.setChecked(bool(st.get("show_masks", False)))
+        try:
+            self.thumb_size.setValue(int(st.get("thumb_size", 240)))
+        except (TypeError, ValueError):
+            pass
+        self.chk_split.setChecked(bool(st.get("split", False)))
 
     def _settings_dict(self):
         o = self.opts
         return {
             "version": __version__,
             "auto": {"groups": sorted(o.groups), "known_groups": list(auto.GROUP_ORDER), "level_mode": o.level_mode, "allow_upright": o.allow_upright,
-                     "strength": o.strength, "exposure_bias": o.exposure_bias, "use_existing": o.use_existing},
+                     "strength": o.strength, "exposure_bias": o.exposure_bias, "use_existing": o.use_existing,
+                     "punch": o.punch, "colour": o.colour, "rules": o.rules},
             "dng_profile": {k: getattr(dng_profile.OPTIONS, k) for k in dng_profile.OPTIONS.__dataclass_fields__},
             "geometry": base64.b64encode(bytes(self.saveGeometry())).decode("ascii"),
             "splitter": self.split.sizes(),
@@ -1922,6 +2540,11 @@ class MainWindow(QtWidgets.QMainWindow):
             "scope": self.scope_combo.currentIndex(),
             "show_wb_samples": self.chk_samples.isChecked(),
             "show_masks": self.chk_masks.isChecked(),
+            "collapsed": [t for t, (c, _f) in self._panels.items() if not c.isVisible()],
+            "ui_scale": self._settings.get("ui_scale", 1.0),
+            "tour_done": self._settings.get("tour_done", False),
+            "thumb_size": self.thumb_size.value(),
+            "split": self.chk_split.isChecked(),
         }
 
     def _session_dict(self):
@@ -2018,9 +2641,20 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ---------------- decisions ----------------
     def _write(self, it, quiet=False) -> bool:
+        status_before = it.status
+        try:
+            snap = core.snapshot_output(it.path, os.path.join(CONFIG_DIR, "undo"))
+        except OSError:
+            snap = None
         try:
             msg = core.write_xmp(it.path, it.edit, it.src_size,
                                  meta={"rating": it.rating, "label": it.label})
+            if snap is not None:
+                old = it.approve_undo
+                if old and old[0].get("copy") and os.path.isfile(old[0]["copy"]):
+                    os.remove(old[0]["copy"])           # only our own temporary copy
+                it.approve_undo = (snap, core.file_hash(snap["target"]),
+                                   status_before if status_before != "approved" else "modified")
         except core.RawSafetyError as ex:
             QtWidgets.QMessageBox.critical(self, "Stopped for safety", str(ex))
             return False
@@ -2199,6 +2833,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
 
 def main():
+    try:
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+            scale = float(json.load(f).get("ui_scale", 1.0))
+        if 0.5 <= scale <= 2.5 and abs(scale - 1.0) > 0.01 and "QT_SCALE_FACTOR" not in os.environ:
+            os.environ["QT_SCALE_FACTOR"] = str(scale)
+    except (OSError, ValueError, AttributeError):
+        pass
     app = QtWidgets.QApplication(sys.argv)
     app.setStyle("Fusion")
     pal = QtGui.QPalette()
