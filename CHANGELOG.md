@@ -1,5 +1,20 @@
 # Changelog
 
+## v1.7.0
+
+- **Windows program, no Python needed:** each release now includes `RAW_Review-Windows-v….zip`. Unzip it and run
+  **RAW Review.exe**. It updates itself the same way: *Check for Updates* downloads the new version, checks it against
+  the fingerprint published with the release, and copies it in when RAW Review restarts. Running from the source
+  with *RAW Review.bat* still works as before.
+- **Cull suggestions** (toolbar): photos that look **soft** (missed focus or shake), have **blown highlights** in the
+  RAW itself, or are **very dark**, plus the weaker frames of **bursts and near-duplicates** (neighbouring photos
+  that look almost the same; the sharpest one, marked ★, is never suggested). The list shows the reason
+  (e.g. *soft?*, *burst 2/5*). *Check them* ticks them so you can look them over in the grid, or *Reject* them in one
+  go. Rejecting only marks them; nothing is written or deleted. Also under **Check ▾ → Suggested rejects**.
+- **Safety tests** run on every change: the RAW stays byte-for-byte the same, sidecars keep other programs' data
+  (titles, keywords, settings RAW Review doesn't control), the original sidecar is backed up once, and *Undo approval*
+  puts things back exactly or refuses when Lightroom has saved since.
+
 ## v1.6.0
 
 - **My auto settings** (toolbar ★): your own recipe for automatic edits, applied to every photo you add, to

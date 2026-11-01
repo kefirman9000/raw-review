@@ -1,6 +1,8 @@
 name: Release
-# Publishes a GitHub Release with a ready-to-run zip whenever version.py changes on main.
-# The in-app updater picks up the newest Release (or main, whichever is newer).
+# Publishes a GitHub Release whenever version.py changes on main:
+#   RAW_Review-Windows-v<version>.zip  the ready-to-run Windows program (no Python needed)
+#   RAW_Review-v<version>.zip          the source, for "RAW Review.bat" and other systems
+# The in-app updater picks the right one: the program updates from the Windows zip, the source from the other.
 on:
   push:
     branches: [main]
@@ -8,9 +10,15 @@ on:
   workflow_dispatch:
 permissions:
   contents: write
+concurrency:
+  group: release
+  cancel-in-progress: false
 jobs:
-  release:
+  version:
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      exists: ${{ steps.check.outputs.exists }}
     steps:
       - uses: actions/checkout@v4
       - name: Read version
@@ -24,27 +32,84 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           if gh release view "v${{ steps.v.outputs.version }}" >/dev/null 2>&1; then echo "exists=1" >> "$GITHUB_OUTPUT"; fi
-      - name: Check the app compiles
-        if: steps.check.outputs.exists != '1'
-        run: python3 -m py_compile *.py
-      - name: Build zip and notes
-        if: steps.check.outputs.exists != '1'
+
+  tests:
+    needs: version
+    if: needs.version.outputs.exists != '1'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: python -m pip install rawpy numpy opencv-python-headless pytest
+      - name: Safety tests
+        run: python -m pytest -q tests
+
+  windows:
+    needs: [version, tests]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install the build tools
+        run: python -m pip install -r requirements.txt pyinstaller
+      - name: Build RAW Review.exe
+        shell: pwsh
         run: |
-          V=${{ steps.v.outputs.version }}
-          mkdir -p dist
+          python -m PyInstaller --noconfirm --windowed --name "RAW Review" `
+            --collect-all rawpy --add-data "CHANGELOG.md;." `
+            --exclude-module tkinter --distpath build-output raw_review_app.py
+      - name: Check that the program starts
+        shell: pwsh
+        run: |
+          $p = Start-Process "build-output\RAW Review\RAW Review.exe" -PassThru
+          Start-Sleep -Seconds 20
+          if ($p.HasExited) { throw "RAW Review.exe closed by itself (exit code $($p.ExitCode))" }
+          Stop-Process -Id $p.Id -Force
+          Write-Host "RAW Review.exe started and stayed open"
+      - name: Zip
+        shell: pwsh
+        run: |
+          $v = "${{ needs.version.outputs.version }}"
+          Compress-Archive -Path "build-output\RAW Review" -DestinationPath "RAW_Review-Windows-v$v.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: RAW_Review-Windows-v*.zip
+
+  release:
+    needs: [version, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows
+          path: dist
+      - name: Build source zip and notes
+        run: |
+          V=${{ needs.version.outputs.version }}
           git archive --format=zip --prefix=raw_review/ -o "dist/RAW_Review-v$V.zip" HEAD
-          (cd dist && sha256sum "RAW_Review-v$V.zip" > SHA256SUMS)
+          (cd dist && sha256sum RAW_Review-*.zip > SHA256SUMS)
           {
-            echo "**Download:** \`RAW_Review-v$V.zip\` below. Unzip it and double-click **RAW Review.bat** (needs Python 3.12)."
+            echo "**Windows:** download \`RAW_Review-Windows-v$V.zip\`, unzip it and run **RAW Review.exe** inside the **RAW Review** folder. No Python needed."
+            echo "If Windows shows *Windows protected your PC*, click **More info → Run anyway**."
+            echo
+            echo "**Other systems, or to run from source:** \`RAW_Review-v$V.zip\` (double-click **RAW Review.bat** on Windows; needs Python 3.12)."
+            echo
             echo "Already have RAW Review? Click **Check for Updates** in the app instead."
             echo
             awk -v v="v$V" '/^## /{p = ($2 == v)} p' CHANGELOG.md | tail -n +2
           } > dist/notes.md
+          cat dist/notes.md
       - name: Publish release
-        if: steps.check.outputs.exists != '1'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          V=${{ steps.v.outputs.version }}
-          gh release create "v$V" "dist/RAW_Review-v$V.zip" dist/SHA256SUMS \
+          V=${{ needs.version.outputs.version }}
+          gh release create "v$V" dist/RAW_Review-*.zip dist/SHA256SUMS \
             --title "RAW Review v$V" --notes-file dist/notes.md --target "${{ github.sha }}" --latest

@@ -20,6 +20,7 @@ Space Station (public domain). A tungsten-light cast was simulated, then removed
 
 - **Edit many photos at once:** *Edits apply to → Selected / Checked photos* copies each slider change to them, either the exact value or as a relative nudge.
 - **Grid view** (`G`) to see the whole shoot at a glance.
+- **Cull suggestions:** flags photos that look soft, have blown highlights or are very dark, and the weaker frames of bursts and near-duplicates (the sharpest frame, ★, is kept). Check them to look them over, or reject them in one go.
 - **Automatic sky and subject masks**, written as Lightroom's own Select Sky / Select Subject (Lightroom computes the exact mask).
 - **Per-photo Undo / Redo** (`Ctrl+Z` / `Ctrl+Y`).
 - **Starts from your existing Lightroom edits** when a photo already has them, and keeps your own Lightroom crop and masks.
@@ -51,14 +52,15 @@ Space Station (public domain). A tungsten-light cast was simulated, then removed
 - The only file written is `photo.xmp` next to `photo.CR3` (Lightroom's normal sidecar).
 - An existing sidecar is backed up once as `photo.xmp.bak`. Only the settings this app controls are changed; ratings, keywords, Clarity, masks etc. are kept.
 - Every write checks the RAW's size and timestamp before and after, and refuses any filename that looks like a photo (RAW/DNG/JPG/TIFF…).
+- Automated [safety tests](tests/test_safety.py) check all of this on every change, and a release isn't published unless they pass.
 
 ## Install (Windows)
 
-1. Install **Python 3.12** from [python.org](https://www.python.org/downloads/).
-2. Download the ZIP from [Releases](https://github.com/kefirman9000/raw-review/releases/latest) (or *Code → Download ZIP*) and unzip it anywhere.
-3. Double-click **`RAW Review.bat`**. The first run sets up its own environment (a few minutes).
+1. Download **`RAW_Review-Windows-v….zip`** from the [latest release](https://github.com/kefirman9000/raw-review/releases/latest).
+2. Unzip it anywhere and run **RAW Review.exe** in the **RAW Review** folder. No Python needed.
+3. If a blue *Windows protected your PC* box appears, click **More info → Run anyway**.
 
-Other systems: `pip install -r requirements.txt`, then `python raw_review_app.py`.
+**From source** (any system): install **Python 3.12**, download `RAW_Review-v….zip` (or *Code → Download ZIP*), then double-click **`RAW Review.bat`** on Windows (the first run sets up its own environment), or `pip install -r requirements.txt` and `python raw_review_app.py` elsewhere.
 
 ## Keys
 
@@ -91,7 +93,7 @@ New versions are published automatically as [GitHub Releases](https://github.com
 
 Click **Check for Updates** in the toolbar. The app also checks quietly at startup and shows an
 **⬆ Update** button when a newer version is on GitHub (a published Release or the main branch, whichever is newer).
-Nothing is installed until you click *Install & Restart*. The previous version is kept in `.update_backup/`.
+Nothing is installed until you click *Install & Restart*. The Windows program checks the download against the fingerprint published with the release and copies it in when it restarts; the source version keeps the previous one in `.update_backup/`.
 The updater only replaces the app's own files and never looks at your photos.
 
 ## Good to know

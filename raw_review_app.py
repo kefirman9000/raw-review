@@ -30,6 +30,7 @@ from PySide6.QtCore import QObject, QRunnable, QThreadPool, Qt, QTimer, Signal
 import raw_review_auto as auto
 import dng_profile
 import raw_review_core as core
+import raw_review_cull as cull
 import updater
 from version import __version__
 
@@ -122,6 +123,7 @@ class Item:
         self.redo: list = []
         self.undo_key = None          # what the last undo step was about (merges one slider drag)
         self.undo_time = 0.0
+        self.cull: cull.CullStats | None = None   # sharpness, clipping, look-alike signature (suggestions only)
 
 
 # --------------------------------------------------------------------------
@@ -157,6 +159,10 @@ class DecodeTask(QRunnable):
                 if ex["edit"] is not None and getattr(self.opts, "use_existing", True):
                     chosen = ex["edit"]
                 res.update(edit=chosen, auto_edit=edit, existing=ex, wb=wb, st=st, thumb=make_thumb(dec, chosen))
+                try:
+                    res["cull"] = cull.measure(dec, edit)
+                except Exception:  # noqa: BLE001 - suggestions are a nicety, never block a photo
+                    traceback.print_exc()
             self.signals.done.emit(self.gen, self.path, res, "")
         except Exception as ex:  # noqa: BLE001
             traceback.print_exc()
@@ -822,6 +828,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.thumb_timer.setSingleShot(True)
         self.thumb_timer.setInterval(350)
         self.thumb_timer.timeout.connect(self._flush_thumbs)
+        self._cull_why: dict = {}      # path -> reasons it may be worth rejecting (suggestions only)
+        self._cull_burst: dict = {}    # path -> "burst 2/5" (★ = the sharpest frame)
+        self.cull_timer = QTimer(self)
+        self.cull_timer.setSingleShot(True)
+        self.cull_timer.setInterval(400)
+        self.cull_timer.timeout.connect(self._refresh_cull)
         self._syncing = False
         self.upd = UpdateSignals()
         self.upd.checked.connect(self.on_update_checked)
@@ -1023,6 +1035,9 @@ class MainWindow(QtWidgets.QMainWindow):
             "without waiting for you to approve. Off by default so you can review first.")
         tb.addWidget(self.chk_autowrite)
         tb.addSeparator()
+        self.act_cull = tb.addAction("Cull suggestions…", self.open_cull)
+        self.act_cull.setToolTip("Photos that look soft, blown out or very dark, and the weaker frames of bursts:\n"
+                                 "check them to look them over, or reject them in one go")
         tb.addAction("Approve checked", self.approve_checked)
         tb.addAction("Approve All To-Review…", self.approve_all)
         tb.addAction("Clear List", self.clear_list)
@@ -1061,6 +1076,8 @@ class MainWindow(QtWidgets.QMainWindow):
         cm.addAction("Not yet reviewed", lambda: self.check_where(lambda it: it.status in ("ready", "modified")))
         cm.addAction("Low-confidence WB", lambda: self.check_where(
             lambda it: bool(it.wb and it.wb.applied and it.wb.confidence < 0.5)))
+        cm.addAction("Suggested rejects (soft, bursts…)", lambda: self.check_where(
+            lambda it: it.path in self._cull_why and it.status in ("ready", "modified")))
         cm.addAction("Invert", self.check_invert)
         chk_btn.setMenu(cm)
         top = QtWidgets.QHBoxLayout()
@@ -1496,6 +1513,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._queue.clear()
         self._analyzing.clear()
         self._an_total = self._an_done = 0
+        self._cull_why, self._cull_burst = {}, {}
         self.list.clear()
         self.grid.clear()
         self._thumb_pending.clear()
@@ -1547,6 +1565,9 @@ class MainWindow(QtWidgets.QMainWindow):
         it.color, it.src_size = dec.color, (dec.cam.shape[1], dec.cam.shape[0])
         if "edit" in res:
             it.edit, it.auto_edit, it.wb = res["edit"], res.get("auto_edit", res["edit"]).copy(), res["wb"]
+            if res.get("cull") is not None:
+                it.cull = res["cull"]
+                self.cull_timer.start()
             ex = res.get("existing") or {}
             it.lr_edit = ex.get("edit").copy() if ex.get("edit") is not None else None
             if it.rating is None and ex.get("rating") is not None:
@@ -1598,6 +1619,7 @@ class MainWindow(QtWidgets.QMainWindow):
         extra = ""
         if it.wb is not None and it.wb.applied and it.wb.confidence < 0.5 and it.status == "ready":
             extra = " · check WB"
+        extra += self._cull_text(it)
         it.list_item.setText(f"{os.path.basename(it.path)}\n{label}{extra}{sidecar}"
                              + (f"\n{extra_meta}" if extra_meta else ""))
         it.list_item.setBackground(QtGui.QBrush(col) if col else QtGui.QBrush())
@@ -1605,6 +1627,89 @@ class MainWindow(QtWidgets.QMainWindow):
         if it.error:
             it.list_item.setToolTip(f"{it.path}\n{it.error}")
         self._update_grid_item(it)
+
+    # ---------------- cull suggestions ----------------
+    def _ordered_items(self):
+        out = []
+        for r in range(self.list.count()):
+            it = self.items.get(self.list.item(r).data(Qt.ItemDataRole.UserRole))
+            if it is not None:
+                out.append(it)
+        return out
+
+    def _refresh_cull(self):
+        """Work out the suggested rejects again (soft, blown, very dark, look-alikes) and relabel what changed."""
+        ordered = [(it.path, it.cull) for it in self._ordered_items()]
+        why, burst = cull.suggestions(ordered), cull.burst_labels(ordered)
+        changed = {p for p in set(why) | set(self._cull_why) if why.get(p) != self._cull_why.get(p)}
+        changed |= {p for p in set(burst) | set(self._cull_burst) if burst.get(p) != self._cull_burst.get(p)}
+        self._cull_why, self._cull_burst = why, burst
+        for p in changed:
+            it = self.items.get(p)
+            if it is not None and it.list_item is not None:
+                self._update_list_item(it)
+        self._update_cull_action()
+
+    def _cull_text(self, it) -> str:
+        bits = []
+        if it.path in self._cull_burst:
+            bits.append(self._cull_burst[it.path])
+        if it.status in ("ready", "modified"):
+            for w in self._cull_why.get(it.path, []):
+                if not w.startswith("similar"):
+                    bits.append(w + "?")
+        return "".join(" · " + b for b in bits)
+
+    def cull_candidates(self):
+        """Photos suggested for rejection that you haven't approved or rejected yet."""
+        return [it for it in self._ordered_items()
+                if it.path in self._cull_why and it.status in ("ready", "modified")]
+
+    def _update_cull_action(self):
+        n = len(self.cull_candidates())
+        self.act_cull.setText(f"Cull suggestions ({n})…" if n else "Cull suggestions…")
+
+    def open_cull(self):
+        todo = self.cull_candidates()
+        if not todo:
+            QtWidgets.QMessageBox.information(
+                self, "Cull suggestions",
+                "Nothing to suggest right now: no unreviewed photo looks soft, blown out, very dark or like a "
+                "weaker copy of its neighbour." + ("\n\nSome photos are still being analysed."
+                                                  if self._queue or self._analyzing else ""))
+            return
+        counts = {}
+        for it in todo:
+            for w in self._cull_why[it.path]:
+                key = "a weaker frame of a burst or near-duplicate" if w.startswith("similar") else w
+                counts[key] = counts.get(key, 0) + 1
+        lines = "".join(f"<li>{n} {k}</li>" for k, n in sorted(counts.items(), key=lambda kv: -kv[1]))
+        box = QtWidgets.QMessageBox(self)
+        box.setWindowTitle("Cull suggestions")
+        box.setIcon(QtWidgets.QMessageBox.Icon.Question)
+        box.setText(f"<b>{len(todo)} photo{'s' if len(todo) != 1 else ''} you may want to reject:</b><ul>{lines}</ul>")
+        box.setInformativeText(
+            "Check them to look them over first (Grid view shows them side by side; X rejects the selected ones), "
+            "or reject them all now. In a burst, the sharpest frame (★) is never suggested.\n\n"
+            "Rejecting only marks them: nothing is written, moved or deleted, and you can approve any of them later.")
+        details = "\n".join(f"{os.path.basename(it.path)}: {', '.join(self._cull_why[it.path])}" for it in todo)
+        box.setDetailedText(details)
+        check_btn = box.addButton("Check them", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+        reject_btn = box.addButton(f"Reject {len(todo)}", QtWidgets.QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton(QtWidgets.QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(check_btn)
+        box.exec()
+        if box.clickedButton() is check_btn:
+            paths = {it.path for it in todo}
+            self.check_where(lambda it: it.path in paths)
+            self.statusBar().showMessage(f"Checked {len(todo)} suggested reject(s).", 6000)
+        elif box.clickedButton() is reject_btn:
+            for it in todo:
+                it.status = "rejected"
+                self._update_list_item(it)
+            self._update_count()
+            self._update_cull_action()
+            self.statusBar().showMessage(f"Rejected {len(todo)} photo(s). Nothing was written or deleted.", 8000)
 
     def _update_grid_item(self, it):
         gi = it.grid_item
@@ -1614,6 +1719,7 @@ class MainWindow(QtWidgets.QMainWindow):
         mark = "☑ " if it.list_item.checkState() == Qt.CheckState.Checked else ""
         low = " · check WB" if (it.wb is not None and it.wb.applied and it.wb.confidence < 0.5
                                 and it.status == "ready") else ""
+        low += self._cull_text(it)
         meta = self._meta_text(it)
         gi.setText(f"{mark}{os.path.basename(it.path)}\n{label}{low}" + (f"\n{meta}" if meta else ""))
         gi.setBackground(QtGui.QBrush(col) if col else QtGui.QBrush())
@@ -1812,6 +1918,8 @@ class MainWindow(QtWidgets.QMainWindow):
             f"{c['rejected']} rejected" + (f" · {c['error']} errors" if c['error'] else "") + prog)
         if hasattr(self, "btn_pause"):
             self.btn_pause.setVisible(busy or self._paused)
+        if hasattr(self, "act_cull"):
+            self._update_cull_action()
 
     def on_row(self, row):
         if row < 0:
@@ -2816,11 +2924,13 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.critical(
                 self, "Update failed",
                 f"The update couldn't be installed:\n{err}\n\n"
-                f"If any files were already replaced, the previous version is saved in "
-                f"{os.path.join(updater.APP_DIR, '.update_backup')}.")
+                + ("Nothing was changed." if updater.FROZEN else
+                   f"If any files were already replaced, the previous version is saved in "
+                   f"{os.path.join(updater.APP_DIR, '.update_backup')}."))
             return
         QtWidgets.QMessageBox.information(
-            self, "Updated", f"Updated to v{self._upd_version}. RAW Review will now restart.")
+            self, "Updated", f"v{self._upd_version} is ready. RAW Review will now close and restart"
+            + (" (it takes a few seconds to copy the new version in)." if updater.FROZEN else "."))
         updater.restart()
         self.close()
 

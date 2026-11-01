@@ -4,3 +4,7 @@ __pycache__/
 .update_backup/
 *.xmp
 *.xmp.bak
+.update_download/
+build-output/
+build/
+*.spec
