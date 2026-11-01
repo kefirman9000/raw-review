@@ -92,7 +92,7 @@ The updater only replaces the app's own files and never looks at your photos.
 
 ## Good to know
 
-- **Settings and the last session** are stored in a `.raw_review` folder in your user folder (`C:\\Users\\<you>\\.raw_review` on Windows). Delete it to start completely fresh.
+- **Settings and the last session** are stored in a `.raw_review` folder in your user folder (`C:\Users\<you>\.raw_review` on Windows). Delete it to start completely fresh.
 
 - **Sky / subject masks:** Lightroom computes them itself. If it shows a warning on a mask, select the photos and use *Update AI Settings*. If a sky's exposure looks 4× too strong or weak in Lightroom, change `LOCAL_EXPOSURE_SCALE` at the top of `raw_review_core.py`.
 
