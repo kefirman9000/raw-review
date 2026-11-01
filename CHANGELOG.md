@@ -1,5 +1,27 @@
 # Changelog
 
+## v1.5.0
+
+- **Starts from your existing Lightroom edits.** When a photo already has settings (its `.xmp` sidecar, or for a DNG
+  its *RAW Review export* copy, which is the file Lightroom uses), those are loaded instead of the auto proposal:
+  white balance, tone, colour, sharpening, noise, straighten / Upright, lens corrections and RAW Review's sky / subject
+  masks, plus the star rating and colour label. *Reset to auto proposal* is still one click away, and the new
+  *Reset to Lightroom settings* goes back. Switch it off in *Auto options → Start from settings a photo already has*.
+  - **A crop you made in Lightroom is kept** as long as you don't change the straighten angle here, and Guided Upright
+    is no longer reset.
+- **Fix: DNG settings being reset in Lightroom.** Re-approving a DNG now builds on the exported copy's current
+  settings (including edits Lightroom wrote into it, such as exposure or brush masks) instead of the original DNG's,
+  so nothing you did in Lightroom is thrown away. If a photo is already in your Lightroom catalog, still use
+  *Metadata → Read Metadata from Files* after re-approving.
+- **Remembers your settings and your session.** Auto options, camera-profile options, window size and layout, the
+  last folder, and the toggles (*Auto-write*, *Edits apply to*, *Relative*, *Show masks*) are saved. The photos you
+  had open come back on the next launch, after an update, or after a crash, with their edits, approve / reject
+  decisions, check marks, ratings and labels (saved every few seconds). *Clear List* starts fresh. Stored in a
+  `.raw_review` folder in your user folder, never next to your photos.
+- **Star ratings and colour labels** like Lightroom: **1-5** stars, **0** clears; **6** red, **7** yellow, **8** green,
+  **9** blue (press again to clear). Works on several selected photos at once. Shown in the list and grid, and written
+  to the XMP when you approve, so Lightroom shows them.
+
 ## v1.4.0
 
 - **Automatic sky and subject masks.** New *Sky & subject masks* panel with two switchable adjustments, written to

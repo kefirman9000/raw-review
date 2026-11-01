@@ -22,6 +22,9 @@ Space Station (public domain). A tungsten-light cast was simulated, then removed
 - **Grid view** (`G`) to see the whole shoot at a glance.
 - **Automatic sky and subject masks**, written as Lightroom's own Select Sky / Select Subject (Lightroom computes the exact mask).
 - **Per-photo Undo / Redo** (`Ctrl+Z` / `Ctrl+Y`).
+- **Starts from your existing Lightroom edits** when a photo already has them, and keeps your own Lightroom crop and masks.
+- **Star ratings and colour labels**, written to Lightroom on approve.
+- **Remembers your settings and the photos you had open**, even across updates.
 - **Drag and drop** photos or whole folders (subfolders included).
 - **Smart auto white balance**
   - Looks for the surfaces most likely to be truly neutral: the brightest unclipped *near-whites* and the darkest *near-blacks*.
@@ -68,6 +71,8 @@ Other systems: `pip install -r requirements.txt`, then `python raw_review_app.py
 | `C` | Check / uncheck this photo |
 | `G` | Grid view on / off (double-click or `Enter` opens a photo; with several selected, `A` / `X` act on all of them) |
 | `Ctrl+Z` / `Ctrl+Y` | Undo / redo the last change to this photo (each photo has its own history) |
+| `1`–`5` / `0` | Star rating / clear (several selected photos at once) |
+| `6` `7` `8` `9` | Red / yellow / green / blue label (press again to clear) |
 | `Ctrl+C` / `Ctrl+V` | Copy settings / paste to the photos selected in the list |
 
 ## Getting the edits into Lightroom Classic
@@ -86,6 +91,8 @@ Nothing is installed until you click *Install & Restart*. The previous version i
 The updater only replaces the app's own files and never looks at your photos.
 
 ## Good to know
+
+- **Settings and the last session** are stored in a `.raw_review` folder in your user folder (`C:\\Users\\<you>\\.raw_review` on Windows). Delete it to start completely fresh.
 
 - **Sky / subject masks:** Lightroom computes them itself. If it shows a warning on a mask, select the photos and use *Update AI Settings*. If a sky's exposure looks 4× too strong or weak in Lightroom, change `LOCAL_EXPOSURE_SCALE` at the top of `raw_review_core.py`.
 

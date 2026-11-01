@@ -13,6 +13,8 @@ RAW files are NEVER modified, moved, renamed or deleted - they are only read.
 
 from __future__ import annotations
 
+import base64
+import json
 import os
 import sys
 import time
@@ -29,6 +31,10 @@ import raw_review_core as core
 import updater
 from version import __version__
 
+CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".raw_review")   # settings + last session (never your photos)
+SETTINGS_FILE = os.path.join(CONFIG_DIR, "settings.json")
+SESSION_FILE = os.path.join(CONFIG_DIR, "session.json")
+LABEL_COLOURS = {"Red": "#d9534f", "Yellow": "#e6c229", "Green": "#4caf50", "Blue": "#3f7fd9", "Purple": "#9c5bd6"}
 CACHE_SIZE = 24          # decoded previews kept in memory
 THUMB_W, THUMB_H = 120, 80      # list icons
 GRID_W, GRID_H = 240, 160        # grid view thumbnails (also the size thumbnails are made at)
@@ -55,6 +61,9 @@ class Item:
         self.error = ""
         self.list_item: QtWidgets.QListWidgetItem | None = None
         self.grid_item: QtWidgets.QListWidgetItem | None = None
+        self.rating: int | None = None    # 0-5 stars (None = leave the file's rating alone)
+        self.label: str | None = None     # Lightroom colour label ("" = clear, None = leave alone)
+        self.lr_edit = None               # the settings the photo already had (Lightroom), if any
         self.undo: list = []          # earlier versions of .edit (newest last)
         self.redo: list = []
         self.undo_key = None          # what the last undo step was about (merges one slider drag)
@@ -89,7 +98,11 @@ class DecodeTask(QRunnable):
             res = {"dec": dec}
             if self.analyze:
                 edit, wb, st = auto.propose_edit(dec, self.opts)
-                res.update(edit=edit, wb=wb, st=st, thumb=make_thumb(dec, edit))
+                ex = core.read_existing(self.path, core.as_shot_edit(dec))      # read-only
+                chosen = edit
+                if ex["edit"] is not None and getattr(self.opts, "use_existing", True):
+                    chosen = ex["edit"]
+                res.update(edit=chosen, auto_edit=edit, existing=ex, wb=wb, st=st, thumb=make_thumb(dec, chosen))
             self.signals.done.emit(self.gen, self.path, res, "")
         except Exception as ex:  # noqa: BLE001
             traceback.print_exc()
@@ -472,15 +485,25 @@ class MainWindow(QtWidgets.QMainWindow):
         self.render_timer.setInterval(35)
         self.render_timer.timeout.connect(self.refresh_view)
 
+        self._restore_map = {}
+        self._last_session_text = ""
+        self.last_dir = ""
         self._build_ui()
         self._build_shortcuts()
         self._set_controls_enabled(False)
+        self._apply_saved_window(self._settings)
+        self.autosave = QTimer(self)
+        self.autosave.setInterval(8000)
+        self.autosave.timeout.connect(self.save_state)
+        self.autosave.start()
+        QTimer.singleShot(0, self.restore_session)
         QTimer.singleShot(2500, lambda: self.check_updates(manual=False))   # quiet check
 
     # ---------------- UI ----------------
     def _opts_snapshot(self) -> "auto.AutoOptions":
         o = self.opts
-        return auto.AutoOptions(set(o.groups), o.level_mode, o.allow_upright, o.strength, o.exposure_bias)
+        return auto.AutoOptions(set(o.groups), o.level_mode, o.allow_upright, o.strength, o.exposure_bias,
+                                o.use_existing)
 
     def _opts_changed(self, *_):
         groups = {k for k, a in self.auto_actions.items() if a.isChecked()}
@@ -501,7 +524,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 continue
             a = menu.addAction("Auto " + label[0].lower() + label[1:])
             a.setCheckable(True)
-            a.setChecked(True)
+            a.setChecked(key in self.opts.groups)
             a.toggled.connect(self._opts_changed)
             self.auto_actions[key] = a
         menu.addSeparator()
@@ -516,9 +539,17 @@ class MainWindow(QtWidgets.QMainWindow):
             grp.addAction(a)
             a.setChecked(mode == self.opts.level_mode)
             a.triggered.connect(lambda _c=False, m=mode: self._set_level_opt(m))
+        self.act_existing = menu.addAction("Start from settings a photo already has (Lightroom)")
+        self.act_existing.setCheckable(True)
+        self.act_existing.setChecked(self.opts.use_existing)
+        self.act_existing.setToolTip("When a photo already has a Lightroom sidecar (or a DNG export), load those\n"
+                                     "settings instead of the auto proposal. 'Reset to auto proposal' still works.\n"
+                                     "Applies to photos added from now on.")
+        self.act_existing.toggled.connect(lambda on: setattr(self.opts, "use_existing", bool(on)))
+        menu.addSeparator()
         self.act_upright = menu.addAction("Best guess may choose Upright: Vertical")
         self.act_upright.setCheckable(True)
-        self.act_upright.setChecked(True)
+        self.act_upright.setChecked(self.opts.allow_upright)
         self.act_upright.toggled.connect(self._opts_changed)
         menu.addSeparator()
         sm = menu.addMenu("Auto strength")
@@ -527,7 +558,7 @@ class MainWindow(QtWidgets.QMainWindow):
             a = sm.addAction(f"{pct}%")
             a.setCheckable(True)
             g2.addAction(a)
-            a.setChecked(pct == 100)
+            a.setChecked(pct == round(self.opts.strength * 100))
             a.triggered.connect(lambda _c=False, p=pct: setattr(self.opts, "strength", p / 100.0))
         bm = menu.addMenu("Exposure bias (brighter / darker)")
         g3 = QtGui.QActionGroup(bm)
@@ -535,7 +566,7 @@ class MainWindow(QtWidgets.QMainWindow):
             a = bm.addAction(f"{ev:+.2f} EV" if ev else "0 EV")
             a.setCheckable(True)
             g3.addAction(a)
-            a.setChecked(ev == 0.0)
+            a.setChecked(abs(ev - self.opts.exposure_bias) < 1e-6)
             a.triggered.connect(lambda _c=False, v=ev: setattr(self.opts, "exposure_bias", v))
         menu.addSeparator()
         pm = menu.addMenu("Camera profile (DNG colour)")
@@ -620,6 +651,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _build_ui(self):
         self.opts = auto.AutoOptions()
+        self._settings = self._load_json(SETTINGS_FILE)
+        self._apply_saved_options(self._settings)
         self.sliders = {}
         tb = self.addToolBar("Main")
         tb.setMovable(False)
@@ -653,7 +686,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.act_update = tb.addAction("Check for Updates", lambda: self.check_updates(manual=True))
         self.act_update.setToolTip(f"You have v{__version__}. Checks github.com/{updater.GITHUB_REPO}")
 
-        split = QtWidgets.QSplitter()
+        split = self.split = QtWidgets.QSplitter()
         self.setCentralWidget(split)
 
         # Left: list with a check box per photo
@@ -860,6 +893,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_enhance.setToolTip("Run every automatic tool ticked in 'Auto options'")
         self.btn_reset_auto = QtWidgets.QPushButton("Reset to auto proposal")
         self.btn_reset_shot = QtWidgets.QPushButton("Reset to As Shot")
+        self.btn_reset_lr = QtWidgets.QPushButton("Reset to Lightroom settings")
+        self.btn_reset_lr.setToolTip("Go back to the settings this photo already had when it was added "
+                                     "(its Lightroom sidecar / DNG export)")
+        self.btn_reset_lr.clicked.connect(self.reset_lr)
         self.btn_undo = QtWidgets.QPushButton("↶ Undo (Ctrl+Z)")
         self.btn_redo = QtWidgets.QPushButton("↷ Redo (Ctrl+Y)")
         self.btn_undo.setToolTip("Undo the last change to this photo (each photo keeps its own history)")
@@ -875,6 +912,11 @@ class MainWindow(QtWidgets.QMainWindow):
         ml.addWidget(self.btn_paste, 2, 1)
         ml.addWidget(self.btn_undo, 3, 0)
         ml.addWidget(self.btn_redo, 3, 1)
+        ml.addWidget(self.btn_reset_lr, 4, 0, 1, 2)
+        self.rating_lbl = QtWidgets.QLabel("")
+        self.rating_lbl.setToolTip("Star rating 1-5 (0 clears) and colour label 6 red, 7 yellow, 8 green, 9 blue "
+                                   "(press again to clear). Written to Lightroom when you approve.")
+        ml.addWidget(self.rating_lbl, 5, 0, 1, 2)
         pl.addWidget(g_misc)
 
         safety = QtWidgets.QLabel(
@@ -932,6 +974,10 @@ class MainWindow(QtWidgets.QMainWindow):
         sc("E", self.auto_enhance)
         sc("C", self.toggle_check_current)
         sc("G", lambda: self.act_grid.toggle())
+        for n in range(6):
+            sc(str(n), lambda n=n: self.set_rating(n))
+        for key, lab in zip("6789", core.LABELS):
+            sc(key, lambda lab=lab: self.set_label(lab))
         sc("Ctrl+Z", self.undo_edit)
         sc("Ctrl+Y", self.redo_edit)
         sc("Ctrl+Shift+Z", self.redo_edit)
@@ -943,6 +989,7 @@ class MainWindow(QtWidgets.QMainWindow):
         mask_keys = set(core.MASK_KEYS["sky"]) | set(core.MASK_KEYS["subject"])
         widgets += [w for k, w in self.sliders.items() if k not in mask_keys]
         widgets += [self.box_sky, self.box_subj, self.chk_masks, self.btn_undo, self.btn_redo]
+        self.btn_reset_lr.setEnabled(bool(on and self.current is not None and self.current.lr_edit is not None))
         for w in widgets:
             w.setEnabled(on)
         if on:
@@ -965,11 +1012,11 @@ class MainWindow(QtWidgets.QMainWindow):
     def open_files(self):
         exts = " ".join("*" + x for x in sorted(core.RAW_EXTS)) + " " + \
             " ".join("*" + x.upper() for x in sorted(core.RAW_EXTS))
-        files, _ = QtWidgets.QFileDialog.getOpenFileNames(self, "Add RAW photos", "", f"RAW photos ({exts})")
+        files, _ = QtWidgets.QFileDialog.getOpenFileNames(self, "Add RAW photos", self.last_dir, f"RAW photos ({exts})")
         self.add_paths(files)
 
     def open_folder(self):
-        d = QtWidgets.QFileDialog.getExistingDirectory(self, "Add a folder (subfolders included)")
+        d = QtWidgets.QFileDialog.getExistingDirectory(self, "Add a folder (subfolders included)", self.last_dir)
         if d:
             self.add_paths([d])
 
@@ -988,6 +1035,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 consider(p)
 
         new = [f for f in found if f not in self.items]
+        if found:
+            self.last_dir = os.path.dirname(found[0])
         opts = self._opts_snapshot()
         for f in new:
             it = Item(f)
@@ -995,13 +1044,17 @@ class MainWindow(QtWidgets.QMainWindow):
             li.setData(Qt.ItemDataRole.UserRole, f)
             li.setToolTip(f)
             li.setFlags(li.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            li.setCheckState(Qt.CheckState.Unchecked)
+            saved = self._restore_map.get(f)
+            li.setCheckState(Qt.CheckState.Checked if saved and saved.get("checked") else Qt.CheckState.Unchecked)
             it.list_item = li
             gi = QtWidgets.QListWidgetItem(os.path.basename(f))
             gi.setData(Qt.ItemDataRole.UserRole, f)
             gi.setToolTip(f)
             gi.setTextAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
             it.grid_item = gi
+            if saved:
+                it.rating = saved.get("rating")
+                it.label = saved.get("label")
             self.items[f] = it
             self.list.addItem(li)
             self.grid.addItem(gi)
@@ -1030,6 +1083,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.current = None
         self._undo = {}
         self.act_undo_batch.setEnabled(False)
+        self._restore_map = {}
         self.list.clear()
         self.grid.clear()
         self._thumb_pending.clear()
@@ -1059,13 +1113,27 @@ class MainWindow(QtWidgets.QMainWindow):
         self._cache_put(path, dec)
         it.color, it.src_size = dec.color, (dec.cam.shape[1], dec.cam.shape[0])
         if "edit" in res:
-            it.edit, it.auto_edit, it.wb = res["edit"], res["edit"].copy(), res["wb"]
+            it.edit, it.auto_edit, it.wb = res["edit"], res.get("auto_edit", res["edit"]).copy(), res["wb"]
+            ex = res.get("existing") or {}
+            it.lr_edit = ex.get("edit").copy() if ex.get("edit") is not None else None
+            if it.rating is None and ex.get("rating") is not None:
+                it.rating = ex["rating"]
+            if it.label is None and ex.get("label"):
+                it.label = ex["label"]
+            saved = self._restore_map.pop(path, None)
+            if saved is not None:                       # last session: put back your edit and decision
+                if saved.get("edit"):
+                    it.edit = core.edit_from_dict(saved["edit"])
+                st = saved.get("status", "ready")
+                it.status = st if st in ("ready", "approved", "modified", "rejected") else "ready"
             if it.status == "loading":
                 it.status = "ready"
             self._set_thumb(it, res["thumb"])
+            if saved is not None:
+                self._queue_thumb(it)
             self._update_list_item(it)
             self._update_count()
-            if self.chk_autowrite.isChecked() and it.status == "ready":
+            if self.chk_autowrite.isChecked() and it.status == "ready" and saved is None:
                 self._write(it, quiet=True)
         if it is self.current:
             self.load_controls()
@@ -1090,11 +1158,15 @@ class MainWindow(QtWidgets.QMainWindow):
     # ---------------- list / navigation ----------------
     def _update_list_item(self, it):
         label, col = STATUS_STYLE[it.status]
-        sidecar = " · has XMP" if os.path.exists(core.sidecar_path(it.path)) and it.status != "approved" else ""
+        has = (os.path.exists(core.dng_export_path(it.path)) if it.path.lower().endswith(".dng")
+               else os.path.exists(core.sidecar_path(it.path)))
+        sidecar = " · has XMP" if has and it.status != "approved" else ""
+        extra_meta = self._meta_text(it)
         extra = ""
         if it.wb is not None and it.wb.applied and it.wb.confidence < 0.5 and it.status == "ready":
             extra = " · check WB"
-        it.list_item.setText(f"{os.path.basename(it.path)}\n{label}{extra}{sidecar}")
+        it.list_item.setText(f"{os.path.basename(it.path)}\n{label}{extra}{sidecar}"
+                             + (f"\n{extra_meta}" if extra_meta else ""))
         it.list_item.setBackground(QtGui.QBrush(col) if col else QtGui.QBrush())
         it.list_item.setForeground(QtGui.QBrush(QtGui.QColor("white")) if col else QtGui.QBrush())
         if it.error:
@@ -1109,7 +1181,8 @@ class MainWindow(QtWidgets.QMainWindow):
         mark = "☑ " if it.list_item.checkState() == Qt.CheckState.Checked else ""
         low = " · check WB" if (it.wb is not None and it.wb.applied and it.wb.confidence < 0.5
                                 and it.status == "ready") else ""
-        gi.setText(f"{mark}{os.path.basename(it.path)}\n{label}{low}")
+        meta = self._meta_text(it)
+        gi.setText(f"{mark}{os.path.basename(it.path)}\n{label}{low}" + (f"\n{meta}" if meta else ""))
         gi.setBackground(QtGui.QBrush(col) if col else QtGui.QBrush())
         gi.setForeground(QtGui.QBrush(QtGui.QColor("white")))
         if it.error:
@@ -1350,6 +1423,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.box_subj.setChecked(e.subj_on)
         self._loading_controls = False
         self._update_undo_buttons()
+        self._update_rating_label()
         self.notes_lbl.setText("   ".join(e.notes))
 
     def on_wb_slider(self, _v):
@@ -1713,6 +1787,186 @@ class MainWindow(QtWidgets.QMainWindow):
         self.statusBar().showMessage(f"Undid the last batch edit ({n} photo(s)). "
                                      "Any XMP already written is left as it was.", 8000)
 
+    # ---------------- ratings & colour labels ----------------
+    def _meta_text(self, it):
+        parts = []
+        if it.rating:
+            parts.append("★" * it.rating + "☆" * (5 - it.rating))
+        if it.label:
+            parts.append(f"● {it.label}")
+        return "  ".join(parts)
+
+    def _rating_targets(self):
+        sel = [t for t in self.selected_items() if t is not None]
+        if len(sel) > 1:
+            return sel
+        return [self.current] if self.current else []
+
+    def set_rating(self, n):
+        targets = self._rating_targets()
+        for t in targets:
+            t.rating = n
+            self._mark_changed(t)
+            self._update_list_item(t)
+        if targets:
+            self.statusBar().showMessage(
+                (f"{'★' * n} rating" if n else "Rating cleared") + f" on {len(targets)} photo(s) "
+                "– written to Lightroom when approved.", 3000)
+        self._update_rating_label()
+
+    def set_label(self, lab):
+        targets = self._rating_targets()
+        same = all(t.label == lab for t in targets)
+        for t in targets:
+            t.label = "" if same else lab           # pressing the same key again clears it, like Lightroom
+            self._mark_changed(t)
+            self._update_list_item(t)
+        if targets:
+            self.statusBar().showMessage(("Label cleared" if same else f"{lab} label") +
+                                         f" on {len(targets)} photo(s).", 3000)
+        self._update_rating_label()
+
+    def _update_rating_label(self):
+        it = self.current
+        if it is None:
+            self.rating_lbl.setText("")
+            return
+        stars = "★" * (it.rating or 0) + "☆" * (5 - (it.rating or 0))
+        lab = it.label or ""
+        col = LABEL_COLOURS.get(lab, "#888")
+        self.rating_lbl.setText(f"<span style='font-size:15px'>{stars}</span>"
+                                + (f"&nbsp;&nbsp;<span style='color:{col}'>● {lab}</span>" if lab else "")
+                                + "&nbsp;&nbsp;<span style='color:#777'>(keys 0-5, 6-9)</span>")
+
+    def reset_lr(self):
+        it = self.current
+        if it is None or it.edit is None or it.lr_edit is None:
+            return
+        self._record_undo(it, it.edit.copy())
+        it.edit = it.lr_edit.copy()
+        self._mark_changed(it)
+        self._queue_thumb(it)
+        self.load_controls()
+        self.refresh_view()
+        self.statusBar().showMessage("Back to the settings this photo had in Lightroom.", 4000)
+
+    # ---------------- remembering settings & the session ----------------
+    @staticmethod
+    def _load_json(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return {}
+
+    @staticmethod
+    def _json_default(o):
+        if isinstance(o, np.generic):
+            return o.item()
+        if isinstance(o, (set, frozenset)):
+            return sorted(o)
+        raise TypeError(type(o).__name__)
+
+    def _save_json(self, path, data):
+        try:
+            os.makedirs(CONFIG_DIR, exist_ok=True)
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=1, default=self._json_default)
+            os.replace(tmp, path)
+        except OSError:
+            pass                                   # remembering is a convenience; never block the app
+
+    def _apply_saved_options(self, st):
+        o = st.get("auto") or {}
+        if "groups" in o:
+            self.opts.groups = set(g for g in o["groups"] if g in auto.GROUP_ORDER)
+            known = set(o.get("known_groups", auto.GROUP_ORDER))
+            self.opts.groups |= {g for g in auto.GROUP_ORDER if g not in known}   # tools added in an update: on
+        for k in ("level_mode", "allow_upright", "strength", "exposure_bias", "use_existing"):
+            if k in o:
+                setattr(self.opts, k, o[k])
+        if self.opts.level_mode not in core.LEVEL_MODES:
+            self.opts.level_mode = "Auto (best guess)"
+        for k, v in (st.get("dng_profile") or {}).items():
+            if hasattr(dng_profile.OPTIONS, k):
+                setattr(dng_profile.OPTIONS, k, v)
+        self.last_dir = st.get("last_dir", "") if os.path.isdir(st.get("last_dir", "") or "") else ""
+
+    def _apply_saved_window(self, st):
+        try:
+            if st.get("geometry"):
+                self.restoreGeometry(QtCore.QByteArray(base64.b64decode(st["geometry"])))
+            if st.get("splitter"):
+                self.split.setSizes([int(x) for x in st["splitter"]])
+        except Exception:  # noqa: BLE001
+            pass
+        self.chk_autowrite.setChecked(bool(st.get("auto_write", False)))
+        self.chk_relative.setChecked(bool(st.get("relative", False)))
+        self.scope_combo.setCurrentIndex(int(st.get("scope", 0)) if str(st.get("scope", 0)).isdigit() else 0)
+        self.chk_samples.setChecked(bool(st.get("show_wb_samples", False)))
+        self.chk_masks.setChecked(bool(st.get("show_masks", False)))
+
+    def _settings_dict(self):
+        o = self.opts
+        return {
+            "version": __version__,
+            "auto": {"groups": sorted(o.groups), "known_groups": list(auto.GROUP_ORDER), "level_mode": o.level_mode, "allow_upright": o.allow_upright,
+                     "strength": o.strength, "exposure_bias": o.exposure_bias, "use_existing": o.use_existing},
+            "dng_profile": {k: getattr(dng_profile.OPTIONS, k) for k in dng_profile.OPTIONS.__dataclass_fields__},
+            "geometry": base64.b64encode(bytes(self.saveGeometry())).decode("ascii"),
+            "splitter": self.split.sizes(),
+            "last_dir": self.last_dir,
+            "auto_write": self.chk_autowrite.isChecked(),
+            "relative": self.chk_relative.isChecked(),
+            "scope": self.scope_combo.currentIndex(),
+            "show_wb_samples": self.chk_samples.isChecked(),
+            "show_masks": self.chk_masks.isChecked(),
+        }
+
+    def _session_dict(self):
+        photos = []
+        for r in range(self.list.count()):
+            path = self.list.item(r).data(Qt.ItemDataRole.UserRole)
+            it = self.items.get(path)
+            if it is None:
+                continue
+            saved = self._restore_map.get(path)            # not analysed yet: keep what we restored
+            photos.append({
+                "path": path,
+                "status": it.status if it.edit is not None else (saved or {}).get("status", "ready"),
+                "checked": it.list_item.checkState() == Qt.CheckState.Checked,
+                "rating": it.rating, "label": it.label,
+                "edit": core.edit_to_dict(it.edit) if it.edit is not None else (saved or {}).get("edit"),
+            })
+        return {"version": __version__, "current": self.list.currentRow(), "photos": photos}
+
+    def save_state(self):
+        self._save_json(SETTINGS_FILE, self._settings_dict())
+        sess = self._session_dict()
+        text = json.dumps(sess, sort_keys=True, default=self._json_default)
+        if text != self._last_session_text:
+            self._save_json(SESSION_FILE, sess)
+            self._last_session_text = text
+
+    def restore_session(self):
+        if len(sys.argv) > 1:
+            return                                         # opened with photos on the command line
+        sess = self._load_json(SESSION_FILE)
+        photos = [p for p in sess.get("photos", []) if isinstance(p, dict) and os.path.isfile(p.get("path", ""))]
+        missing = len(sess.get("photos", [])) - len(photos)
+        if not photos:
+            return
+        self._restore_map = {p["path"]: p for p in photos}
+        self.add_paths([p["path"] for p in photos])
+        cur = sess.get("current", 0)
+        if isinstance(cur, int) and 0 <= cur < self.list.count():
+            self.list.setCurrentRow(cur)
+        self._update_checked_label()
+        self.statusBar().showMessage(
+            f"Restored your last session: {len(photos)} photo(s) with their edits and decisions"
+            + (f" ({missing} no longer found)" if missing else "") + ". Clear List starts fresh.", 10000)
+
     # ---------------- per-photo undo / redo ----------------
     UNDO_LIMIT = 100
     UNDO_MERGE_SECONDS = 1.0
@@ -1765,7 +2019,8 @@ class MainWindow(QtWidgets.QMainWindow):
     # ---------------- decisions ----------------
     def _write(self, it, quiet=False) -> bool:
         try:
-            msg = core.write_xmp(it.path, it.edit, it.src_size)
+            msg = core.write_xmp(it.path, it.edit, it.src_size,
+                                 meta={"rating": it.rating, "label": it.label})
         except core.RawSafetyError as ex:
             QtWidgets.QMessageBox.critical(self, "Stopped for safety", str(ex))
             return False
@@ -1936,6 +2191,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.close()
 
     def closeEvent(self, e):
+        self.save_state()
         self.pool.clear()
         self.gen += 1
         self.pool.waitForDone(3000)

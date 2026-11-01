@@ -68,6 +68,7 @@ class AutoOptions:
     allow_upright: bool = True
     strength: float = 1.0
     exposure_bias: float = 0.0       # EV added to auto exposure (your taste / calibration)
+    use_existing: bool = True        # start from settings the photo already has (Lightroom), if any
 
 
 # --------------------------------------------------------------------------

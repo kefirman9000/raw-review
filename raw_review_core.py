@@ -60,7 +60,7 @@ MASK_NAME = {"sky": "RAW Review: Sky", "subject": "RAW Review: Subject"}
 LOCAL_EXPOSURE_SCALE = 1.0
 
 # crs:PerspectiveUpright values (as decoded by the ExifTool project).
-UPRIGHT_MODES = {"Off": 0, "Auto": 1, "Full": 2, "Level": 3, "Vertical": 4}
+UPRIGHT_MODES = {"Off": 0, "Auto": 1, "Full": 2, "Level": 3, "Vertical": 4, "Guided": 5}
 
 # Straighten / level modes offered in the app.
 #   "rotate" modes are measured by this app and written as a plain crop angle.
@@ -500,6 +500,9 @@ class Edit:
     subj_texture: int = 0
     subj_clarity: int = 0
     subj_saturation: int = 0
+    # Set when the settings were read from an existing Lightroom edit that has its own crop:
+    # as long as the angle isn't changed here, that crop is left exactly as it was.
+    lr_crop_angle: float | None = None
     # Optional settings (whites, blacks, saturation, sharpening, noise) are only
     # written to the sidecar once they have been set, so an existing sidecar's
     # values are left alone until you or an auto tool touch them.
@@ -1192,7 +1195,9 @@ NS = {
     "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
     "crs": "http://ns.adobe.com/camera-raw-settings/1.0/",
     "rrv": "http://ns.rawreview.local/1.0/",
+    "xmp": "http://ns.adobe.com/xap/1.0/",
 }
+LABELS = ["Red", "Yellow", "Green", "Blue", "Purple"]      # Lightroom's colour label names
 for _p, _u in NS.items():
     ET.register_namespace(_p, _u)
 
@@ -1381,7 +1386,22 @@ def _write_masks(desc, edit: Edit, raw_path: str):
         desc.remove(group)
 
 
-def _write_sidecar(raw_path: str, edit: Edit, src_size=(3, 2)) -> str:
+def _write_meta(desc, meta):
+    """Star rating / colour label. None = leave whatever the file has."""
+    if not meta:
+        return
+    r = meta.get("rating")
+    if r is not None:
+        _set(desc, _q("xmp", "Rating"), str(int(r)))
+    lab = meta.get("label")
+    if lab is not None:
+        if lab:
+            _set(desc, _q("xmp", "Label"), lab)
+        else:
+            _remove(desc, _q("xmp", "Label"))
+
+
+def _write_sidecar(raw_path: str, edit: Edit, src_size=(3, 2), meta=None) -> str:
     """
     Write/update the Lightroom sidecar for raw_path. The RAW itself is never
     opened for writing; its size and timestamp are verified unchanged.
@@ -1434,9 +1454,14 @@ def _write_sidecar(raw_path: str, edit: Edit, src_size=(3, 2)) -> str:
     for k in remove:
         _remove(desc, _q("crs", k))
     _write_masks(desc, edit, raw_path)
+    _write_meta(desc, meta)
 
     marker = _q("rrv", "CropByRawReview")
-    if abs(edit.angle) >= 0.01:
+    keep_lr_crop = (edit.lr_crop_angle is not None and abs(edit.angle - edit.lr_crop_angle) < 0.01
+                    and desc.get(marker) is None)
+    if keep_lr_crop:
+        pass                                  # the crop you made in Lightroom stays as it is
+    elif abs(edit.angle) >= 0.01:
         for k, val in _crop_values(edit, *src_size).items():
             _set(desc, _q("crs", k), val)
         desc.set(marker, "True")
@@ -1526,7 +1551,7 @@ def _embed_xmp_in_tiff(data: bytes, xmp: bytes) -> bytes:
     return bytes(out)
 
 
-def _write_dng(dng_path: str, edit: Edit, src_size=(3, 2), out_dir: str | None = None) -> str:
+def _write_dng(dng_path: str, edit: Edit, src_size=(3, 2), out_dir: str | None = None, meta=None) -> str:
     """
     Export an edited COPY of the DNG for Lightroom: <out_dir>/<name>.dng, with the develop
     settings embedded in its XMP packet. The source DNG is only read, never changed, and
@@ -1548,6 +1573,16 @@ def _write_dng(dng_path: str, edit: Edit, src_size=(3, 2), out_dir: str | None =
     with open(src, "rb") as f:
         data = f.read()
     existing = _extract_tiff_xmp(data)         # only used to keep ratings / keywords; unreadable XMP is replaced
+    if os.path.isfile(target):
+        # An earlier export exists (maybe edited in Lightroom since): build on ITS settings, so edits
+        # made there (masks, other sliders, ratings) aren't thrown away by re-approving.
+        try:
+            with open(target, "rb") as f:
+                prev = _extract_tiff_xmp(f.read())
+            if prev:
+                existing = prev
+        except (OSError, RawSafetyError):
+            pass
 
     with tempfile.TemporaryDirectory(prefix="rawreview-") as td:
         fake = os.path.join(td, "x.dng")                 # lets the normal sidecar merge logic run
@@ -1556,7 +1591,7 @@ def _write_dng(dng_path: str, edit: Edit, src_size=(3, 2), out_dir: str | None =
         if existing:
             with open(side, "wb") as f:
                 f.write(existing)
-        _write_sidecar(fake, edit, src_size)
+        _write_sidecar(fake, edit, src_size, meta)
         with open(side, "rb") as f:
             body = f.read().decode("utf-8")
     packet = ('<?xpacket begin="\ufeff" id="W5M0MpCehiHzreSzNTczkc9d"?>\n' + body
@@ -1596,12 +1631,191 @@ def _write_dng(dng_path: str, edit: Edit, src_size=(3, 2), out_dir: str | None =
     return f"Exported {stem}.dng to {out_dir} (import this folder into Lightroom)"
 
 
-def write_xmp(raw_path: str, edit: Edit, src_size=(3, 2), out_dir: str | None = None) -> str:
+def write_xmp(raw_path: str, edit: Edit, src_size=(3, 2), out_dir: str | None = None, meta=None) -> str:
     """Write the Lightroom settings: a .xmp sidecar for RAW files, an exported edited .dng copy for DNG."""
     if os.path.splitext(raw_path)[1].lower() == ".dng":
-        return _write_dng(raw_path, edit, src_size, out_dir)
-    return _write_sidecar(raw_path, edit, src_size)
+        return _write_dng(raw_path, edit, src_size, out_dir, meta)
+    return _write_sidecar(raw_path, edit, src_size, meta)
 
 
 def is_raw(path: str) -> bool:
     return os.path.splitext(path)[1].lower() in RAW_EXTS
+
+
+# --------------------------------------------------------------------------
+# Reading the settings a photo already has (Lightroom sidecar / DNG)
+# --------------------------------------------------------------------------
+
+def dng_export_path(dng_path: str) -> str:
+    stem = os.path.splitext(os.path.basename(dng_path))[0]
+    return os.path.join(os.path.dirname(os.path.abspath(dng_path)), DNG_EXPORT_DIR, stem + ".dng")
+
+
+def _existing_xmp_bytes(raw_path: str):
+    """The XMP that Lightroom would use for this photo, or None. Read-only."""
+    try:
+        if raw_path.lower().endswith(".dng"):
+            for p in (dng_export_path(raw_path), raw_path):     # the export is what Lightroom has
+                if os.path.isfile(p):
+                    with open(p, "rb") as f:
+                        x = _extract_tiff_xmp(f.read())
+                    if x and b"camera-raw-settings" in x:
+                        return x
+            return None
+        side = sidecar_path(raw_path)
+        if os.path.isfile(side):
+            with open(side, "rb") as f:
+                return f.read()
+    except (OSError, RawSafetyError):
+        return None
+    return None
+
+
+def _crs_props(root):
+    """All simple crs:/xmp: properties (attributes or child elements) in every rdf:Description."""
+    props = {}
+    for d in root.iter(_q("rdf", "Description")):
+        for k, v in d.attrib.items():
+            props.setdefault(k, v)
+        for child in d:
+            if len(child) == 0 and child.text is not None and child.tag not in props:
+                props[child.tag] = child.text.strip()
+    return props
+
+
+def read_existing(raw_path: str, base: Edit):
+    """
+    Settings already saved for this photo (by Lightroom or by RAW Review), applied onto a copy of
+    `base` (normally the As Shot edit). Returns {"edit": Edit or None, "rating": int|None,
+    "label": str|None}. "edit" is None when the file has no develop settings. Never writes anything.
+    """
+    out = {"edit": None, "rating": None, "label": None}
+    data = _existing_xmp_bytes(raw_path)
+    if not data:
+        return out
+    try:
+        text = data.decode("utf-8", "replace")
+        i = text.find("<x:xmpmeta")
+        j = text.rfind("</x:xmpmeta>")
+        root = ET.fromstring(text[i:j + 12] if i >= 0 and j > i else text)
+    except ET.ParseError:
+        return out
+    P = _crs_props(root)
+
+    def g(name, ns="crs"):
+        return P.get(_q(ns, name))
+
+    try:
+        out["rating"] = int(float(g("Rating", "xmp"))) if g("Rating", "xmp") is not None else None
+    except ValueError:
+        pass
+    lab = g("Label", "xmp")
+    out["label"] = lab if lab else None
+
+    main = ("Exposure2012", "Contrast2012", "Highlights2012", "Shadows2012", "WhiteBalance", "Temperature")
+    if g("HasSettings") is None and not any(g(k) is not None for k in main):
+        return out
+
+    e = base.copy()
+    e.notes = []
+
+    def num(name, default=None):
+        v = g(name)
+        try:
+            return float(v) if v is not None else default
+        except ValueError:
+            return default
+
+    simple = {"exposure": "Exposure2012", "contrast": "Contrast2012", "highlights": "Highlights2012",
+              "shadows": "Shadows2012", "vibrance": "Vibrance", "whites": "Whites2012", "blacks": "Blacks2012",
+              "saturation": "Saturation", "sharp_amount": "Sharpness", "sharp_radius": "SharpenRadius",
+              "sharp_detail": "SharpenDetail", "sharp_masking": "SharpenEdgeMasking",
+              "nr_luma": "LuminanceSmoothing", "nr_luma_detail": "LuminanceNoiseReductionDetail",
+              "nr_color": "ColorNoiseReduction"}
+    for key, name in simple.items():
+        v = num(name)
+        if v is None:
+            continue
+        st = SETTINGS[key]
+        v = min(max(v, st.lo), st.hi)
+        setattr(e, key, int(round(v)) if st.integer else round(v, st.decimals))
+        if st.optional:
+            e.touched.add(key)
+
+    wb = g("WhiteBalance")
+    t, ti = num("Temperature"), num("Tint")
+    if wb == "As Shot" or (wb is None and t is None):
+        e.wb_mode = "as_shot"
+    elif t is not None:
+        e.wb_mode = "custom"
+        e.temp = min(max(t, SETTINGS["temp"].lo), SETTINGS["temp"].hi)
+        e.tint = min(max(ti or 0.0, SETTINGS["tint"].lo), SETTINGS["tint"].hi)
+
+    lp = g("LensProfileEnable")
+    if lp is not None:
+        e.lens_profile = lp in ("1", "True", "true")
+    up = num("PerspectiveUpright")
+    if up is not None:
+        names = {v: k for k, v in UPRIGHT_MODES.items()}
+        e.upright = names.get(int(up), "Off")
+
+    if g("HasCrop") in ("True", "true"):
+        ca = num("CropAngle", 0.0)
+        ang = round(min(max(ca / XMP_ANGLE_SIGN, SETTINGS["angle"].lo), SETTINGS["angle"].hi), 2)
+        e.angle = ang
+        ours = any(k == _q("rrv", "CropByRawReview") for d in root.iter(_q("rdf", "Description")) for k in d.attrib)
+        e.lr_crop_angle = None if ours else ang
+    else:
+        e.angle = 0.0
+    e.level_mode = "Manual" if (abs(e.angle) >= 0.01 or e.upright != "Off") else "Off"
+
+    # RAW Review's own sky / subject masks (other masks stay in the file untouched)
+    e.sky_on = e.subj_on = False
+    grp = None
+    for d in root.iter(_q("rdf", "Description")):
+        grp = d.find(_q("crs", "MaskGroupBasedCorrections"))
+        if grp is not None:
+            break
+    if grp is not None:
+        for li in grp.iter(_q("rdf", "li")):
+            for node in [li] + list(li):
+                name = node.get(_q("crs", "CorrectionName")) or ""
+                kind = "sky" if name == MASK_NAME["sky"] else "subject" if name == MASK_NAME["subject"] else None
+                if not kind:
+                    continue
+
+                def lv(n, scale=100.0):
+                    try:
+                        return float(node.get(_q("crs", n), "0")) * scale
+                    except ValueError:
+                        return 0.0
+                if kind == "sky":
+                    e.sky_on = True
+                    e.sky_exposure = round(lv("LocalExposure2012", LOCAL_EXPOSURE_SCALE), 2)
+                    e.sky_contrast, e.sky_highlights = round(lv("LocalContrast2012")), round(lv("LocalHighlights2012"))
+                    e.sky_dehaze, e.sky_saturation = round(lv("LocalDehaze")), round(lv("LocalSaturation"))
+                    e.sky_temp = round(lv("LocalTemperature"))
+                else:
+                    e.subj_on = True
+                    e.subj_exposure = round(lv("LocalExposure2012", LOCAL_EXPOSURE_SCALE), 2)
+                    e.subj_contrast, e.subj_shadows = round(lv("LocalContrast2012")), round(lv("LocalShadows2012"))
+                    e.subj_texture, e.subj_clarity = round(lv("LocalTexture")), round(lv("LocalClarity2012"))
+                    e.subj_saturation = round(lv("LocalSaturation"))
+    e.notes = ["Started from the settings already saved for this photo (Lightroom)"]
+    out["edit"] = e
+    return out
+
+
+def edit_to_dict(e: Edit) -> dict:
+    d = {f: getattr(e, f) for f in e.__dataclass_fields__}
+    d["touched"] = sorted(e.touched)
+    d["notes"] = list(e.notes)
+    return d
+
+
+def edit_from_dict(d: dict) -> Edit:
+    e = Edit()
+    for k, v in (d or {}).items():
+        if k in e.__dataclass_fields__:
+            setattr(e, k, set(v) if k == "touched" else v)
+    return e
