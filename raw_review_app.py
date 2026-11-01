@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 import traceback
 from collections import OrderedDict
 
@@ -54,6 +55,10 @@ class Item:
         self.error = ""
         self.list_item: QtWidgets.QListWidgetItem | None = None
         self.grid_item: QtWidgets.QListWidgetItem | None = None
+        self.undo: list = []          # earlier versions of .edit (newest last)
+        self.redo: list = []
+        self.undo_key = None          # what the last undo step was about (merges one slider drag)
+        self.undo_time = 0.0
 
 
 # --------------------------------------------------------------------------
@@ -794,6 +799,31 @@ class MainWindow(QtWidgets.QMainWindow):
         cl2 = group("Colour", ["colour"])
         for k in ("vibrance", "saturation"):
             cl2.addWidget(self._slider(k))
+        ml_ = group("Sky & subject masks (Lightroom AI)", ["masks"])
+        self.box_sky = QtWidgets.QGroupBox("Sky")
+        self.box_sky.setCheckable(True)
+        self.box_sky.setChecked(False)
+        bl = QtWidgets.QVBoxLayout(self.box_sky)
+        for k in core.MASK_KEYS["sky"]:
+            bl.addWidget(self._slider(k))
+        self.box_subj = QtWidgets.QGroupBox("Subject")
+        self.box_subj.setCheckable(True)
+        self.box_subj.setChecked(False)
+        bl2 = QtWidgets.QVBoxLayout(self.box_subj)
+        for k in core.MASK_KEYS["subject"]:
+            bl2.addWidget(self._slider(k))
+        ml_.addWidget(self.box_sky)
+        ml_.addWidget(self.box_subj)
+        self.chk_masks = QtWidgets.QCheckBox("Show masks (sky blue, subject orange)")
+        self.chk_masks.toggled.connect(lambda _v: self.refresh_view())
+        ml_.addWidget(self.chk_masks)
+        mnote = QtWidgets.QLabel("Written as Lightroom's Select Sky / Select Subject. Lightroom makes the exact "
+                                 "mask itself, so the preview here is approximate. If Lightroom shows a warning on "
+                                 "the mask, select the photos and use Update AI Settings.")
+        mnote.setWordWrap(True)
+        mnote.setStyleSheet("color:#888;font-size:11px;")
+        ml_.addWidget(mnote)
+
         sl = group("Sharpening", ["sharpen"])
         for k in ("sharp_amount", "sharp_radius", "sharp_detail", "sharp_masking"):
             sl.addWidget(self._slider(k))
@@ -830,6 +860,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_enhance.setToolTip("Run every automatic tool ticked in 'Auto options'")
         self.btn_reset_auto = QtWidgets.QPushButton("Reset to auto proposal")
         self.btn_reset_shot = QtWidgets.QPushButton("Reset to As Shot")
+        self.btn_undo = QtWidgets.QPushButton("↶ Undo (Ctrl+Z)")
+        self.btn_redo = QtWidgets.QPushButton("↷ Redo (Ctrl+Y)")
+        self.btn_undo.setToolTip("Undo the last change to this photo (each photo keeps its own history)")
+        self.btn_redo.setToolTip("Redo (Ctrl+Y or Ctrl+Shift+Z)")
+        self.btn_undo.clicked.connect(self.undo_edit)
+        self.btn_redo.clicked.connect(self.redo_edit)
         self.btn_copy = QtWidgets.QPushButton("Copy settings (Ctrl+C)")
         self.btn_paste = QtWidgets.QPushButton("Paste to checked/selected (Ctrl+V)")
         ml.addWidget(self.btn_enhance, 0, 0, 1, 2)
@@ -837,6 +873,8 @@ class MainWindow(QtWidgets.QMainWindow):
         ml.addWidget(self.btn_reset_shot, 1, 1)
         ml.addWidget(self.btn_copy, 2, 0)
         ml.addWidget(self.btn_paste, 2, 1)
+        ml.addWidget(self.btn_undo, 3, 0)
+        ml.addWidget(self.btn_redo, 3, 1)
         pl.addWidget(g_misc)
 
         safety = QtWidgets.QLabel(
@@ -866,6 +904,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.level_combo.activated.connect(lambda _i: self.do_level(self.level_combo.currentText()))
         self.btn_level.clicked.connect(lambda: self.do_level(self.level_combo.currentText()))
         self.chk_lens.toggled.connect(self.on_control)
+        self.box_sky.toggled.connect(self.on_control)
+        self.box_subj.toggled.connect(self.on_control)
         self.btn_auto_wb.clicked.connect(self.do_auto_wb)
         self.btn_eyedrop.toggled.connect(self.on_eyedrop_toggle)
         self.btn_enhance.clicked.connect(self.auto_enhance)
@@ -892,14 +932,21 @@ class MainWindow(QtWidgets.QMainWindow):
         sc("E", self.auto_enhance)
         sc("C", self.toggle_check_current)
         sc("G", lambda: self.act_grid.toggle())
+        sc("Ctrl+Z", self.undo_edit)
+        sc("Ctrl+Y", self.redo_edit)
+        sc("Ctrl+Shift+Z", self.redo_edit)
 
     def _set_controls_enabled(self, on):
         widgets = [self.wb_combo, self.btn_auto_wb, self.btn_eyedrop, self.level_combo, self.btn_level,
                    self.chk_lens, self.btn_enhance, self.btn_reset_auto, self.btn_reset_shot,
                    self.btn_copy, self.btn_paste, self.btn_approve, self.btn_reject]
-        widgets += list(self.sliders.values())
+        mask_keys = set(core.MASK_KEYS["sky"]) | set(core.MASK_KEYS["subject"])
+        widgets += [w for k, w in self.sliders.items() if k not in mask_keys]
+        widgets += [self.box_sky, self.box_subj, self.chk_masks, self.btn_undo, self.btn_redo]
         for w in widgets:
             w.setEnabled(on)
+        if on:
+            self._update_undo_buttons()
 
     # ---------------- adding files ----------------
     def dragEnterEvent(self, e):
@@ -1189,10 +1236,19 @@ class MainWindow(QtWidgets.QMainWindow):
         changed = [k for k in core.SETTINGS if getattr(old, k) != getattr(new, k)]
         wb_to_shot = new.wb_mode == "as_shot" and old.wb_mode != "as_shot"
         lens = old.lens_profile != new.lens_profile
-        if not changed and not wb_to_shot and not lens and old.wb_mode == new.wb_mode:
+        sky_flip = old.sky_on != new.sky_on
+        subj_flip = old.subj_on != new.subj_on
+        if (not changed and not wb_to_shot and not lens and old.wb_mode == new.wb_mode
+                and not sky_flip and not subj_flip):
             return
+        key = ("sync",) + tuple(changed)
         for t in targets:
+            self._record_undo(t, t.edit.copy(), key=key)
             te = t.edit
+            if sky_flip:
+                te.sky_on = new.sky_on
+            if subj_flip:
+                te.subj_on = new.subj_on
             if new.wb_mode == "as_shot":
                 if wb_to_shot:
                     te.wb_mode = "as_shot"
@@ -1290,7 +1346,10 @@ class MainWindow(QtWidgets.QMainWindow):
             s.setValue(getattr(e, key))
         self.level_combo.setCurrentText(e.level_mode if e.level_mode in core.LEVEL_MODES else "Manual")
         self.chk_lens.setChecked(e.lens_profile)
+        self.box_sky.setChecked(e.sky_on)
+        self.box_subj.setChecked(e.subj_on)
         self._loading_controls = False
+        self._update_undo_buttons()
         self.notes_lbl.setText("   ".join(e.notes))
 
     def on_wb_slider(self, _v):
@@ -1331,6 +1390,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._loading_controls = False
             setattr(e, key, val)
         e.lens_profile = self.chk_lens.isChecked()
+        e.sky_on = self.box_sky.isChecked()
+        e.subj_on = self.box_subj.isChecked()
+        changed = tuple(k for k in core.SETTINGS if getattr(old, k) != getattr(e, k))
+        flags = tuple(f for f in ("wb_mode", "lens_profile", "sky_on", "subj_on", "level_mode")
+                      if getattr(old, f) != getattr(e, f))
+        if not changed and not flags:
+            return
+        self._record_undo(it, old, key=changed + flags)
+        self._update_undo_buttons()
         self._mark_changed(it)
         self._propagate(old, e)
         self.render_timer.start()
@@ -1356,7 +1424,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.view.set_message("Loading preview…")
             return
         before = self.chk_before.isChecked()
-        img, self.geom = core.render(dec, it.edit, original=before)
+        img, self.geom = core.render(dec, it.edit, original=before,
+                                     show_masks=self.chk_masks.isChecked() and not before)
         if not before and it.list_item is not None:
             import cv2
             h, w = img.shape[:2]
@@ -1375,6 +1444,9 @@ class MainWindow(QtWidgets.QMainWindow):
         badge = "BEFORE (as shot)" if before else ""
         if not before and it.edit.upright != "Off":
             badge = f"Upright: {it.edit.upright} (applied by Lightroom, not shown here)"
+        elif not before and (it.edit.sky_on or it.edit.subj_on):
+            on = " + ".join(n for n, f in (("Sky", it.edit.sky_on), ("Subject", it.edit.subj_on)) if f)
+            badge = f"{on} mask: approximate preview – Lightroom computes the exact mask"
         self.view.set_image(to_qimage(img), overlay, badge)
         self.view.set_message("Click a neutral spot…" if self.btn_eyedrop.isChecked() else "")
 
@@ -1395,6 +1467,7 @@ class MainWindow(QtWidgets.QMainWindow):
         it, dec = self._current_dec()
         if dec is None:
             return
+        self._record_undo(it, it.edit.copy())
         res = auto.run_auto(dec, it.edit, groups, self._opts_snapshot())
         if res.get("wb") is not None:
             it.wb = res["wb"]
@@ -1416,6 +1489,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         if mode == "Manual":
             return
+        self._record_undo(it, it.edit.copy())
         auto.apply_level_mode(dec, it.edit, mode, self.opts.allow_upright)
         self._mark_changed(it)
         self.load_controls()
@@ -1442,6 +1516,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if res is None:
             self.statusBar().showMessage("That spot is clipped or too dark – try another neutral area.", 6000)
             return
+        self._record_undo(it, it.edit.copy())
         it.edit.wb_mode, it.edit.temp, it.edit.tint = "custom", round(res[0]), round(res[1])
         self._replace_note(it.edit, "Auto WB", f"Auto WB: eyedropper → {round(res[0])}K / tint {round(res[1]):+d}")
         it.wb = None
@@ -1451,7 +1526,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def reset_auto(self):
         it = self.current
-        if it and it.auto_edit:
+        if it and it.auto_edit and it.edit is not None:
+            self._record_undo(it, it.edit.copy())
             it.edit = it.auto_edit.copy()
             self._mark_changed(it)
             self.load_controls()
@@ -1460,7 +1536,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def reset_shot(self):
         it = self.current
         dec = self._dec(it) if it else None
-        if dec is not None:
+        if dec is not None and it.edit is not None:
+            self._record_undo(it, it.edit.copy())
             it.edit = core.as_shot_edit(dec)
             it.edit.notes = ["Reset to As Shot"]
             self._mark_changed(it)
@@ -1480,6 +1557,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for it in targets:
             if it.edit is None:
                 continue
+            self._record_undo(it, it.edit.copy())
             it.edit = self.clip_edit.copy()
             it.edit.notes = ["Pasted settings"]
             self._mark_changed(it)
@@ -1578,6 +1656,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._batch_errors += 1
             self.statusBar().showMessage(f"{os.path.basename(path)}: {err}", 8000)
         else:
+            if it.edit is not None:
+                self._record_undo(it, it.edit.copy())
             it.edit = res["edit"]
             if res.get("wb") is not None:
                 it.wb = res["wb"]
@@ -1618,6 +1698,8 @@ class MainWindow(QtWidgets.QMainWindow):
             it = self.items.get(path)
             if it is None:
                 continue
+            if it.edit is not None:
+                self._record_undo(it, it.edit.copy())
             it.edit, it.wb = edit, wb
             it.status = "modified" if status == "approved" else status
             self._update_list_item(it)
@@ -1630,6 +1712,55 @@ class MainWindow(QtWidgets.QMainWindow):
         self.refresh_view()
         self.statusBar().showMessage(f"Undid the last batch edit ({n} photo(s)). "
                                      "Any XMP already written is left as it was.", 8000)
+
+    # ---------------- per-photo undo / redo ----------------
+    UNDO_LIMIT = 100
+    UNDO_MERGE_SECONDS = 1.0
+
+    def _record_undo(self, it, before, key=None):
+        """Save `before` (the photo's settings before a change) as an undo step.
+        Repeated changes to the same slider within a second (one drag) become one step."""
+        now = time.monotonic()
+        if key is not None and key == it.undo_key and now - it.undo_time < self.UNDO_MERGE_SECONDS and it.undo:
+            it.undo_time = now
+            it.redo.clear()
+            return
+        it.undo.append(before.copy())
+        del it.undo[:-self.UNDO_LIMIT]
+        it.redo.clear()
+        it.undo_key, it.undo_time = key, now
+
+    def _update_undo_buttons(self):
+        it = self.current
+        has = it is not None and it.edit is not None
+        self.btn_undo.setEnabled(bool(has and it.undo))
+        self.btn_redo.setEnabled(bool(has and it.redo))
+        if has:
+            self.btn_undo.setText(f"↶ Undo (Ctrl+Z){'  ·  ' + str(len(it.undo)) if it.undo else ''}")
+
+    def _restore(self, it, edit, verb):
+        it.edit = edit
+        it.undo_key = None                 # the next slider move starts a new step
+        self._mark_changed(it)
+        self._queue_thumb(it)
+        self.load_controls()
+        self.refresh_view()
+        self.statusBar().showMessage(f"{verb} on {os.path.basename(it.path)}"
+                                     f"  ({len(it.undo)} undo / {len(it.redo)} redo left)", 3000)
+
+    def undo_edit(self):
+        it = self.current
+        if it is None or it.edit is None or not it.undo:
+            return
+        it.redo.append(it.edit.copy())
+        self._restore(it, it.undo.pop(), "Undo")
+
+    def redo_edit(self):
+        it = self.current
+        if it is None or it.edit is None or not it.redo:
+            return
+        it.undo.append(it.edit.copy())
+        self._restore(it, it.redo.pop(), "Redo")
 
     # ---------------- decisions ----------------
     def _write(self, it, quiet=False) -> bool:

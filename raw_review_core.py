@@ -27,6 +27,7 @@ import shutil
 import struct
 import tempfile
 import time
+import uuid
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 
@@ -47,6 +48,16 @@ XMP_ANGLE_SIGN = -1.0
 # Process version written ONLY into brand-new sidecars ("11.0" = PV2012/v5,
 # fully supported by current Lightroom Classic; it offers to update it).
 PROCESS_VERSION = "11.0"
+
+# Lightroom AI masks (Select Sky / Select Subject). RAW Review writes the mask *recipe* the
+# same way Lightroom's Adaptive presets do; Lightroom computes the exact mask itself (it may
+# ask you to run "Update AI Settings" the first time). Values from Lightroom's XMP format.
+MASK_SUBTYPE = {"subject": "1", "sky": "2"}          # 0 background, 1 subject, 2 sky, 3 people
+MASK_NAME = {"sky": "RAW Review: Sky", "subject": "RAW Review: Subject"}
+# Local exposure in the XMP: written as EV / LOCAL_EXPOSURE_SCALE. Sources disagree on whether
+# Lightroom stores local exposure in plain EV (1.0) or scaled (4.0). If a +0.50 EV sky
+# adjustment shows up in Lightroom as +2.00 (or +0.13), change this number.
+LOCAL_EXPOSURE_SCALE = 1.0
 
 # crs:PerspectiveUpright values (as decoded by the ExifTool project).
 UPRIGHT_MODES = {"Off": 0, "Auto": 1, "Full": 2, "Level": 3, "Vertical": 4}
@@ -308,6 +319,7 @@ class Decoded:
     baseline: float          # brightness normalisation used by auto white balance
     source_size: tuple       # (w, h) of the decoded half-size image
     quality: ImageQuality = field(default_factory=ImageQuality)
+    masks: dict = field(default_factory=dict)      # preview mask estimates, computed on demand
 
 
 def decode_raw(path: str) -> Decoded:
@@ -473,6 +485,21 @@ class Edit:
     upright: str = "Off"         # key of UPRIGHT_MODES
     level_mode: str = "Off"      # key of LEVEL_MODES
     lens_profile: bool = True
+    # Lightroom AI masks (Select Sky / Select Subject) with their local adjustments
+    sky_on: bool = False
+    sky_exposure: float = 0.0    # EV
+    sky_contrast: int = 0
+    sky_highlights: int = 0
+    sky_dehaze: int = 0
+    sky_saturation: int = 0
+    sky_temp: int = 0            # local temperature, -100 (cooler) .. 100 (warmer)
+    subj_on: bool = False
+    subj_exposure: float = 0.0
+    subj_contrast: int = 0
+    subj_shadows: int = 0
+    subj_texture: int = 0
+    subj_clarity: int = 0
+    subj_saturation: int = 0
     # Optional settings (whites, blacks, saturation, sharpening, noise) are only
     # written to the sidecar once they have been set, so an existing sidecar's
     # values are left alone until you or an auto tool touch them.
@@ -517,7 +544,21 @@ SETTINGS = {s.key: s for s in [
     Setting("nr_luma_detail", "Luminance detail", 0, 100, 1, 0, 50, True, True),
     Setting("nr_color", "Color", 0, 100, 1, 0, 25, True, True),
     Setting("angle", "Straighten (°, + = counter-clockwise)", -15, 15, 0.05, 2, 0, False),
+    Setting("sky_exposure", "Exposure (EV)", -2, 2, 0.05, 2, 0, False),
+    Setting("sky_contrast", "Contrast", -100, 100, 1, 0, 0),
+    Setting("sky_highlights", "Highlights", -100, 100, 1, 0, 0),
+    Setting("sky_dehaze", "Dehaze", -100, 100, 1, 0, 0),
+    Setting("sky_saturation", "Saturation", -100, 100, 1, 0, 0),
+    Setting("sky_temp", "Temperature", -100, 100, 1, 0, 0),
+    Setting("subj_exposure", "Exposure (EV)", -2, 2, 0.05, 2, 0, False),
+    Setting("subj_contrast", "Contrast", -100, 100, 1, 0, 0),
+    Setting("subj_shadows", "Shadows", -100, 100, 1, 0, 0),
+    Setting("subj_texture", "Texture", -100, 100, 1, 0, 0),
+    Setting("subj_clarity", "Clarity", -100, 100, 1, 0, 0),
+    Setting("subj_saturation", "Saturation", -100, 100, 1, 0, 0),
 ]}
+MASK_KEYS = {"sky": [k for k in SETTINGS if k.startswith("sky_")],
+             "subject": [k for k in SETTINGS if k.startswith("subj_")]}
 
 # Friendly names used in the batch editor (the slider labels above are short
 # because they sit under a group heading).
@@ -526,6 +567,8 @@ SETTING_NAMES = {
     "sharp_detail": "Sharpening detail", "sharp_masking": "Sharpening masking",
     "nr_luma": "Noise reduction: luminance", "nr_luma_detail": "Noise reduction: luminance detail",
     "nr_color": "Noise reduction: color", "angle": "Straighten angle",
+    **{k: "Sky mask: " + SETTINGS[k].label for k in MASK_KEYS["sky"]},
+    **{k: "Subject mask: " + SETTINGS[k].label for k in MASK_KEYS["subject"]},
 }
 
 
@@ -556,6 +599,10 @@ def change_setting(edit: Edit, key: str, action: str, amount: float = 0.0):
         edit.wb_mode = "custom"
     if key == "angle":
         edit.level_mode = "Manual"
+    if key.startswith("sky_"):
+        edit.sky_on = True
+    elif key.startswith("subj_"):
+        edit.subj_on = True
 
 
 def as_shot_edit(dec: Decoded) -> Edit:
@@ -664,8 +711,145 @@ def apply_colour(g: np.ndarray, e: Edit) -> np.ndarray:
     return g
 
 
-def render(dec: Decoded, edit: Edit, original: bool = False, rotate: bool = True):
-    """Return (uint8 RGB image, Geometry). original=True shows the as-shot file."""
+# ---- approximate Sky / Subject masks for the PREVIEW only (Lightroom computes the real ones) ----
+
+def _small_view(dec: Decoded, long_edge: int = 320):
+    cam = dec.cam
+    H, W = cam.shape[:2]
+    k = long_edge / max(H, W)
+    small = cv2.resize(cam, (max(8, round(W * k)), max(8, round(H * k))), interpolation=cv2.INTER_AREA)
+    lin = _cam_to_linear_srgb(small, dec.color.as_shot_mul, dec.color) * dec.baseline
+    return np.clip(lin, 0, 4).astype(np.float32), (W, H)
+
+
+def _upscale_mask(m: np.ndarray, size, feather: float) -> np.ndarray:
+    m = cv2.GaussianBlur(m.astype(np.float32), (0, 0), feather)
+    return np.clip(cv2.resize(m, size, interpolation=cv2.INTER_LINEAR), 0, 1).astype(np.float32)
+
+
+def estimate_sky(dec: Decoded):
+    """(mask 0..1 at working size, fraction of frame, confidence 0..1). Cached on dec."""
+    if "sky" in dec.masks:
+        return dec.masks["sky"]
+    lin, size = _small_view(dec)
+    h, w = lin.shape[:2]
+    Y = lin @ LUMA
+    g = _srgb_encode(np.clip(Y, 0, 1))
+    gx = cv2.Sobel(g, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(g, cv2.CV_32F, 0, 1, ksize=3)
+    tex = cv2.GaussianBlur(np.hypot(gx, gy), (0, 0), 2.0)
+    r, gg, b = lin[..., 0], lin[..., 1], lin[..., 2]
+    blueish = (b > gg * 1.02) & (b > r * 1.05)
+    neutral = (np.abs(r - b) < 0.12 * (Y + 1e-3)) & (np.abs(gg - Y) < 0.15 * (Y + 1e-3))
+    top_ref = float(np.percentile(g[: max(2, h // 4)], 75))
+    bright = g > max(0.35, 0.55 * top_ref)
+    cand = (tex < 0.06) & bright & (blueish | neutral)
+    rows = np.linspace(1.0, 0.0, h, dtype=np.float32)[:, None]
+    cand &= rows > 0.15                                           # sky is (almost) never at the very bottom
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(cand.astype(np.uint8), 8)
+    keep = np.zeros_like(cand)
+    for i in range(1, n):
+        x, y, ww, hh, area = stats[i]
+        if y <= 1 and area > 0.01 * h * w:                       # touches the top edge
+            keep |= lab == i
+    if keep.any():
+        # clouds, birds, sun: holes completely surrounded by sky belong to the sky
+        holes = (~keep).astype(np.uint8)
+        nh, hl, hs, _ = cv2.connectedComponentsWithStats(holes, 8)
+        for i in range(1, nh):
+            x, y, ww, hh, area = hs[i]
+            if x > 0 and y > 0 and x + ww < w and y + hh < h:
+                keep |= hl == i
+        keep = cv2.erode(keep.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0    # pull back from the horizon
+    frac = float(keep.mean())
+    if frac < 0.03:
+        out = (np.zeros(dec.cam.shape[:2], np.float32), 0.0, 0.0)
+    else:
+        smooth = float(tex[keep].mean()) if keep.any() else 1.0
+        blue_share = float((blueish & keep).sum() / max(keep.sum(), 1))
+        conf = float(np.clip(min(1.0, frac / 0.12) * (1.0 - smooth / 0.06) * (0.6 + 0.4 * blue_share), 0, 1))
+        out = (_upscale_mask(keep, size, 0.8), frac, conf)
+    dec.masks["sky"] = out
+    return out
+
+
+def estimate_subject(dec: Decoded):
+    """(mask, fraction, confidence): the sharp, central region that stands out from its surroundings."""
+    if "subject" in dec.masks:
+        return dec.masks["subject"]
+    lin, size = _small_view(dec)
+    h, w = lin.shape[:2]
+    g = _srgb_encode(np.clip(lin @ LUMA, 0, 1))
+    lap = np.abs(cv2.Laplacian(cv2.GaussianBlur(g, (0, 0), 0.8), cv2.CV_32F))
+    focus = cv2.GaussianBlur(lap, (0, 0), max(h, w) / 40.0)
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    centre = np.exp(-(((xx - w / 2) / (0.42 * w)) ** 2 + ((yy - h * 0.55) / (0.45 * h)) ** 2))
+    sky_small = cv2.resize(estimate_sky(dec)[0], (w, h), interpolation=cv2.INTER_AREA)
+    # the horizon / skyline is a sharp edge too, but it isn't the subject
+    sky_bin = (sky_small > 0.5).astype(np.uint8)
+    band = cv2.dilate(sky_bin, np.ones((15, 15), np.uint8)) - cv2.erode(sky_bin, np.ones((3, 3), np.uint8))
+    lap = lap * (1 - band.astype(np.float32))
+    focus = cv2.GaussianBlur(lap, (0, 0), max(h, w) / 90.0)
+    score = focus / (np.percentile(focus, 98) + 1e-6) * (0.35 + 0.65 * centre) * (1 - sky_small)
+    thr = max(float(np.percentile(score, 88)), 0.35 * float(np.percentile(score, 99.5)))
+    m = (score > thr).astype(np.uint8)
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(m, 8)
+    if n <= 1:
+        out = (np.zeros(dec.cam.shape[:2], np.float32), 0.0, 0.0)
+    else:
+        best = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+        blob = lab == best
+        blob = cv2.morphologyEx(blob.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8)) > 0
+        frac = float(blob.mean())
+        inside = float(score[blob].mean())
+        outside = float(score[~blob].mean()) if (~blob).any() else 0.0
+        conf = float(np.clip((inside / (outside + 1e-6) - 1.5) / 3.0, 0, 1)) if 0.03 < frac < 0.7 else 0.0
+        out = (_upscale_mask(blob, size, 1.5), frac, conf)
+    dec.masks["subject"] = out
+    return out
+
+
+def _apply_local(g: np.ndarray, mask: np.ndarray, ev=0.0, contrast=0, highlights=0, shadows=0,
+                 dehaze=0, saturation=0, temp=0, texture=0, clarity=0) -> np.ndarray:
+    """Preview approximation of one Lightroom local adjustment, blended through `mask`."""
+    if mask is None or not mask.any():
+        return g
+    loc = g
+    ev_total = ev - 0.004 * dehaze
+    if ev_total:
+        loc = np.clip(loc * np.float32(2.0 ** (ev_total / 2.2)), 0, 1.5)
+    if contrast or highlights or shadows or dehaze:
+        e = Edit(contrast=int(contrast + 0.5 * dehaze), highlights=int(highlights), shadows=int(shadows))
+        loc = apply_tone(loc, e, None, 0.0)
+    if texture or clarity:
+        L = loc @ LUMA
+        for amt, sigma in ((texture, 1.5), (clarity, 6.0)):
+            if amt:
+                detail = L - cv2.GaussianBlur(L, (0, 0), sigma)
+                loc = loc + (0.8 * amt / 100.0) * detail[..., None]
+    sat = saturation + 0.3 * dehaze
+    if sat:
+        mean = loc.mean(axis=2, keepdims=True)
+        loc = mean + (loc - mean) * (1 + sat / 100.0)
+    if temp:
+        k = 0.12 * temp / 100.0
+        loc = loc * np.array([1 + k, 1.0, 1 - k], dtype=np.float32)
+    return g + mask[..., None] * (loc - g)
+
+
+def apply_masks(g: np.ndarray, dec: Decoded, e: Edit) -> np.ndarray:
+    if e.sky_on:
+        g = _apply_local(g, estimate_sky(dec)[0], e.sky_exposure, e.sky_contrast, e.sky_highlights, 0,
+                         e.sky_dehaze, e.sky_saturation, e.sky_temp)
+    if e.subj_on:
+        g = _apply_local(g, estimate_subject(dec)[0], e.subj_exposure, e.subj_contrast, 0, e.subj_shadows,
+                         0, e.subj_saturation, 0, e.subj_texture, e.subj_clarity)
+    return g
+
+
+def render(dec: Decoded, edit: Edit, original: bool = False, rotate: bool = True, show_masks: bool = False):
+    """Return (uint8 RGB image, Geometry). original=True shows the as-shot file.
+    show_masks tints the (approximate) Sky mask blue and the Subject mask orange."""
     color = dec.color
     if original or edit.wb_mode != "custom":
         mul = color.as_shot_mul
@@ -676,6 +860,13 @@ def render(dec: Decoded, edit: Edit, original: bool = False, rotate: bool = True
     e = Edit() if original else edit
     g = apply_tone(g, e, None, color.base_contrast)
     g = apply_colour(g, e)
+    if not original and (e.sky_on or e.subj_on):
+        g = apply_masks(g, dec, e)
+    if show_masks and not original:
+        for key, on, tint in (("sky", e.sky_on, (0.2, 0.6, 1.0)), ("subject", e.subj_on, (1.0, 0.55, 0.1))):
+            if on:
+                m = (estimate_sky(dec) if key == "sky" else estimate_subject(dec))[0][..., None] * 0.45
+                g = g * (1 - m) + np.array(tint, dtype=np.float32) * m
 
     img = (np.clip(g, 0, 1) * 255 + 0.5).astype(np.uint8)
     if rotate and not original:
@@ -1119,6 +1310,77 @@ def _remove(desc, key):
         desc.remove(child)
 
 
+def _mask_correction_values(edit: Edit, kind: str) -> dict:
+    """Local adjustment values in Lightroom's XMP units (sliders / 100, exposure in EV)."""
+    if kind == "sky":
+        v = {"LocalExposure2012": edit.sky_exposure / LOCAL_EXPOSURE_SCALE,
+             "LocalContrast2012": edit.sky_contrast / 100, "LocalHighlights2012": edit.sky_highlights / 100,
+             "LocalDehaze": edit.sky_dehaze / 100, "LocalSaturation": edit.sky_saturation / 100,
+             "LocalTemperature": edit.sky_temp / 100}
+    else:
+        v = {"LocalExposure2012": edit.subj_exposure / LOCAL_EXPOSURE_SCALE,
+             "LocalContrast2012": edit.subj_contrast / 100, "LocalShadows2012": edit.subj_shadows / 100,
+             "LocalTexture": edit.subj_texture / 100, "LocalClarity2012": edit.subj_clarity / 100,
+             "LocalSaturation": edit.subj_saturation / 100}
+    return {k: f"{val:.6f}" for k, val in v.items()}
+
+
+def _sync_id(raw_path: str, kind: str, part: str) -> str:
+    # Stable per photo + mask, so re-approving replaces the same mask instead of piling up new ones.
+    return uuid.uuid5(uuid.NAMESPACE_URL, f"rawreview:{os.path.basename(raw_path)}:{kind}:{part}").hex.upper()
+
+
+def _is_our_correction(li) -> bool:
+    for node in [li] + list(li):
+        name = node.get(_q("crs", "CorrectionName"))
+        if name is None:
+            el = node.find(_q("crs", "CorrectionName"))
+            name = el.text if el is not None else None
+        if (name or "").startswith("RAW Review:") or node.get(_q("rrv", "Mask")) is not None:
+            return True
+    return False
+
+
+def _write_masks(desc, edit: Edit, raw_path: str):
+    """
+    Replace only RAW Review's own Sky / Subject corrections inside crs:MaskGroupBasedCorrections.
+    Masks you made in Lightroom are kept as they are.
+    """
+    key = _q("crs", "MaskGroupBasedCorrections")
+    group = desc.find(key)
+    wanted = [k for k, on in (("sky", edit.sky_on), ("subject", edit.subj_on)) if on]
+    if group is None and not wanted:
+        return
+    if group is None:
+        group = ET.SubElement(desc, key)
+    seq = group.find(_q("rdf", "Seq"))
+    if seq is None:
+        seq = ET.SubElement(group, _q("rdf", "Seq"))
+    for li in list(seq):
+        if _is_our_correction(li):
+            seq.remove(li)
+    for kind in wanted:
+        li = ET.SubElement(seq, _q("rdf", "li"))
+        attrs = {_q("crs", "What"): "Correction", _q("crs", "CorrectionAmount"): "1.000000",
+                 _q("crs", "CorrectionActive"): "true", _q("crs", "CorrectionName"): MASK_NAME[kind],
+                 _q("crs", "CorrectionSyncID"): _sync_id(raw_path, kind, "correction"),
+                 _q("rrv", "Mask"): kind}
+        attrs.update({_q("crs", k): v for k, v in _mask_correction_values(edit, kind).items()})
+        d = ET.SubElement(li, _q("rdf", "Description"), attrs)
+        cm = ET.SubElement(d, _q("crs", "CorrectionMasks"))
+        s2 = ET.SubElement(cm, _q("rdf", "Seq"))
+        ET.SubElement(s2, _q("rdf", "li"), {
+            _q("crs", "What"): "Mask/Image", _q("crs", "MaskActive"): "true",
+            _q("crs", "MaskName"): ("Sky 1" if kind == "sky" else "Subject 1"),
+            _q("crs", "MaskBlendMode"): "0", _q("crs", "MaskInverted"): "false",
+            _q("crs", "MaskSyncID"): _sync_id(raw_path, kind, "mask"),
+            _q("crs", "MaskValue"): "1.000000", _q("crs", "MaskVersion"): "1",
+            _q("crs", "MaskSubType"): MASK_SUBTYPE[kind],
+            _q("crs", "ReferencePoint"): "0.500000 0.500000", _q("crs", "ErrorReason"): "0"})
+    if len(seq) == 0:
+        desc.remove(group)
+
+
 def _write_sidecar(raw_path: str, edit: Edit, src_size=(3, 2)) -> str:
     """
     Write/update the Lightroom sidecar for raw_path. The RAW itself is never
@@ -1171,6 +1433,7 @@ def _write_sidecar(raw_path: str, edit: Edit, src_size=(3, 2)) -> str:
         _set(desc, _q("crs", k), val)
     for k in remove:
         _remove(desc, _q("crs", k))
+    _write_masks(desc, edit, raw_path)
 
     marker = _q("rrv", "CropByRawReview")
     if abs(edit.angle) >= 0.01:

@@ -20,6 +20,8 @@ Space Station (public domain). A tungsten-light cast was simulated, then removed
 
 - **Edit many photos at once:** *Edits apply to → Selected / Checked photos* copies each slider change to them, either the exact value or as a relative nudge.
 - **Grid view** (`G`) to see the whole shoot at a glance.
+- **Automatic sky and subject masks**, written as Lightroom's own Select Sky / Select Subject (Lightroom computes the exact mask).
+- **Per-photo Undo / Redo** (`Ctrl+Z` / `Ctrl+Y`).
 - **Drag and drop** photos or whole folders (subfolders included).
 - **Smart auto white balance**
   - Looks for the surfaces most likely to be truly neutral: the brightest unclipped *near-whites* and the darkest *near-blacks*.
@@ -65,6 +67,7 @@ Other systems: `pip install -r requirements.txt`, then `python raw_review_app.py
 | `E` | Auto-enhance this photo (all ticked auto tools) |
 | `C` | Check / uncheck this photo |
 | `G` | Grid view on / off (double-click or `Enter` opens a photo; with several selected, `A` / `X` act on all of them) |
+| `Ctrl+Z` / `Ctrl+Y` | Undo / redo the last change to this photo (each photo has its own history) |
 | `Ctrl+C` / `Ctrl+V` | Copy settings / paste to the photos selected in the list |
 
 ## Getting the edits into Lightroom Classic
@@ -83,6 +86,8 @@ Nothing is installed until you click *Install & Restart*. The previous version i
 The updater only replaces the app's own files and never looks at your photos.
 
 ## Good to know
+
+- **Sky / subject masks:** Lightroom computes them itself. If it shows a warning on a mask, select the photos and use *Update AI Settings*. If a sky's exposure looks 4× too strong or weak in Lightroom, change `LOCAL_EXPOSURE_SCALE` at the top of `raw_review_core.py`.
 
 - The preview approximates Lightroom's rendering. What counts is the values written to the sidecar.
 - **Pixel DNGs:** the preview applies the DNG's local HDR tone map (`ProfileGainTableMap`) and lens shading, so it matches Google's own rendering. The tone map stays inside the DNG (only the XMP packet is ever rewritten), and Lightroom reads it from there. I could not test that in Lightroom itself. If a Pixel photo looks *darker in Lightroom than in the preview*, your Lightroom isn't applying the table: turn off *Auto options -> Camera profile -> Pixel local HDR tone map*, and the auto tools will brighten with Exposure and Shadows instead (a close approximation, not identical).

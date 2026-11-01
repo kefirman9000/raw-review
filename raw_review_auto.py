@@ -36,6 +36,7 @@ AUTO_GROUPS = [
     ("shhi", "Shadows & highlights"),
     ("contrast", "Contrast"),
     ("colour", "Colour (vibrance & saturation)"),
+    ("masks", "Sky & subject masks (Lightroom AI)"),
     ("sharpen", "Sharpening"),
     ("noise", "Noise reduction"),
 ]
@@ -294,6 +295,67 @@ def apply_level_mode(dec, edit, mode: str, allow_upright: bool = True):
 # Running the tools
 # --------------------------------------------------------------------------
 
+# --------------------------------------------------------------------------
+# Sky / subject masks (Lightroom computes the exact masks; we decide whether and how much)
+# --------------------------------------------------------------------------
+SKY_MIN_FRACTION = 0.08    # sky must cover at least this much of the frame
+SKY_MIN_CONFIDENCE = 0.45
+SUBJECT_MIN_CONFIDENCE = 0.6
+
+
+def _round_setting(key, val):
+    st = core.SETTINGS[key]
+    val = min(max(val, st.lo), st.hi)
+    return int(round(val)) if st.integer else round(val, st.decimals)
+
+
+def auto_masks(dec, edit, strength=1.0) -> str:
+    """Turn on a Select Sky / Select Subject adjustment when the photo has a sky / a clear subject."""
+    probe = edit.copy()
+    probe.sky_on = probe.subj_on = False
+    img, _ = core.render(dec, probe, rotate=False)
+    L = (img.astype(np.float32) / 255.0) @ LUMA
+    notes = []
+
+    sm, sf, sc = core.estimate_sky(dec)
+    if sf >= SKY_MIN_FRACTION and sc >= SKY_MIN_CONFIDENCE:
+        sel = sm > 0.5
+        sky_l = float(L[sel].mean())
+        p95 = float(np.percentile(L[sel], 95))
+        px = img[sel].astype(np.float32)
+        blue = float(((px[:, 2] > px[:, 1] + 6) & (px[:, 2] > px[:, 0] + 12)).mean())
+        edit.sky_on = True
+        edit.sky_exposure = _round_setting("sky_exposure", min(0.0, -(sky_l - 0.62) * 1.2) * strength)
+        edit.sky_highlights = _round_setting("sky_highlights", -min(45.0, max(0.0, (p95 - 0.82) * 220)) * strength)
+        edit.sky_dehaze = _round_setting("sky_dehaze", 10 * strength)
+        edit.sky_saturation = _round_setting("sky_saturation", (12 if blue > 0.4 else 0) * strength)
+        edit.sky_contrast = _round_setting("sky_contrast", (5 if blue > 0.4 else 15) * strength)  # grey skies need contrast
+        edit.sky_temp = 0
+        notes.append(f"sky {sf:.0%} of frame ({'blue' if blue > 0.4 else 'cloudy'})")
+    else:
+        edit.sky_on = False
+
+    mm, mf, mc = core.estimate_subject(dec)
+    if mc >= SUBJECT_MIN_CONFIDENCE and 0.03 < mf < 0.6:
+        sel = mm > 0.5
+        subj_l, rest_l = float(L[sel].mean()), float(L[~sel].mean())
+        edit.subj_on = True
+        edit.subj_exposure = _round_setting("subj_exposure", min(0.35, max(0.0, (rest_l - subj_l) * 0.9 + 0.05)) * strength)
+        edit.subj_shadows = _round_setting("subj_shadows", (12 if subj_l < 0.35 else 0) * strength)
+        edit.subj_texture = _round_setting("subj_texture", 10 * strength)
+        edit.subj_clarity = _round_setting("subj_clarity", 5 * strength)
+        edit.subj_contrast = 0
+        edit.subj_saturation = 0
+        notes.append("clear subject")
+    else:
+        edit.subj_on = False
+
+    if not notes:
+        return "Auto masks: no sky or clear subject found, none added"
+    return ("Auto masks: " + ", ".join(notes)
+            + " (Lightroom computes the exact masks; use Update AI Settings if it asks)")
+
+
 def run_auto(dec, edit, groups, opts: AutoOptions | None = None) -> dict:
     """Run the chosen auto groups (in the right order) on `edit`. Returns {"wb": .., "level": ..}."""
     opts = opts or AutoOptions()
@@ -321,6 +383,8 @@ def run_auto(dec, edit, groups, opts: AutoOptions | None = None) -> dict:
             replace_note(edit, "Auto contrast", auto_contrast(dec, edit, s))
         elif g == "colour":
             replace_note(edit, "Auto colour", auto_colour(dec, edit, s))
+        elif g == "masks":
+            replace_note(edit, "Auto masks", auto_masks(dec, edit, s))
         elif g == "sharpen":
             replace_note(edit, "Auto sharpening", auto_sharpen(dec, edit, s))
         elif g == "noise":

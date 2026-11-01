@@ -1,5 +1,24 @@
 # Changelog
 
+## v1.4.0
+
+- **Automatic sky and subject masks.** New *Sky & subject masks* panel with two switchable adjustments, written to
+  Lightroom as its own AI masks (**Select Sky** and **Select Subject**):
+  - Sky: exposure, contrast, highlights, dehaze, saturation, temperature.
+  - Subject: exposure, contrast, shadows, texture, clarity, saturation.
+  - **Auto** turns them on only when the photo has a real sky (at least 8% of the frame, touching the top edge) or a
+    clear subject, and picks gentle values: darker, deeper skies; a little lift and detail on the subject. Runs with
+    Auto-enhance and can be switched off in *Auto options*.
+  - Lightroom computes the exact mask itself (the same way it handles its own Adaptive presets), so the preview here
+    is an approximation. Tick *Show masks* to see it (sky blue, subject orange). If Lightroom shows a warning on the
+    mask, select the photos and use **Update AI Settings**.
+  - **Masks you made in Lightroom are kept.** Only masks named "RAW Review: Sky" / "RAW Review: Subject" are replaced.
+  - Works with *Edits apply to*, Copy / Paste and Batch edit.
+- **Per-photo Undo / Redo.** **Ctrl+Z** undoes the last change to the photo you're looking at, **Ctrl+Y** (or
+  Ctrl+Shift+Z) redoes it. Each photo keeps its own history (up to 100 steps). One slider drag is one step. Covers
+  sliders, auto tools, the eyedropper, resets, Paste, Batch edit and changes copied from another photo.
+  Undo changes the settings in the app; to update Lightroom, approve the photo again.
+
 ## v1.3.0
 
 - **Edit several photos at once.** New *Edits apply to* box at the top of the controls: *This photo*, *Selected photos*
