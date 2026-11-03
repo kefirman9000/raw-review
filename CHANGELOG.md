@@ -1,5 +1,16 @@
 # Changelog
 
+## v1.7.2
+
+- **Auto exposure centres the histogram:** photos were coming out about a stop dark, with most of the histogram on
+  the left in RAW Review and in Lightroom. Auto exposure now checks the finished photo (after Levels, Shadows &
+  highlights and Contrast) and sets Exposure so its median brightness sits in the middle of the histogram, holding
+  back only as far as needed to keep bright areas from blowing out. *Exposure bias* in My auto settings still
+  applies on top.
+- **Preview brightness matches Lightroom again:** v1.7.1's preview look also brightened the picture, which made
+  previews look brighter than the same settings do in Lightroom. The look now only adds colour (like Lightroom's
+  Adobe Color profile, a little gentler than before) and leaves brightness alone.
+
 ## v1.7.1
 
 - **Previews now look like Lightroom:** the on-screen preview of RAW files was about a stop darker and noticeably

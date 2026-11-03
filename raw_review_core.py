@@ -86,17 +86,13 @@ LEVEL_MODES = {
 # in the Auto menu (or change this one number).
 PREVIEW_BASE_EV = 0.5
 
-# Lightroom look for the ON-SCREEN preview of non-DNG raws. Lightroom's default
-# rendering (Adobe Color profile + its default tone curve) is about a stop brighter
-# in the midtones and noticeably more colourful than the plain colorimetric render
-# below. This curve (sRGB-encoded in -> out) and midtone saturation boost were fitted
-# against Lightroom exports of the same files. Display only: the auto tools still
-# measure the plain render they were tuned on, so the edits written to Lightroom
-# don't change. Set PREVIEW_LOOK = False to see the plain render.
+# Colour look for the ON-SCREEN preview of non-DNG raws. Lightroom's default profile
+# (Adobe Color) is more colourful than the plain colorimetric render below, so the preview
+# gets a gentle midtone saturation boost. Brightness is NOT changed: the plain render's
+# brightness is what Lightroom shows for the same settings, and auto exposure is tuned on it.
+# Display only; the auto tools measure the plain render. PREVIEW_LOOK = False turns it off.
 PREVIEW_LOOK = True
-LOOK_CURVE_X = (0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0)
-LOOK_CURVE_Y = (0.0, 0.134, 0.300, 0.456, 0.600, 0.730, 0.820, 0.888, 0.940, 0.975, 1.0)
-LOOK_SATURATION = 0.30          # extra saturation at mid grey, fading to 0 at black and white
+LOOK_SATURATION = 0.15          # extra saturation at mid grey, fading to 0 at black and white
 
 # Long edge of the working preview, in pixels.
 WORK_LONG_EDGE = 1400
@@ -726,66 +722,21 @@ def apply_colour(g: np.ndarray, e: Edit) -> np.ndarray:
     return g
 
 
-def _monotone_lut(xs, ys, n: int = 4096) -> np.ndarray:
-    """Smooth monotone curve through (xs, ys) (Fritsch-Carlson cubic), sampled as a LUT."""
-    x = np.asarray(xs, dtype=np.float64)
-    y = np.asarray(ys, dtype=np.float64)
-    h = np.diff(x)
-    d = np.diff(y) / h
-    m = np.empty_like(y)
-    m[0], m[-1] = d[0], d[-1]
-    m[1:-1] = np.where(d[:-1] * d[1:] > 0, (d[:-1] + d[1:]) / 2.0, 0.0)
-    for i in range(len(d)):                   # keep it monotone (no overshoot)
-        if d[i] == 0:
-            m[i] = m[i + 1] = 0.0
-            continue
-        a, b = m[i] / d[i], m[i + 1] / d[i]
-        s = a * a + b * b
-        if s > 9.0:
-            t = 3.0 / np.sqrt(s)
-            m[i], m[i + 1] = t * a * d[i], t * b * d[i]
-    t = np.linspace(0.0, 1.0, n)
-    i = np.clip(np.searchsorted(x, t, side="right") - 1, 0, len(h) - 1)
-    u = (t - x[i]) / h[i]
-    h00, h10 = 2 * u**3 - 3 * u**2 + 1, u**3 - 2 * u**2 + u
-    h01, h11 = -2 * u**3 + 3 * u**2, u**3 - u**2
-    out = h00 * y[i] + h10 * h[i] * m[i] + h01 * y[i + 1] + h11 * h[i] * m[i + 1]
-    return np.clip(out, 0.0, 1.0).astype(np.float32)
-
-
-_LOOK_LUT = _monotone_lut(LOOK_CURVE_X, LOOK_CURVE_Y)
-
-
 def apply_look(g: np.ndarray) -> np.ndarray:
     """
-    Lightroom-style default rendering for the on-screen preview (see PREVIEW_LOOK).
-    The curve is applied hue-preservingly, like the DNG SDK's RGB tone: the brightest
-    and darkest channel go through the curve and the middle one keeps its relative
-    place between them. Then a saturation boost that peaks in the midtones.
+    Adobe Color-like colour for the on-screen preview (see PREVIEW_LOOK): a saturation boost
+    that peaks in the midtones and fades out toward black and white. Luminance is kept, so
+    the preview's brightness and histogram match what Lightroom shows.
     """
     g = np.clip(g, 0.0, 1.0, dtype=np.float32)
-    n = np.float32(len(_LOOK_LUT) - 1)
-    r, gg, b = g[..., 0], g[..., 1], g[..., 2]
-    mx = np.maximum(np.maximum(r, gg), b)        # much faster than g.max(axis=2)
-    mn = np.minimum(np.minimum(r, gg), b)
-    mx2 = np.take(_LOOK_LUT, (mx * n + 0.5).astype(np.int32))
-    mn2 = np.take(_LOOK_LUT, (mn * n + 0.5).astype(np.int32))
-    span = mx - mn
-    # middle channel keeps its relative place between darkest and brightest (grey: scale 0)
-    scale = np.divide(mx2 - mn2, span, out=np.zeros_like(span), where=span > 1e-6)
-    out = g - mn[..., None]
-    out *= scale[..., None]
-    out += mn2[..., None]
-    L = out @ LUMA
+    L = g @ LUMA
     d = (L - np.float32(0.5)) * np.float32(2.0)
-    k = np.float32(1.0) + np.float32(LOOK_SATURATION) * np.maximum(np.float32(1.0) - d * d, np.float32(0.0))
-    out -= L[..., None]
-    out *= k[..., None]
+    k = np.float32(LOOK_SATURATION) * np.maximum(np.float32(1.0) - d * d, np.float32(0.0))
+    out = g - L[..., None]
+    out *= (np.float32(1.0) + k)[..., None]
     out += L[..., None]
     return np.clip(out, 0.0, 1.0, out=out)
 
-
-# ---- approximate Sky / Subject masks for the PREVIEW only (Lightroom computes the real ones) ----
 
 def _small_view(dec: Decoded, long_edge: int = 320):
     cam = dec.cam

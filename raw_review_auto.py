@@ -58,6 +58,10 @@ TARGET_SATURATION = 0.30   # target average saturation of coloured pixels
 SHARP_RATIO_CRISP = 2.8    # edge-acuity ratio of a crisp photo (see core.measure_quality)
 SHARP_RATIO_SOFT = 1.6     # ... and of a very soft one
 NOISE_FLOOR = 0.005        # luminance noise below this needs no reduction
+# Histogram centring (see center_exposure): after the tone tools have run, exposure is nudged
+# until the finished photo's median brightness sits in the middle of the histogram.
+TARGET_MEDIAN = 0.50       # median luminance of the finished photo (display units, 0..1)
+CENTER_MAX_CLIPPED = 0.02  # stop brightening once this share of the photo is blown to white
 # ---------------------------------------------------------------------------
 
 
@@ -424,6 +428,55 @@ def active_rules(rules) -> dict:
     return {k: r for k, r in (rules or {}).items() if r and r[0] not in ("auto",)}
 
 
+def _finished_luma(dec, edit) -> np.ndarray:
+    """Luminance of the photo with exposure and every tone slider applied (what the histogram shows)."""
+    return _stage(dec, edit, "final")[1]
+
+
+def center_exposure(dec, edit, strength=1.0, bias=0.0) -> str:
+    """
+    Put the finished photo's histogram in the middle. Auto exposure alone judges the raw
+    data before Levels / Shadows & highlights / Contrast and held back for bright spots,
+    so photos regularly came out with most of the histogram on the left. This measures
+    the photo with all tone sliders applied and moves Exposure until the median brightness
+    is TARGET_MEDIAN. The tone sliders are left as the tone tools set them (re-running them
+    would fight the change). Brightening stops before more than CENTER_MAX_CLIPPED of the
+    photo blows out to white.
+    """
+    def clipped(ev):
+        trial = edit.copy()
+        trial.exposure = ev
+        return float((_finished_luma(dec, trial) > 0.985).mean())
+
+    start = edit.exposure
+    held = False
+
+    def seek():
+        nonlocal held
+        for _ in range(8):
+            med = float(np.median(_finished_luma(dec, edit)))
+            err = math.log2(TARGET_MEDIAN / max(med, 1e-3))
+            if abs(err) < 0.03:
+                break
+            step = min(max(1.8 * err, -1.5), 1.5)    # display brightness ~ exposure^(1/2.2)
+            new = min(max(edit.exposure + step, -2.5), 3.5)
+            if step > 0 and clipped(new) > CENTER_MAX_CLIPPED:
+                lo, hi = edit.exposure, new           # largest brightening that keeps highlights
+                for _b in range(6):
+                    mid = (lo + hi) / 2
+                    lo, hi = (lo, mid) if clipped(mid) > CENTER_MAX_CLIPPED else (mid, hi)
+                new, held = lo, True
+            if abs(new - edit.exposure) < 0.02:
+                break
+            edit.exposure = new
+
+    seek()
+    ev = start + (edit.exposure - start) * strength + bias
+    edit.exposure = float(min(max(round(round(ev / 0.05) * 0.05, 2), -5.0), 5.0))
+    return (f"Auto exposure: {edit.exposure:+.2f} EV (histogram centred"
+            + (", held back to protect highlights)" if held else ")"))
+
+
 def run_auto(dec, edit, groups, opts: AutoOptions | None = None, user_rules: bool = False) -> dict:
     """Run the chosen auto groups (in the right order) on `edit`. Returns {"wb": .., "level": ..}.
     user_rules=True also applies "My auto settings" (new photos, Auto-enhance, re-apply)."""
@@ -432,7 +485,17 @@ def run_auto(dec, edit, groups, opts: AutoOptions | None = None, user_rules: boo
     s = opts.strength
     out = {}
     base = edit.copy()
-    for g in GROUP_ORDER:
+    centre_at = GROUP_ORDER.index("contrast")
+    centred = "exposure" not in groups
+
+    def centre():
+        replace_note(edit, "Auto exposure",
+                     center_exposure(dec, edit, s, opts.exposure_bias))
+
+    for i, g in enumerate(GROUP_ORDER):
+        if not centred and i > centre_at:            # tone tools done: centre the histogram
+            centre()
+            centred = True
         if g not in groups:
             continue
         if g == "wb":
@@ -444,7 +507,8 @@ def run_auto(dec, edit, groups, opts: AutoOptions | None = None, user_rules: boo
         elif g == "level":
             out["level"] = apply_level_mode(dec, edit, opts.level_mode, opts.allow_upright)
         elif g == "exposure":
-            replace_note(edit, "Auto exposure", auto_exposure(dec, edit, s, opts.exposure_bias))
+            # first estimate; center_exposure() refines it and adds the bias
+            replace_note(edit, "Auto exposure", auto_exposure(dec, edit, s, 0.0))
         elif g == "levels":
             replace_note(edit, "Auto levels", auto_levels(dec, edit, s))
         elif g == "shhi":
@@ -463,6 +527,8 @@ def run_auto(dec, edit, groups, opts: AutoOptions | None = None, user_rules: boo
             replace_note(edit, "Auto sharpening", auto_sharpen(dec, edit, s))
         elif g == "noise":
             replace_note(edit, "Auto noise", auto_noise(dec, edit, s))
+    if not centred:
+        centre()
     if user_rules:
         rules = active_rules(opts.rules)
         if rules:
