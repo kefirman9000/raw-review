@@ -286,7 +286,7 @@ def apply_level_mode(dec, edit, mode: str, allow_upright: bool = True):
         replace_note(edit, "Straighten",
                      f"Straighten: Lightroom Upright {spec['upright']} (Lightroom computes the correction)")
         return None
-    img, _ = core.render(dec, edit, rotate=False)
+    img, _ = core.render(dec, edit, rotate=False, look=False)
     st = core.auto_straighten(img, allow_upright, spec["source"])
     edit.angle, edit.upright = st.angle, st.upright
     if st.upright != "Off":                         # best guess chose Upright Vertical
@@ -317,7 +317,7 @@ def auto_masks(dec, edit, strength=1.0) -> str:
     """Turn on a Select Sky / Select Subject adjustment when the photo has a sky / a clear subject."""
     probe = edit.copy()
     probe.sky_on = probe.subj_on = False
-    img, _ = core.render(dec, probe, rotate=False)
+    img, _ = core.render(dec, probe, rotate=False, look=False)
     L = (img.astype(np.float32) / 255.0) @ LUMA
     notes = []
 

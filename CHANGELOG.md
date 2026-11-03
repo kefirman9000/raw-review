@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.7.1
+
+- **Previews now look like Lightroom:** the on-screen preview of RAW files was about a stop darker and noticeably
+  less colourful than the same photo in Lightroom. It now applies a Lightroom-style default look (brighter midtones,
+  richer colour), fitted against Lightroom exports of the same files. This only changes what you see: the auto edits
+  and the settings written to Lightroom are exactly the same as before. DNGs keep using their own embedded profile.
+
 ## v1.7.0
 
 - **Windows program, no Python needed:** each release now includes `RAW_Review-Windows-v….zip`. Unzip it and run
