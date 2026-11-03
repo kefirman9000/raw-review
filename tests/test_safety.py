@@ -152,3 +152,13 @@ def test_undo_never_targets_the_raw(raw, tmp_path):
     snap["target"] = raw
     with pytest.raises(core.RawSafetyError):
         core.restore_output(raw, snap, None)
+
+
+def test_tone_curve_lights_round_trips_only_when_set(raw):
+    core.write_xmp(raw, edit())
+    assert "ParametricLights" not in open(core.sidecar_path(raw)).read()   # user's own curve untouched
+    e = edit()
+    e.lights = 12
+    e.touched.add("lights")
+    core.write_xmp(raw, e)
+    assert core.read_existing(raw, core.Edit())["edit"].lights == 12

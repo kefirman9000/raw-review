@@ -481,6 +481,7 @@ class Edit:
     vibrance: int = 0
     whites: int = 0              # -100..100  (white point)
     blacks: int = 0              # -100..100  (black point)
+    lights: int = 0              # -100..100  tone curve, Lights region (crs:ParametricLights)
     saturation: int = 0
     sharp_amount: int = 40       # 0..150
     sharp_radius: float = 1.0    # 0.5..3.0
@@ -545,6 +546,7 @@ SETTINGS = {s.key: s for s in [
     Setting("shadows", "Shadows", -100, 100, 1, 0, 0),
     Setting("whites", "Whites", -100, 100, 1, 0, 0, True, True),
     Setting("blacks", "Blacks", -100, 100, 1, 0, 0, True, True),
+    Setting("lights", "Tone curve: Lights", -100, 100, 1, 0, 0, True, True),
     Setting("vibrance", "Vibrance", -100, 100, 1, 0, 0),
     Setting("saturation", "Saturation", -100, 100, 1, 0, 0, True, True),
     Setting("sharp_amount", "Amount", 0, 150, 1, 0, 40, True, True),
@@ -674,15 +676,38 @@ def _srgb_encode(x):
                     1.055 * np.power(np.maximum(x, 0.0031308), 1 / 2.4) - 0.055)
 
 
-def base_gamma(cam: np.ndarray, color: CameraColor, mul, exposure: float) -> np.ndarray:
-    """White balance + exposure + highlight shoulder + sRGB curve (no tone sliders)."""
+# Highlights slider (negative = recover), modelled like Lightroom's: only tones above
+# RECOVER_FROM (linear, ~0.63 on screen) move, and at -100 up to RECOVER_STOPS stops of
+# highlight detail above white are brought back under white. Midtones are left alone.
+RECOVER_FROM = 0.35
+RECOVER_STOPS = 2.0
+
+
+def recover_highlights(lin: np.ndarray, highlights: float) -> np.ndarray:
+    """Compress linear tones above RECOVER_FROM so that 2^(RECOVER_STOPS*amount) lands at white."""
+    amount = min(max(-float(highlights) / 100.0, 0.0), 1.0)
+    if amount <= 0.0:
+        return lin
+    t = np.float32(RECOVER_FROM)
+    W = np.float32(2.0 ** (RECOVER_STOPS * amount))
+    c = (1 - t) * (W - t) / (W - 1)                  # so that f(W) == 1 exactly
+    Y = np.maximum(lin @ LUMA, np.float32(1e-6))
+    over = np.maximum(Y - t, 0)
+    fY = np.where(Y > t, t + over / (1 + over / c), Y)
+    return lin * (fY / Y)[..., None]
+
+
+def base_gamma(cam: np.ndarray, color: CameraColor, mul, exposure: float,
+               highlights: float = 0.0) -> np.ndarray:
+    """White balance + exposure + highlight recovery + shoulder + sRGB curve (no other tone sliders)."""
     model = color.model
     if model is not None:
         # DNG with its own profile: colour matrices + hue/sat map + look + tone curve
-        lin = model.render_linear(cam, mul, exposure, color.base_ev)
+        lin = recover_highlights(model.render_linear(cam, mul, exposure, color.base_ev), highlights)
     else:
         lin = _cam_to_linear_srgb(cam, mul, color)
         lin *= np.float32(2.0 ** (exposure + PREVIEW_BASE_EV))
+        lin = recover_highlights(lin, highlights)
         knee = 0.8                                   # soft highlight shoulder
         lin = np.where(lin < knee, lin, knee + (1 - knee) * np.tanh((lin - knee) / (1 - knee)))
     return _srgb_encode(lin).astype(np.float32)
@@ -703,11 +728,15 @@ def apply_tone(g: np.ndarray, e: Edit, stop: str | None = None, base_c: float = 
     if stop != "levels":
         ms = 6.75 * L1 * (1 - L1) ** 2           # shadow mask, peaks at L=1/3
         mh = 6.75 * L1 ** 2 * (1 - L1)           # highlight mask, peaks at L=2/3
-        L1 = np.clip(L1 + 0.25 * (e.shadows / 100.0 * ms + e.highlights / 100.0 * mh), 0, 1)
+        # negative Highlights is applied before this, in base_gamma (recover_highlights)
+        L1 = np.clip(L1 + 0.25 * (e.shadows / 100.0 * ms + max(e.highlights, 0) / 100.0 * mh), 0, 1)
         if stop != "shhi":
             c = base_c + e.contrast / 100.0      # small base S-curve, like a raw default
             S = L1 * L1 * (3 - 2 * L1)
             L1 = np.clip(L1 + c * (S - L1), 0, 1)
+            if e.lights:                         # tone curve Lights: bump on 0.25..1, peak ~0.62
+                bump = np.sin(np.pi * np.clip((L1 - 0.25) / 0.75, 0, 1))
+                L1 = np.clip(L1 + 0.12 * e.lights / 100.0 * bump, 0, 1)
     return g * (L1 / L)[..., None]
 
 
@@ -884,7 +913,8 @@ def render(dec: Decoded, edit: Edit, original: bool = False, rotate: bool = True
     else:
         mul = color.temp_tint_to_mul(edit.temp, edit.tint)
 
-    g = base_gamma(dec.cam, color, mul, 0.0 if original else edit.exposure)
+    g = base_gamma(dec.cam, color, mul, 0.0 if original else edit.exposure,
+                   0.0 if original else edit.highlights)
     e = Edit() if original else edit
     g = apply_tone(g, e, None, color.base_contrast)
     g = apply_colour(g, e)
@@ -1269,6 +1299,8 @@ def crs_values(edit: Edit):
         v["Whites2012"] = f"{int(round(edit.whites)):+d}"
     if "blacks" in t:
         v["Blacks2012"] = f"{int(round(edit.blacks)):+d}"
+    if "lights" in t:
+        v["ParametricLights"] = f"{int(round(edit.lights)):+d}"
     if "saturation" in t:
         v["Saturation"] = f"{int(round(edit.saturation)):+d}"
     if t & {"sharp_amount", "sharp_radius", "sharp_detail", "sharp_masking"}:
@@ -1755,7 +1787,7 @@ def read_existing(raw_path: str, base: Edit):
 
     simple = {"exposure": "Exposure2012", "contrast": "Contrast2012", "highlights": "Highlights2012",
               "shadows": "Shadows2012", "vibrance": "Vibrance", "whites": "Whites2012", "blacks": "Blacks2012",
-              "saturation": "Saturation", "sharp_amount": "Sharpness", "sharp_radius": "SharpenRadius",
+              "lights": "ParametricLights", "saturation": "Saturation", "sharp_amount": "Sharpness", "sharp_radius": "SharpenRadius",
               "sharp_detail": "SharpenDetail", "sharp_masking": "SharpenEdgeMasking",
               "nr_luma": "LuminanceSmoothing", "nr_luma_detail": "LuminanceNoiseReductionDetail",
               "nr_color": "ColorNoiseReduction"}

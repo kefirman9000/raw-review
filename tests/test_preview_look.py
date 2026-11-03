@@ -73,3 +73,37 @@ def test_exposure_bias_still_applies_after_centring():
     auto.run_auto(dec, plain, ["exposure"])
     auto.run_auto(dec, biased, ["exposure"], auto.AutoOptions(exposure_bias=0.5))
     assert abs((biased.exposure - plain.exposure) - 0.5) < 0.06
+
+
+def test_highlight_recovery_keeps_midtones_and_brings_back_whites():
+    lin = np.array([[[0.18, 0.18, 0.18], [3.0, 3.0, 3.0]]], np.float32)
+    out = core.recover_highlights(lin, -100)
+    assert np.allclose(out[0, 0], 0.18)                 # midtones untouched
+    assert out[0, 1, 0] < 1.0                           # 1.6 stops over white is back under it
+    assert np.array_equal(core.recover_highlights(lin, 0), lin)
+
+
+def test_lights_tone_curve_lifts_upper_midtones_only():
+    g = np.array([[[0.1] * 3, [0.62] * 3]], np.float32)
+    e = core.Edit()
+    e.lights = 50
+    base = core.apply_tone(g, core.Edit(), None, 0.0)
+    out = core.apply_tone(g, e, None, 0.0)
+    assert abs(out[0, 0, 0] - base[0, 0, 0]) < 1e-6   # shadows untouched
+    assert out[0, 1, 0] > base[0, 1, 0] + 0.03          # lights lifted
+
+
+def _bright_spot_scene():
+    dec = _dark_scene()
+    dec.cam[:30, :60] = 0.15                            # a big bright area (white shelf) ~2 stops over
+    return dec
+
+
+def test_centring_crushes_highlights_instead_of_staying_dark():
+    dec = _bright_spot_scene()
+    e = core.as_shot_edit(dec)
+    auto.run_auto(dec, e, ["exposure", "levels", "shhi", "contrast"])
+    L = auto._finished_luma(dec, e)
+    assert abs(float(np.median(L)) - auto.TARGET_MEDIAN) < 0.05
+    assert e.highlights < 0
+    assert float((L > 0.985).mean()) <= auto.CENTER_MAX_CLIPPED + 0.01

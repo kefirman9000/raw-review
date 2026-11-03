@@ -61,7 +61,7 @@ NOISE_FLOOR = 0.005        # luminance noise below this needs no reduction
 # Histogram centring (see center_exposure): after the tone tools have run, exposure is nudged
 # until the finished photo's median brightness sits in the middle of the histogram.
 TARGET_MEDIAN = 0.50       # median luminance of the finished photo (display units, 0..1)
-CENTER_MAX_CLIPPED = 0.02  # stop brightening once this share of the photo is blown to white
+CENTER_MAX_CLIPPED = 0.005 # Highlights is pulled down until no more than this share is blown
 # ---------------------------------------------------------------------------
 
 
@@ -104,7 +104,8 @@ def _stage(dec: core.Decoded, edit: core.Edit, stage: str):
     "base" = WB + exposure only, "levels", "shhi", or "final" = all tone
     sliders (colour sliders are never included).
     """
-    g = core.base_gamma(_small(dec), dec.color, _mul(dec, edit), edit.exposure)
+    hl = edit.highlights if stage in ("shhi", "final") else 0.0   # recovery is part of Highlights
+    g = core.base_gamma(_small(dec), dec.color, _mul(dec, edit), edit.exposure, hl)
     if stage != "base":
         g = core.apply_tone(g, edit, None if stage == "final" else stage, dec.color.base_contrast)
     return g, g @ LUMA
@@ -435,24 +436,19 @@ def _finished_luma(dec, edit) -> np.ndarray:
 
 def center_exposure(dec, edit, strength=1.0, bias=0.0) -> str:
     """
-    Put the finished photo's histogram in the middle. Auto exposure alone judges the raw
-    data before Levels / Shadows & highlights / Contrast and held back for bright spots,
-    so photos regularly came out with most of the histogram on the left. This measures
-    the photo with all tone sliders applied and moves Exposure until the median brightness
-    is TARGET_MEDIAN. The tone sliders are left as the tone tools set them (re-running them
-    would fight the change). Brightening stops before more than CENTER_MAX_CLIPPED of the
-    photo blows out to white.
+    Put the finished photo's histogram in the middle, the way you'd do it by hand:
+    expose for the midtones, then crush Highlights as far as needed to bring the bright
+    areas back under white, and lift the tone curve's Lights a little when Highlights had
+    to go hard, so the upper midtones don't go flat. Auto exposure alone judged the raw
+    data before the tone tools and held back for bright spots, so photos came out dark.
+    Tone tools are not re-run here (they would fight the change).
     """
-    def clipped(ev):
-        trial = edit.copy()
-        trial.exposure = ev
-        return float((_finished_luma(dec, trial) > 0.985).mean())
+    s_exp, s_hl, s_lights = edit.exposure, edit.highlights, edit.lights
 
-    start = edit.exposure
-    held = False
+    def clipped(e):
+        return float((_finished_luma(dec, e) > 0.985).mean())
 
     def seek():
-        nonlocal held
         for _ in range(8):
             med = float(np.median(_finished_luma(dec, edit)))
             err = math.log2(TARGET_MEDIAN / max(med, 1e-3))
@@ -460,21 +456,46 @@ def center_exposure(dec, edit, strength=1.0, bias=0.0) -> str:
                 break
             step = min(max(1.8 * err, -1.5), 1.5)    # display brightness ~ exposure^(1/2.2)
             new = min(max(edit.exposure + step, -2.5), 3.5)
-            if step > 0 and clipped(new) > CENTER_MAX_CLIPPED:
-                lo, hi = edit.exposure, new           # largest brightening that keeps highlights
-                for _b in range(6):
-                    mid = (lo + hi) / 2
-                    lo, hi = (lo, mid) if clipped(mid) > CENTER_MAX_CLIPPED else (mid, hi)
-                new, held = lo, True
             if abs(new - edit.exposure) < 0.02:
                 break
             edit.exposure = new
 
+    def recover():
+        """Least-negative Highlights that keeps no more than CENTER_MAX_CLIPPED blown."""
+        if clipped(edit) <= CENTER_MAX_CLIPPED:
+            return
+        trial = edit.copy()
+        trial.highlights = -100
+        if clipped(trial) > CENTER_MAX_CLIPPED:      # truly blown (lights, sun): crush fully
+            edit.highlights = -100
+            return
+        lo, hi = -100, min(edit.highlights, 0)
+        for _ in range(7):
+            trial.highlights = (lo + hi) / 2
+            lo, hi = (trial.highlights, hi) if clipped(trial) <= CENTER_MAX_CLIPPED else (lo, trial.highlights)
+        edit.highlights = int(math.floor(lo))
+
+    for _ in range(3):
+        seek()
+        recover()
+        crush = max(-edit.highlights, 0)                # how hard Highlights is pulled down
+        if crush > 30:
+            edit.lights = int(min(round((crush - 30) * 0.5), 35))
     seek()
-    ev = start + (edit.exposure - start) * strength + bias
+
+    def blend(v0, v1):
+        return v0 + (v1 - v0) * strength
+    ev = blend(s_exp, edit.exposure) + bias
     edit.exposure = float(min(max(round(round(ev / 0.05) * 0.05, 2), -5.0), 5.0))
-    return (f"Auto exposure: {edit.exposure:+.2f} EV (histogram centred"
-            + (", held back to protect highlights)" if held else ")"))
+    _set(edit, "highlights", blend(s_hl, edit.highlights))
+    if edit.lights != s_lights:
+        _set(edit, "lights", blend(s_lights, edit.lights))
+    note = f"Auto exposure: {edit.exposure:+.2f} EV (histogram centred"
+    if edit.highlights < 0:
+        note += f"; highlights {edit.highlights:+d} to recover bright areas"
+    if edit.lights != s_lights:
+        note += f", tone curve lights {edit.lights:+d}"
+    return note + ")"
 
 
 def run_auto(dec, edit, groups, opts: AutoOptions | None = None, user_rules: bool = False) -> dict:

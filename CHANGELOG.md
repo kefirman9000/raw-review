@@ -1,5 +1,18 @@
 # Changelog
 
+## v1.7.3
+
+- **Exposes for the middle, crushes highlights instead of staying dark:** v1.7.2 held exposure back whenever bright
+  areas would blow out, so shots with white shelves, signs or windows still came out dark. Auto exposure now always
+  puts the histogram's middle in the middle, then pulls **Highlights** down as far as needed to bring the bright
+  areas back, and when Highlights has to go hard, lifts the tone curve's **Lights** a little so the upper midtones
+  don't go flat.
+- **New slider: Tone curve: Lights** (Tone panel), written to Lightroom's parametric tone curve
+  (`crs:ParametricLights`). Like Whites/Blacks it's only written once it's set, so your own Lightroom curves are
+  left alone. Also available as a rule in My auto settings.
+- **Highlights in the preview now behaves like Lightroom's:** pulling Highlights down recovers the brightest areas
+  (up to about two stops over white) and leaves the midtones alone. Before, it mostly darkened the midtones.
+
 ## v1.7.2
 
 - **Auto exposure centres the histogram:** photos were coming out about a stop dark, with most of the histogram on

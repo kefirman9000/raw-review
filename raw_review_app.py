@@ -436,7 +436,7 @@ class MyAutoDialog(QtWidgets.QDialog):
     FLAG_LABELS = ["Auto", "Always on", "Never"]
     SECTIONS = [
         ("White balance", ["temp", "tint"]),
-        ("Tone", ["exposure", "contrast", "highlights", "shadows", "whites", "blacks"]),
+        ("Tone", ["exposure", "contrast", "highlights", "shadows", "whites", "blacks", "lights"]),
         ("Colour", ["vibrance", "saturation"]),
         ("Sharpening", ["sharp_amount", "sharp_radius", "sharp_detail", "sharp_masking"]),
         ("Noise reduction", ["nr_luma", "nr_luma_detail", "nr_color"]),
@@ -1238,7 +1238,7 @@ class MainWindow(QtWidgets.QMainWindow):
         pl.addWidget(g_wb)
 
         tl = group("Tone", ["exposure", "levels", "shhi", "contrast"])
-        for k in ("exposure", "contrast", "highlights", "shadows", "whites", "blacks"):
+        for k in ("exposure", "contrast", "highlights", "shadows", "whites", "blacks", "lights"):
             tl.addWidget(self._slider(k))
         cl2 = group("Colour", ["colour"])
         for k in ("vibrance", "saturation"):
