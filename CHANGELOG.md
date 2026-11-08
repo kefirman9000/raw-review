@@ -1,5 +1,16 @@
 # Changelog
 
+## v1.8.0
+
+- **New option: auto crop to centre the subject.** Turn on *Auto options ▾ → Auto crop to centre the subject
+  (planes, cars…)*. RAW Review finds the main subject (a plane against the sky, a car against a blurred background)
+  and crops just enough to put it in the middle of the frame: same aspect ratio, never cutting into the subject,
+  and never trimming more than 40% of the width or height. If that limit stops it from centring fully, it gets the
+  subject as close to the centre as it can. Subjects already near the centre are left uncropped. Off by default.
+- **Per-photo toggle:** *Geometry → Crop to centre the subject* adds or removes the crop on the current photo,
+  whatever the option is set to. The preview shows the crop, and it's written to Lightroom as a normal crop
+  (on top of any straighten angle), so you can still adjust it there. Pasting settings keeps each photo's own crop.
+
 ## v1.7.3
 
 - **Exposes for the middle, crushes highlights instead of staying dark:** v1.7.2 held exposure back whenever bright

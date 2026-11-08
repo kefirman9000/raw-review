@@ -922,6 +922,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.act_upright.setCheckable(True)
         self.act_upright.setChecked(self.opts.allow_upright)
         self.act_upright.toggled.connect(self._opts_changed)
+        self.act_subject_crop = menu.addAction("Auto crop to centre the subject (planes, cars…)")
+        self.act_subject_crop.setCheckable(True)
+        self.act_subject_crop.setChecked(self.opts.subject_crop)
+        self.act_subject_crop.setToolTip("Finds the main subject and crops just enough (same aspect ratio, at most\n"
+                                         "40% off each side) to put it in the centre. Off by default.\n"
+                                         "Runs on new photos, Auto-enhance and straighten re-runs.")
+        self.act_subject_crop.toggled.connect(lambda on: setattr(self.opts, "subject_crop", bool(on)))
         menu.addSeparator()
         menu.addAction("My auto settings… (brightness, strength, your rules)", self.open_my_auto)
         menu.addSeparator()
@@ -1297,6 +1304,10 @@ class MainWindow(QtWidgets.QMainWindow):
         gl.addLayout(row2)
         self.chk_lens = QtWidgets.QCheckBox("Lens profile corrections + remove CA")
         gl.addWidget(self.chk_lens)
+        self.chk_subject_crop = QtWidgets.QCheckBox("Crop to centre the subject")
+        self.chk_subject_crop.setToolTip("Minimal crop (same aspect ratio) that puts the main subject - a plane,\n"
+                                         "a car - in the middle of the frame. Untick to remove the crop.")
+        gl.addWidget(self.chk_subject_crop)
 
         g_misc = QtWidgets.QGroupBox("This photo")
         ml = QtWidgets.QGridLayout(g_misc)
@@ -1362,6 +1373,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.level_combo.activated.connect(lambda _i: self.do_level(self.level_combo.currentText()))
         self.btn_level.clicked.connect(lambda: self.do_level(self.level_combo.currentText()))
         self.chk_lens.toggled.connect(self.on_control)
+        self.chk_subject_crop.toggled.connect(self.on_subject_crop)
         self.box_sky.toggled.connect(self.on_control)
         self.box_subj.toggled.connect(self.on_control)
         self.btn_auto_wb.clicked.connect(self.do_auto_wb)
@@ -1402,7 +1414,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _set_controls_enabled(self, on):
         widgets = [self.wb_combo, self.btn_auto_wb, self.btn_eyedrop, self.level_combo, self.btn_level,
-                   self.chk_lens, self.btn_enhance, self.btn_reset_auto, self.btn_reset_shot,
+                   self.chk_lens, self.chk_subject_crop, self.btn_enhance, self.btn_reset_auto, self.btn_reset_shot,
                    self.btn_copy, self.btn_paste, self.btn_approve, self.btn_reject]
         mask_keys = set(core.MASK_KEYS["sky"]) | set(core.MASK_KEYS["subject"])
         widgets += [w for k, w in self.sliders.items() if k not in mask_keys]
@@ -1975,6 +1987,7 @@ class MainWindow(QtWidgets.QMainWindow):
             s.setValue(getattr(e, key))
         self.level_combo.setCurrentText(e.level_mode if e.level_mode in core.LEVEL_MODES else "Manual")
         self.chk_lens.setChecked(e.lens_profile)
+        self.chk_subject_crop.setChecked(bool(e.crop_box))
         self.box_sky.setChecked(e.sky_on)
         self.box_subj.setChecked(e.subj_on)
         self._loading_controls = False
@@ -2059,7 +2072,7 @@ class MainWindow(QtWidgets.QMainWindow):
                                      show_masks=self.chk_masks.isChecked() and not before)
         if split:
             orig, _g = core.render(dec, it.edit, original=True, rotate=False)
-            orig, _g = core.rotate_and_crop(orig, it.edit.angle)
+            orig, _g = core.rotate_and_crop(orig, it.edit.angle, it.edit.crop_box)
             if orig.shape != img.shape:
                 import cv2
                 orig = cv2.resize(orig, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_AREA)
@@ -2139,6 +2152,24 @@ class MainWindow(QtWidgets.QMainWindow):
         self.load_controls()
         self.refresh_view()
 
+    def on_subject_crop(self, on):
+        if self._loading_controls:
+            return
+        it, dec = self._current_dec()
+        if dec is None:
+            return
+        self._record_undo(it, it.edit.copy())
+        if on:
+            note = auto.apply_subject_crop(dec, it.edit)
+            if not it.edit.crop_box:
+                self.statusBar().showMessage(note, 6000)
+        else:
+            it.edit.crop_box = None
+            auto.replace_note(it.edit, "Subject crop", "Subject crop: off")
+        self._mark_changed(it)
+        self.load_controls()
+        self.refresh_view()
+
     @staticmethod
     def _replace_note(edit, prefix, note):
         auto.replace_note(edit, prefix, note)
@@ -2202,7 +2233,9 @@ class MainWindow(QtWidgets.QMainWindow):
             if it.edit is None:
                 continue
             self._record_undo(it, it.edit.copy())
+            own_crop = it.edit.crop_box              # a subject crop belongs to its own photo
             it.edit = self.clip_edit.copy()
+            it.edit.crop_box = own_crop
             it.edit.notes = ["Pasted settings"]
             self._mark_changed(it)
             self._queue_thumb(it)
@@ -2435,7 +2468,7 @@ class MainWindow(QtWidgets.QMainWindow):
         groups = [g for g in auto.GROUP_ORDER if g in o.groups]
         spec = auto.BatchSpec(scope="all", groups=groups, level_mode=o.level_mode, allow_upright=o.allow_upright,
                               strength=o.strength, exposure_bias=o.exposure_bias, punch=o.punch, colour=o.colour,
-                              rules=dict(o.rules), user_rules=True)
+                              rules=dict(o.rules), user_rules=True, subject_crop=o.subject_crop)
         self._run_batch_on(items, spec)
 
     # ---------------- view menu / help ----------------
@@ -2603,7 +2636,7 @@ class MainWindow(QtWidgets.QMainWindow):
             known = set(o.get("known_groups", auto.GROUP_ORDER))
             self.opts.groups |= {g for g in auto.GROUP_ORDER if g not in known}   # tools added in an update: on
         for k in ("level_mode", "allow_upright", "strength", "exposure_bias", "use_existing", "punch", "colour",
-                  "rules"):
+                  "rules", "subject_crop"):
             if k in o:
                 setattr(self.opts, k, o[k])
         if self.opts.level_mode not in core.LEVEL_MODES:
@@ -2638,7 +2671,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "version": __version__,
             "auto": {"groups": sorted(o.groups), "known_groups": list(auto.GROUP_ORDER), "level_mode": o.level_mode, "allow_upright": o.allow_upright,
                      "strength": o.strength, "exposure_bias": o.exposure_bias, "use_existing": o.use_existing,
-                     "punch": o.punch, "colour": o.colour, "rules": o.rules},
+                     "punch": o.punch, "colour": o.colour, "rules": o.rules, "subject_crop": o.subject_crop},
             "dng_profile": {k: getattr(dng_profile.OPTIONS, k) for k in dng_profile.OPTIONS.__dataclass_fields__},
             "geometry": base64.b64encode(bytes(self.saveGeometry())).decode("ascii"),
             "splitter": self.split.sizes(),

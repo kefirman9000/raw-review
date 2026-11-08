@@ -76,6 +76,7 @@ class AutoOptions:
     punch: float = 0.0               # -50..50  "My auto settings": more / less contrast than auto picks
     colour: float = 0.0              # -50..50  more / less colour (vibrance) than auto picks
     rules: dict = field(default_factory=dict)   # {setting: [mode, value]}  see apply_rules()
+    subject_crop: bool = False       # crop slightly so the main subject (plane, car...) is centred
 
 
 # --------------------------------------------------------------------------
@@ -298,6 +299,26 @@ def apply_level_mode(dec, edit, mode: str, allow_upright: bool = True):
         edit.level_mode = "Upright: " + st.upright
     replace_note(edit, "Straighten", st.note)
     return st
+
+
+def apply_subject_crop(dec, edit) -> str:
+    """Minimal same-aspect crop that centres the main subject. Sets edit.crop_box (or clears it)."""
+    plain = edit.copy()
+    plain.crop_box = None
+    img, _ = core.render(dec, plain, look=False)              # straightened, not yet subject-cropped
+    subj, conf = core.find_subject_box(img)
+    edit.crop_box = None
+    if subj is None or conf < core.SUBJECT_CROP_MIN_CONF:
+        note = "Subject crop: no clear subject found, not cropped"
+    else:
+        box = core.subject_crop_box(subj)
+        if box is None:
+            note = "Subject crop: subject already centred (or fills the frame), not cropped"
+        else:
+            edit.crop_box = box
+            note = f"Subject crop: kept {100 * (box[2] - box[0]):.0f}% of the frame to centre the subject"
+    replace_note(edit, "Subject crop", note)
+    return note
 
 
 # --------------------------------------------------------------------------
@@ -550,6 +571,10 @@ def run_auto(dec, edit, groups, opts: AutoOptions | None = None, user_rules: boo
             replace_note(edit, "Auto noise", auto_noise(dec, edit, s))
     if not centred:
         centre()
+    # Subject crop runs with full proposals (new photos, Auto-enhance) and whenever straightening is
+    # re-run, because it is measured on the straightened frame.
+    if opts.subject_crop and (user_rules or "level" in groups):
+        out["crop"] = apply_subject_crop(dec, edit)
     if user_rules:
         rules = active_rules(opts.rules)
         if rules:
@@ -584,6 +609,7 @@ class BatchSpec:
     colour: float = 0.0
     rules: dict = field(default_factory=dict)
     user_rules: bool = False                     # also apply "My auto settings"
+    subject_crop: bool = False
 
     @property
     def needs_decode(self) -> bool:
@@ -598,7 +624,7 @@ def apply_batch(dec, edit, spec: BatchSpec) -> dict:
                        AutoOptions(groups=set(spec.groups), level_mode=spec.level_mode,
                                    allow_upright=spec.allow_upright, strength=spec.strength,
                                    exposure_bias=spec.exposure_bias, punch=spec.punch, colour=spec.colour,
-                                   rules=spec.rules),
+                                   rules=spec.rules, subject_crop=spec.subject_crop),
                        user_rules=spec.user_rules)
     apply_changes(edit, spec.changes)
     return out

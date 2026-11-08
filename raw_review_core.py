@@ -512,6 +512,9 @@ class Edit:
     # Set when the settings were read from an existing Lightroom edit that has its own crop:
     # as long as the angle isn't changed here, that crop is left exactly as it was.
     lr_crop_angle: float | None = None
+    # Subject crop: [left, top, right, bottom] as 0..1 fractions of the straightened frame, or None.
+    # Same aspect ratio as the photo; set by the "center the subject" crop (see subject_crop_box).
+    crop_box: list | None = None
     # Optional settings (whites, blacks, saturation, sharpening, noise) are only
     # written to the sidecar once they have been set, so an existing sidecar's
     # values are left alone until you or an auto tool touch them.
@@ -637,37 +640,53 @@ def crop_factor(w: float, h: float, deg: float) -> float:
 @dataclass
 class Geometry:
     """Maps between working-image coordinates and displayed-image coordinates."""
-    M: np.ndarray | None = None   # 2x3 affine (working -> rotated)
+    M: np.ndarray | None = None   # 2x3 affine (working -> rotated); None = no rotation
     x0: int = 0
     y0: int = 0
 
     def to_display(self, x, y):
-        if self.M is None:
-            return x, y
-        px = self.M[0, 0] * x + self.M[0, 1] * y + self.M[0, 2]
-        py = self.M[1, 0] * x + self.M[1, 1] * y + self.M[1, 2]
-        return px - self.x0, py - self.y0
+        if self.M is not None:
+            x, y = (self.M[0, 0] * x + self.M[0, 1] * y + self.M[0, 2],
+                    self.M[1, 0] * x + self.M[1, 1] * y + self.M[1, 2])
+        return x - self.x0, y - self.y0
 
     def to_source(self, x, y):
-        if self.M is None:
-            return x, y
-        inv = cv2.invertAffineTransform(self.M)
         rx, ry = x + self.x0, y + self.y0
+        if self.M is None:
+            return rx, ry
+        inv = cv2.invertAffineTransform(self.M)
         return (inv[0, 0] * rx + inv[0, 1] * ry + inv[0, 2],
                 inv[1, 0] * rx + inv[1, 1] * ry + inv[1, 2])
 
 
-def rotate_and_crop(img: np.ndarray, deg: float):
+def _box_pixels(w: int, h: int, box):
+    """Pixel rectangle (x0, y0, cw, ch) of a 0..1 crop box inside a w x h image."""
+    l, t, r, b = (min(max(float(v), 0.0), 1.0) for v in box)
+    x0, y0 = int(round(l * w)), int(round(t * h))
+    cw, ch = max(1, int(round((r - l) * w))), max(1, int(round((b - t) * h)))
+    return x0, y0, min(cw, w - x0), min(ch, h - y0)
+
+
+def rotate_and_crop(img: np.ndarray, deg: float, box=None):
+    """Straighten (rotate + largest centred crop), then apply the optional subject crop box."""
     h, w = img.shape[:2]
-    if abs(deg) < 1e-3:
+    M, x0, y0 = None, 0, 0
+    out = img
+    if abs(deg) >= 1e-3:
+        M = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), deg, 1.0)
+        out = cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_LINEAR,
+                             borderMode=cv2.BORDER_REPLICATE)
+        k = crop_factor(w, h, deg)
+        cw, ch = max(1, int(w * k)), max(1, int(h * k))
+        x0, y0 = (w - cw) // 2, (h - ch) // 2
+        out = out[y0:y0 + ch, x0:x0 + cw]
+    if box:
+        bx, by, bw, bh = _box_pixels(out.shape[1], out.shape[0], box)
+        out = out[by:by + bh, bx:bx + bw]
+        x0, y0 = x0 + bx, y0 + by
+    if M is None and not box:
         return img, Geometry()
-    M = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), deg, 1.0)
-    out = cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_LINEAR,
-                         borderMode=cv2.BORDER_REPLICATE)
-    k = crop_factor(w, h, deg)
-    cw, ch = max(1, int(w * k)), max(1, int(h * k))
-    x0, y0 = (w - cw) // 2, (h - ch) // 2
-    return np.ascontiguousarray(out[y0:y0 + ch, x0:x0 + cw]), Geometry(M, x0, y0)
+    return np.ascontiguousarray(out), Geometry(M, x0, y0)
 
 
 def _srgb_encode(x):
@@ -863,6 +882,120 @@ def estimate_subject(dec: Decoded):
     return out
 
 
+# --------------------------------------------------------------------------
+# Subject crop: a minimal crop that puts the main subject (plane, car, ...) in the centre
+# --------------------------------------------------------------------------
+SUBJECT_CROP_MIN_SCALE = 0.6   # never keep less than this share of the width / height
+SUBJECT_CROP_DEADBAND = 0.03   # subject already this close to the centre: no crop
+SUBJECT_CROP_MIN_CONF = 0.35
+
+
+def _spectral_residual(gray: np.ndarray) -> np.ndarray:
+    """Hou & Zhang spectral-residual saliency of a small grey image (0..1 out)."""
+    small = cv2.resize(gray, (64, 64), interpolation=cv2.INTER_AREA).astype(np.float32)
+    f = np.fft.fft2(small)
+    logamp = np.log(np.abs(f) + 1e-6)
+    resid = logamp - cv2.blur(logamp, (3, 3))
+    sal = np.abs(np.fft.ifft2(np.exp(resid + 1j * np.angle(f)))) ** 2
+    sal = cv2.GaussianBlur(sal.astype(np.float32), (0, 0), 2.5)
+    sal = cv2.resize(sal, (gray.shape[1], gray.shape[0]), interpolation=cv2.INTER_LINEAR)
+    return sal / (float(sal.max()) + 1e-9)
+
+
+def find_subject_box(rgb: np.ndarray):
+    """
+    Bounding box of the main subject in an 8-bit RGB image: ((l, t, r, b) as 0..1 fractions,
+    confidence 0..1), or (None, 0.0). Looks for the region that stands out from the background
+    by colour, sharpness and shape (a plane against sky, a car against a blurred road).
+    """
+    h0, w0 = rgb.shape[:2]
+    k = 400.0 / max(h0, w0)
+    img = cv2.resize(rgb, (max(16, round(w0 * k)), max(16, round(h0 * k))), interpolation=cv2.INTER_AREA)
+    h, w = img.shape[:2]
+    lab = cv2.cvtColor(img, cv2.COLOR_RGB2LAB).astype(np.float32)
+    gray = lab[..., 0] / 255.0
+
+    def norm(a):
+        lo, hi = np.percentile(a, 2), np.percentile(a, 99.5)
+        return np.clip((a - lo) / (hi - lo + 1e-6), 0, 1)
+
+    # colour distance from the background (the frame's border is mostly background)
+    bw = max(2, min(h, w) // 20)
+    border = np.concatenate([lab[:bw].reshape(-1, 3), lab[-bw:].reshape(-1, 3),
+                             lab[:, :bw].reshape(-1, 3), lab[:, -bw:].reshape(-1, 3)])
+    bg = np.median(border, axis=0)
+    spread = np.median(np.abs(border - bg), axis=0) + 4.0
+    colour = norm(cv2.GaussianBlur(np.sqrt((((lab - bg) / spread) ** 2).sum(axis=2)), (0, 0), 2.0))
+    # sharpness: the subject is in focus, the background often isn't
+    lap = np.abs(cv2.Laplacian(cv2.GaussianBlur(gray, (0, 0), 0.8), cv2.CV_32F))
+    focus = norm(cv2.GaussianBlur(lap, (0, 0), max(h, w) / 60.0))
+    spec = norm(_spectral_residual(gray))
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    prior = np.exp(-(((xx - w / 2) / (0.6 * w)) ** 2 + ((yy - h / 2) / (0.6 * h)) ** 2))
+    sal = (0.40 * colour + 0.30 * spec + 0.30 * focus) * (0.6 + 0.4 * prior)
+
+    thr = max(float(np.percentile(sal, 85)), 0.5 * float(sal.max()))
+    m = (sal > thr).astype(np.uint8)
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+    n, lab_cc, stats, _ = cv2.connectedComponentsWithStats(m, 8)
+    best, best_score = 0, 0.0
+    for i in range(1, n):
+        x, y, ww, hh, area = stats[i]
+        if area < 0.002 * h * w:
+            continue
+        edges = (x <= 0) + (y <= 0) + (x + ww >= w) + (y + hh >= h)
+        if edges >= 2 or ww * hh > 0.6 * h * w:     # spans the frame: that's background / scenery
+            continue
+        score = float(sal[lab_cc == i].sum()) * (0.5 if edges else 1.0)
+        if score > best_score:
+            best, best_score = i, score
+    if not best:
+        return None, 0.0
+    x, y, ww, hh, area = stats[best]
+    blob = lab_cc == best
+    # parts of the same subject (wing, tail, wheels) that fell just outside: merge nearby blobs
+    near = cv2.dilate(blob.astype(np.uint8), np.ones((15, 15), np.uint8)) > 0
+    for i in range(1, n):
+        if i != best and stats[i][4] >= 0.0005 * h * w and near[lab_cc == i].any():
+            xi, yi, wi, hi_, _a = stats[i]
+            nx0, ny0 = min(x, xi), min(y, yi)
+            nx1, ny1 = max(x + ww, xi + wi), max(y + hh, yi + hi_)
+            x, y, ww, hh = nx0, ny0, nx1 - nx0, ny1 - ny0
+    inside = np.zeros((h, w), bool)
+    inside[y:y + hh, x:x + ww] = True
+    ratio = float(sal[inside].mean()) / (float(sal[~inside].mean()) + 1e-6) if (~inside).any() else 0.0
+    conf = float(np.clip((ratio - 1.6) / 2.0, 0, 1))
+    return (x / w, y / h, (x + ww) / w, (y + hh) / h), conf
+
+
+def subject_crop_box(subject, min_scale: float = SUBJECT_CROP_MIN_SCALE):
+    """
+    The smallest same-aspect crop (as [l, t, r, b] fractions) that puts the subject's centre in the
+    middle of the frame, never cutting into the subject and never keeping less than `min_scale` of
+    the width/height. If that would need more cropping, the subject is moved as close to the
+    centre as the limit allows. Returns None when no crop is needed.
+    """
+    l, t, r, b = subject
+    cx, cy = (l + r) / 2.0, (t + b) / 2.0
+    if abs(cx - 0.5) < SUBJECT_CROP_DEADBAND and abs(cy - 0.5) < SUBJECT_CROP_DEADBAND:
+        return None
+    pad_x, pad_y = 0.04 + 0.08 * (r - l), 0.04 + 0.08 * (b - t)
+    need = max(min_scale, (r - l) + 2 * pad_x, (b - t) + 2 * pad_y)
+    if need >= 0.999:
+        return None                                   # subject too big to crop around
+    best = 2.0 * min(cx, 1 - cx, cy, 1 - cy)          # crop size that centres it exactly
+    if best >= need:
+        s = best
+    else:                                             # can't fully centre: get as close as allowed
+        s = need
+        cx = min(max(cx, s / 2), 1 - s / 2)
+        cy = min(max(cy, s / 2), 1 - s / 2)
+        s = 2.0 * min(cx, 1 - cx, cy, 1 - cy)
+    if s >= 0.995:
+        return None
+    return [round(float(v), 5) for v in (cx - s / 2, cy - s / 2, cx + s / 2, cy + s / 2)]
+
+
 def _apply_local(g: np.ndarray, mask: np.ndarray, ev=0.0, contrast=0, highlights=0, shadows=0,
                  dehaze=0, saturation=0, temp=0, texture=0, clarity=0) -> np.ndarray:
     """Preview approximation of one Lightroom local adjustment, blended through `mask`."""
@@ -930,7 +1063,7 @@ def render(dec: Decoded, edit: Edit, original: bool = False, rotate: bool = True
 
     img = (np.clip(g, 0, 1) * 255 + 0.5).astype(np.uint8)
     if rotate and not original:
-        return rotate_and_crop(img, edit.angle)
+        return rotate_and_crop(img, edit.angle, edit.crop_box)
     return np.ascontiguousarray(img), Geometry()
 
 
@@ -1324,13 +1457,23 @@ def crs_values(edit: Edit):
 
 
 def _crop_values(edit: Edit, src_w: float, src_h: float):
+    """Lightroom crop: the straighten crop, narrowed to the subject crop box when one is set."""
     k = crop_factor(src_w, src_h, edit.angle)
-    lo, hi = 0.5 - k / 2.0, 0.5 + k / 2.0
+    box = edit.crop_box or [0.0, 0.0, 1.0, 1.0]
+    u, v = (box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0     # centre in the straightened frame
+    # straightened frame -> rotated full frame (pixels, relative to the image centre)
+    px, py = (u - 0.5) * k * src_w, (v - 0.5) * k * src_h
+    # ... -> unrotated source (undo the preview's counter-clockwise rotation)
+    a = math.radians(edit.angle)
+    sx = math.cos(a) * px - math.sin(a) * py
+    sy = math.sin(a) * px + math.cos(a) * py
+    cx, cy = 0.5 + sx / src_w, 0.5 + sy / src_h
+    hw, hh = k * (box[2] - box[0]) / 2.0, k * (box[3] - box[1]) / 2.0
     return {
         "HasCrop": "True",
         "CropAngle": f"{XMP_ANGLE_SIGN * edit.angle:.2f}",
-        "CropLeft": f"{lo:.6f}", "CropTop": f"{lo:.6f}",
-        "CropRight": f"{hi:.6f}", "CropBottom": f"{hi:.6f}",
+        "CropLeft": f"{cx - hw:.6f}", "CropTop": f"{cy - hh:.6f}",
+        "CropRight": f"{cx + hw:.6f}", "CropBottom": f"{cy + hh:.6f}",
     }
 
 
@@ -1516,15 +1659,21 @@ def _write_sidecar(raw_path: str, edit: Edit, src_size=(3, 2), meta=None) -> str
     _write_meta(desc, meta)
 
     marker = _q("rrv", "CropByRawReview")
+    box_key = _q("rrv", "SubjectCrop")
     keep_lr_crop = (edit.lr_crop_angle is not None and abs(edit.angle - edit.lr_crop_angle) < 0.01
-                    and desc.get(marker) is None)
+                    and not edit.crop_box and desc.get(marker) is None)
     if keep_lr_crop:
         pass                                  # the crop you made in Lightroom stays as it is
-    elif abs(edit.angle) >= 0.01:
+    elif abs(edit.angle) >= 0.01 or edit.crop_box:
         for k, val in _crop_values(edit, *src_size).items():
             _set(desc, _q("crs", k), val)
         desc.set(marker, "True")
+        if edit.crop_box:
+            desc.set(box_key, ",".join(f"{float(v):.5f}" for v in edit.crop_box))
+        else:
+            desc.attrib.pop(box_key, None)
     elif desc.get(marker) is not None:
+        desc.attrib.pop(box_key, None)
         # We set a crop earlier and the angle is now 0: undo only our own crop.
         for k, val in {"HasCrop": "False", "CropAngle": "0", "CropLeft": "0",
                        "CropTop": "0", "CropRight": "1", "CropBottom": "1"}.items():
@@ -1824,8 +1973,20 @@ def read_existing(raw_path: str, base: Edit):
         e.angle = ang
         ours = any(k == _q("rrv", "CropByRawReview") for d in root.iter(_q("rdf", "Description")) for k in d.attrib)
         e.lr_crop_angle = None if ours else ang
+        e.crop_box = None
+        if ours:
+            for d in root.iter(_q("rdf", "Description")):
+                raw_box = d.get(_q("rrv", "SubjectCrop"))
+                if raw_box:
+                    try:
+                        vals = [float(x) for x in raw_box.split(",")]
+                        if len(vals) == 4 and 0 <= vals[0] < vals[2] <= 1 and 0 <= vals[1] < vals[3] <= 1:
+                            e.crop_box = vals
+                    except ValueError:
+                        pass
     else:
         e.angle = 0.0
+        e.crop_box = None
     e.level_mode = "Manual" if (abs(e.angle) >= 0.01 or e.upright != "Off") else "Off"
 
     # RAW Review's own sky / subject masks (other masks stay in the file untouched)
