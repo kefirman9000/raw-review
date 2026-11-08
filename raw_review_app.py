@@ -792,6 +792,147 @@ class BatchDialog(QtWidgets.QDialog):
                               exposure_bias=self.bias.value(), changes=changes)
 
 
+class ApplyAutoDialog(QtWidgets.QDialog):
+    """Run chosen auto tools, with their own options, on exactly the photos selected in the list / grid."""
+
+    def __init__(self, parent, names: list, opts: "auto.AutoOptions", last: dict | None = None):
+        super().__init__(parent)
+        n = len(names)
+        self.setWindowTitle(f"Auto settings for {n} selected photo{'s' if n != 1 else ''}")
+        self.resize(520, 640)
+        self.opts = opts
+        lay = QtWidgets.QVBoxLayout(self)
+
+        head = QtWidgets.QLabel(f"<b>Applies to these {n} photo{'s' if n != 1 else ''} only</b> "
+                                "(select others in the list or grid first to change this):")
+        head.setWordWrap(True)
+        lay.addWidget(head)
+        shown = ", ".join(names[:8]) + (f"  … and {n - 8} more" if n > 8 else "")
+        who = QtWidgets.QLabel(shown)
+        who.setWordWrap(True)
+        who.setStyleSheet("color:#999;")
+        lay.addWidget(who)
+
+        ga = QtWidgets.QGroupBox("Automatic tools to run")
+        al = QtWidgets.QGridLayout(ga)
+        self.checks = {}
+        for i, (key, label) in enumerate(auto.AUTO_GROUPS):
+            cb = QtWidgets.QCheckBox(label)
+            self.checks[key] = cb
+            if key == "level":
+                self.level_combo = QtWidgets.QComboBox()
+                self.level_combo.addItems([m for m in core.LEVEL_MODES if m not in ("Manual", "Off")])
+                self.level_combo.activated.connect(lambda _i: self.checks["level"].setChecked(True))
+                al.addWidget(cb, i, 0)
+                al.addWidget(self.level_combo, i, 1)
+            else:
+                al.addWidget(cb, i, 0, 1, 2)
+        quick = QtWidgets.QHBoxLayout()
+        b_all = QtWidgets.QPushButton("All")
+        b_none = QtWidgets.QPushButton("None")
+        b_mine = QtWidgets.QPushButton("Same as Auto options")
+        b_mine.setToolTip("Tick the same tools and options that new photos get")
+        b_all.clicked.connect(lambda: [c.setChecked(True) for c in self.checks.values()])
+        b_none.clicked.connect(lambda: [c.setChecked(False) for c in self.checks.values()])
+        b_mine.clicked.connect(lambda: self._fill(self._from_opts()))
+        for b in (b_all, b_none, b_mine):
+            quick.addWidget(b)
+        quick.addStretch(1)
+        al.addLayout(quick, len(auto.AUTO_GROUPS), 0, 1, 2)
+        lay.addWidget(ga)
+
+        go = QtWidgets.QGroupBox("Options for these photos")
+        ol = QtWidgets.QVBoxLayout(go)
+        self.chk_crop = QtWidgets.QCheckBox("Crop to centre the subject (planes, cars…)")
+        self.chk_upright = QtWidgets.QCheckBox("Straighten best guess may choose Upright: Vertical")
+        self.chk_mine = QtWidgets.QCheckBox("Apply My auto settings (punch, colour, your rules)")
+        self.chk_fresh = QtWidgets.QCheckBox("Start from As Shot (throw away these photos' current edits first)")
+        self.chk_fresh.setToolTip("Off: the tools adjust each photo as it is now.\n"
+                                  "On: each photo is reset to As Shot first, like a brand-new proposal.")
+        for w in (self.chk_crop, self.chk_upright, self.chk_mine, self.chk_fresh):
+            ol.addWidget(w)
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(QtWidgets.QLabel("Strength"))
+        self.strength = QtWidgets.QDoubleSpinBox()
+        self.strength.setRange(0, 200)
+        self.strength.setSingleStep(10)
+        self.strength.setSuffix(" %")
+        self.strength.setToolTip("How far auto tools move the sliders: 50% = half way, 150% = push harder")
+        row.addWidget(self.strength)
+        row.addSpacing(16)
+        row.addWidget(QtWidgets.QLabel("Exposure bias"))
+        self.bias = QtWidgets.QDoubleSpinBox()
+        self.bias.setRange(-2, 2)
+        self.bias.setSingleStep(0.1)
+        self.bias.setDecimals(2)
+        self.bias.setSuffix(" EV")
+        self.bias.setToolTip("Added to Auto exposure: negative = darker, positive = brighter")
+        row.addWidget(self.bias)
+        row.addStretch(1)
+        ol.addLayout(row)
+        lay.addWidget(go)
+        lay.addStretch(1)
+
+        note = QtWidgets.QLabel("Undo with ↶ Undo batch (toolbar) or Ctrl+Z on each photo. Nothing is written "
+                                "to Lightroom until you approve (unless Auto-write is on).")
+        note.setWordWrap(True)
+        note.setStyleSheet("color:#888;font-size:11px;")
+        lay.addWidget(note)
+        bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Ok |
+                                        QtWidgets.QDialogButtonBox.StandardButton.Cancel)
+        bb.button(QtWidgets.QDialogButtonBox.StandardButton.Ok).setText(f"Apply to {n} photo{'s' if n != 1 else ''}")
+        bb.accepted.connect(self._accept)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+        self._fill(last or self._from_opts())
+
+    def _from_opts(self) -> dict:
+        o = self.opts
+        groups = set(o.groups)
+        if o.level_mode != "Off":
+            groups.add("level")
+        return {"groups": sorted(groups), "level_mode": o.level_mode, "subject_crop": o.subject_crop,
+                "allow_upright": o.allow_upright, "mine": True, "fresh": False,
+                "strength": o.strength, "exposure_bias": o.exposure_bias}
+
+    def _fill(self, v: dict):
+        groups = set(v.get("groups", []))
+        for k, cb in self.checks.items():
+            cb.setChecked(k in groups)
+        mode = v.get("level_mode", "Auto (best guess)")
+        self.level_combo.setCurrentText(mode if mode in core.LEVEL_MODES and mode not in ("Manual", "Off")
+                                        else "Auto (best guess)")
+        self.chk_crop.setChecked(bool(v.get("subject_crop", False)))
+        self.chk_upright.setChecked(bool(v.get("allow_upright", True)))
+        self.chk_mine.setChecked(bool(v.get("mine", True)))
+        self.chk_fresh.setChecked(bool(v.get("fresh", False)))
+        self.strength.setValue(round(float(v.get("strength", 1.0)) * 100))
+        self.bias.setValue(float(v.get("exposure_bias", 0.0)))
+
+    def values(self) -> dict:
+        return {"groups": [k for k in auto.GROUP_ORDER if self.checks[k].isChecked()],
+                "level_mode": self.level_combo.currentText(), "subject_crop": self.chk_crop.isChecked(),
+                "allow_upright": self.chk_upright.isChecked(), "mine": self.chk_mine.isChecked(),
+                "fresh": self.chk_fresh.isChecked(), "strength": self.strength.value() / 100.0,
+                "exposure_bias": self.bias.value()}
+
+    def _accept(self):
+        v = self.values()
+        if not v["groups"] and not v["subject_crop"]:
+            QtWidgets.QMessageBox.information(self, self.windowTitle(), "Tick at least one tool to run.")
+            return
+        self.accept()
+
+    def spec(self) -> "auto.BatchSpec":
+        v, o = self.values(), self.opts
+        mine = v["mine"]
+        return auto.BatchSpec(scope="selected", groups=v["groups"], level_mode=v["level_mode"],
+                              allow_upright=v["allow_upright"], strength=v["strength"],
+                              exposure_bias=v["exposure_bias"], punch=o.punch if mine else 0.0,
+                              colour=o.colour if mine else 0.0, rules=dict(o.rules) if mine else {},
+                              user_rules=mine, subject_crop=v["subject_crop"])
+
+
 # --------------------------------------------------------------------------
 # Main window
 # --------------------------------------------------------------------------
@@ -1031,6 +1172,11 @@ class MainWindow(QtWidgets.QMainWindow):
         tb.addWidget(self._build_auto_menu())
         self.act_myauto = tb.addAction("★ My auto settings…", self.open_my_auto)
         self.act_myauto.setToolTip("Your own recipe for auto edits: brightness, punch, colour, and a rule per setting")
+        self.act_auto_sel = tb.addAction("⚡ Auto selected…", self.open_apply_auto)
+        self.act_auto_sel.setShortcut(QtGui.QKeySequence("Ctrl+Shift+E"))
+        self.act_auto_sel.setToolTip("Run auto tools, with options you pick, on just the photos selected in the\n"
+                                     "list or grid (Ctrl/Shift-click to select several). Also on right-click. "
+                                     "(Ctrl+Shift+E)")
         self.act_batch = tb.addAction("Batch edit…", self.open_batch)
         self.act_batch.setToolTip("Run auto tools or raise/lower/set settings on checked, selected or all photos")
         self.act_undo_batch = tb.addAction("Undo batch", self.undo_batch)
@@ -1069,6 +1215,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.list.currentRowChanged.connect(self.on_row)
         self.list.itemChanged.connect(self._on_list_item_changed)
         self.list.itemSelectionChanged.connect(self._sync_grid_from_list)
+        self.list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.list.customContextMenuRequested.connect(lambda pos: self._photo_menu(self.list, pos))
         self.count_lbl = QtWidgets.QLabel("No photos")
         self.count_lbl.setWordWrap(True)
         self.checked_lbl = QtWidgets.QLabel("0 checked")
@@ -1118,6 +1266,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.grid.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
         self.grid.setStyleSheet("QListWidget{background:#1c1c1e;}")
         self.grid.itemSelectionChanged.connect(self._sync_list_from_grid)
+        self.grid.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.grid.customContextMenuRequested.connect(lambda pos: self._photo_menu(self.grid, pos))
         self.grid.currentRowChanged.connect(self._grid_current_changed)
         self.grid.itemActivated.connect(lambda _i: self.act_grid.setChecked(False))   # double-click / Enter
         self.stack = QtWidgets.QStackedWidget()
@@ -2289,6 +2439,74 @@ class MainWindow(QtWidgets.QMainWindow):
         on = it.list_item.checkState() == Qt.CheckState.Checked
         it.list_item.setCheckState(Qt.CheckState.Unchecked if on else Qt.CheckState.Checked)
 
+    # ---------------- auto settings for selected photos ----------------
+    def _photo_menu(self, view, pos):
+        clicked = view.itemAt(pos)
+        if clicked is not None and not clicked.isSelected():
+            view.clearSelection()                       # right-clicking an unselected photo: act on it
+            clicked.setSelected(True)
+        n = len([it for it in self.selected_items() if it.edit is not None])
+        if not n:
+            return
+        s = "s" if n != 1 else ""
+        menu = QtWidgets.QMenu(view)
+        menu.addAction(f"⚡ Auto settings for {n} selected photo{s}…", self.open_apply_auto)
+        menu.addAction(f"Auto-enhance {n} photo{s} (current Auto options)", self.auto_enhance_selected)
+        menu.addAction(f"Crop {n} photo{s} to centre the subject",
+                       lambda: self._run_on_selected(auto.BatchSpec(scope="selected", subject_crop=True)))
+        menu.addAction(f"Remove subject crop from {n} photo{s}", self.remove_crop_selected)
+        menu.addSeparator()
+        menu.addAction(f"Paste settings to {n} photo{s}", self.paste_settings).setEnabled(self.clip_edit is not None)
+        menu.addAction("Batch edit (raise / lower / set sliders)…", self.open_batch)
+        menu.exec(view.viewport().mapToGlobal(pos))
+
+    def _selected_ready(self):
+        return [it for it in self.selected_items() if it is not None and it.edit is not None]
+
+    def _run_on_selected(self, spec):
+        items = self._selected_ready()
+        if not items:
+            self.statusBar().showMessage("Select one or more analysed photos first "
+                                         "(Ctrl-click or Shift-click in the list or grid).", 6000)
+            return
+        self._run_batch_on(items, spec)
+
+    def open_apply_auto(self):
+        items = self._selected_ready()
+        if not items:
+            self.statusBar().showMessage("Select one or more analysed photos first "
+                                         "(Ctrl-click or Shift-click in the list or grid).", 6000)
+            return
+        dlg = ApplyAutoDialog(self, [os.path.basename(it.path) for it in items], self._opts_snapshot(),
+                              self._settings.get("apply_auto_last"))
+        if dlg.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        v = dlg.values()
+        self._settings["apply_auto_last"] = v
+        spec = dlg.spec()
+        spec.fresh = v["fresh"]
+        self._run_on_selected(spec)
+
+    def auto_enhance_selected(self):
+        o = self.opts
+        groups = [g for g in auto.GROUP_ORDER if g in o.groups and g != "level"]
+        self._run_on_selected(auto.BatchSpec(
+            scope="selected", groups=groups, level_mode=o.level_mode, allow_upright=o.allow_upright,
+            strength=o.strength, exposure_bias=o.exposure_bias, punch=o.punch, colour=o.colour,
+            rules=dict(o.rules), user_rules=True, subject_crop=o.subject_crop))
+
+    def remove_crop_selected(self):
+        items = [it for it in self._selected_ready() if it.edit.crop_box]
+        for it in items:
+            self._record_undo(it, it.edit.copy())
+            it.edit.crop_box = None
+            auto.replace_note(it.edit, "Subject crop", "Subject crop: off")
+            self._mark_changed(it)
+            self._queue_thumb(it)
+        self.load_controls()
+        self.refresh_view()
+        self.statusBar().showMessage(f"Removed the subject crop from {len(items)} photo(s).", 5000)
+
     # ---------------- batch edit ----------------
     def open_batch(self):
         if not self.items:
@@ -2681,6 +2899,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "scope": self.scope_combo.currentIndex(),
             "show_wb_samples": self.chk_samples.isChecked(),
             "show_masks": self.chk_masks.isChecked(),
+            "apply_auto_last": self._settings.get("apply_auto_last"),
             "collapsed": [t for t, (c, _f) in self._panels.items() if not c.isVisible()],
             "ui_scale": self._settings.get("ui_scale", 1.0),
             "tour_done": self._settings.get("tour_done", False),

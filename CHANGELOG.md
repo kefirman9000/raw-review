@@ -1,5 +1,17 @@
 # Changelog
 
+## v1.8.1
+
+- **Auto settings for just the photos you pick.** Select photos in the list or grid (Ctrl-click / Shift-click),
+  then click **⚡ Auto selected…** in the toolbar, press **Ctrl+Shift+E**, or right-click them. One window shows
+  exactly which photos it will change and lets you choose, for those photos only: which auto tools run, the
+  straighten mode, subject crop, Upright, My auto settings, strength and exposure bias, and whether to start from
+  As Shot. Your global Auto options are not changed, and the window remembers your last choices.
+- **Right-click menu on photos:** Auto settings for the selection, Auto-enhance them, crop them to centre the
+  subject, remove the subject crop, paste settings, or open Batch edit. Right-clicking a photo that isn't selected
+  acts on that photo alone.
+- *Undo batch* reverts the whole run; Ctrl+Z still works per photo.
+
 ## v1.8.0
 
 - **New option: auto crop to centre the subject.** Turn on *Auto options ▾ → Auto crop to centre the subject

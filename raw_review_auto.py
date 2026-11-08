@@ -610,15 +610,20 @@ class BatchSpec:
     rules: dict = field(default_factory=dict)
     user_rules: bool = False                     # also apply "My auto settings"
     subject_crop: bool = False
+    fresh: bool = False                          # reset to As Shot before running the tools
 
     @property
     def needs_decode(self) -> bool:
-        return bool(self.groups)
+        return bool(self.groups) or self.subject_crop or self.fresh
 
 
 def apply_batch(dec, edit, spec: BatchSpec) -> dict:
     """Apply a BatchSpec to one photo's edit: auto tools first, then manual changes."""
     out = {}
+    if spec.fresh:
+        start = core.as_shot_edit(dec)
+        for f in edit.__dataclass_fields__:
+            setattr(edit, f, getattr(start, f))
     if spec.groups:
         out = run_auto(dec, edit, spec.groups,
                        AutoOptions(groups=set(spec.groups), level_mode=spec.level_mode,
@@ -626,6 +631,8 @@ def apply_batch(dec, edit, spec: BatchSpec) -> dict:
                                    exposure_bias=spec.exposure_bias, punch=spec.punch, colour=spec.colour,
                                    rules=spec.rules, subject_crop=spec.subject_crop),
                        user_rules=spec.user_rules)
+    if spec.subject_crop and "crop" not in out:          # asked for on its own, without straighten
+        out["crop"] = apply_subject_crop(dec, edit)
     apply_changes(edit, spec.changes)
     return out
 
