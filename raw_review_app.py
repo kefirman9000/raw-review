@@ -124,6 +124,7 @@ class Item:
         self.undo_key = None          # what the last undo step was about (merges one slider drag)
         self.undo_time = 0.0
         self.cull: cull.CullStats | None = None   # sharpness, clipping, look-alike signature (suggestions only)
+        self.edited = False           # ✎ you changed it after the auto proposal (or marked it yourself)
 
 
 # --------------------------------------------------------------------------
@@ -1235,7 +1236,33 @@ class MainWindow(QtWidgets.QMainWindow):
             lambda it: it.path in self._cull_why and it.status in ("ready", "modified")))
         cm.addAction("Invert", self.check_invert)
         chk_btn.setMenu(cm)
+        cm.addAction("Edited ✎", lambda: self.check_where(lambda it: it.edited))
+        cm.addAction("Not edited", lambda: self.check_where(lambda it: not it.edited and it.edit is not None))
+        sel_btn = QtWidgets.QToolButton()
+        sel_btn.setText("Select ▾")
+        sel_btn.setToolTip("Select photos by state (then ⚡ Auto selected…, right-click, Approve…)")
+        sel_btn.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
+        sm = QtWidgets.QMenu(sel_btn)
+        sm.addAction("Not edited", lambda: self.select_where(lambda it: not it.edited and it.edit is not None))
+        sm.addAction("Edited ✎", lambda: self.select_where(lambda it: it.edited))
+        sm.addAction("Not edited and not yet reviewed", lambda: self.select_where(
+            lambda it: not it.edited and it.status in ("ready", "modified")))
+        sm.addAction("Not yet reviewed", lambda: self.select_where(lambda it: it.status in ("ready", "modified")))
+        sm.addAction("Checked ☑", lambda: self.select_where(
+            lambda it: it.list_item.checkState() == Qt.CheckState.Checked))
+        sm.addAction("All shown", lambda: self.select_where(lambda it: True))
+        sm.addAction("None", lambda: self.select_where(lambda it: False))
+        sm.addSeparator()
+        sm.addAction("Mark selected as edited ✎", lambda: self.set_edited(self.selected_items(), True))
+        sm.addAction("Mark selected as not edited", lambda: self.set_edited(self.selected_items(), False))
+        sm.addSeparator()
+        self.act_mark_edited = sm.addAction("Mark photos ✎ edited automatically when I change them")
+        self.act_mark_edited.setCheckable(True)
+        self.act_mark_edited.setChecked(bool(self._settings.get("mark_edited", True)))
+        self.act_mark_edited.toggled.connect(lambda on: self._settings.__setitem__("mark_edited", bool(on)))
+        sel_btn.setMenu(sm)
         top = QtWidgets.QHBoxLayout()
+        top.addWidget(sel_btn)
         top.addWidget(chk_btn)
         top.addWidget(self.checked_lbl, 1)
         ll.addLayout(top)
@@ -1279,6 +1306,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.search.setClearButtonEnabled(True)
         self.search.textChanged.connect(self.apply_filter)
         bar.addWidget(self.search, 1)
+        self.show_combo = QtWidgets.QComboBox()
+        self.show_combo.addItems(["Show all", "Show not edited", "Show edited ✎", "Show to review",
+                                  "Show approved", "Show rejected"])
+        self.show_combo.setToolTip("Only show photos in this state (in the list and the grid)")
+        self.show_combo.currentIndexChanged.connect(lambda _i: self._refilter())
+        bar.addWidget(self.show_combo)
         self.thumb_lbl = QtWidgets.QLabel("Thumbnail size")
         self.thumb_size = QtWidgets.QSlider(Qt.Orientation.Horizontal)
         self.thumb_size.setRange(110, GRID_W)
@@ -1742,6 +1775,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     it.edit = core.edit_from_dict(saved["edit"])
                 st = saved.get("status", "ready")
                 it.status = st if st in ("ready", "approved", "modified", "rejected") else "ready"
+                it.edited = bool(saved.get("edited", False))
             if it.status == "loading":
                 it.status = "ready"
             self._set_thumb(it, res["thumb"])
@@ -1782,6 +1816,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if it.wb is not None and it.wb.applied and it.wb.confidence < 0.5 and it.status == "ready":
             extra = " · check WB"
         extra += self._cull_text(it)
+        if it.edited:
+            extra = " · ✎ Edited" + extra
         it.list_item.setText(f"{os.path.basename(it.path)}\n{label}{extra}{sidecar}"
                              + (f"\n{extra_meta}" if extra_meta else ""))
         it.list_item.setBackground(QtGui.QBrush(col) if col else QtGui.QBrush())
@@ -1789,6 +1825,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if it.error:
             it.list_item.setToolTip(f"{it.path}\n{it.error}")
         self._update_grid_item(it)
+        if hasattr(self, "show_combo"):                      # keep the "Show …" filter right for this photo
+            q = self.search.text().strip().lower()
+            hide = (bool(q) and q not in os.path.basename(it.path).lower()) or not self._show_ok(it)
+            if it.list_item.isHidden() != hide:
+                it.list_item.setHidden(hide)
+                if it.grid_item is not None:
+                    it.grid_item.setHidden(hide)
 
     # ---------------- cull suggestions ----------------
     def _ordered_items(self):
@@ -1882,6 +1925,8 @@ class MainWindow(QtWidgets.QMainWindow):
         low = " · check WB" if (it.wb is not None and it.wb.applied and it.wb.confidence < 0.5
                                 and it.status == "ready") else ""
         low += self._cull_text(it)
+        if it.edited:
+            low = " · ✎ Edited" + low
         meta = self._meta_text(it)
         gi.setText(f"{mark}{os.path.basename(it.path)}\n{label}{low}" + (f"\n{meta}" if meta else ""))
         gi.setBackground(QtGui.QBrush(col) if col else QtGui.QBrush())
@@ -2077,7 +2122,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     f" · about {int(left)} s left"
         self.count_lbl.setText(
             f"{n} photos · {c['ready'] + c['modified']} to review · {c['approved']} approved · "
-            f"{c['rejected']} rejected" + (f" · {c['error']} errors" if c['error'] else "") + prog)
+            f"{c['rejected']} rejected" + (f" · {c['error']} errors" if c['error'] else "")
+            + f" · ✎ {sum(1 for it in self.items.values() if it.edited)} edited" + prog)
         if hasattr(self, "btn_pause"):
             self.btn_pause.setVisible(busy or self._paused)
         if hasattr(self, "act_cull"):
@@ -2197,10 +2243,25 @@ class MainWindow(QtWidgets.QMainWindow):
         self.render_timer.start()
 
     def _mark_changed(self, it):
+        relabel = False
         if it.status == "approved":
             it.status = "modified"
+            relabel = True
+        if not it.edited and self._settings.get("mark_edited", True):
+            it.edited = True
+            relabel = True
+        if relabel:
             self._update_list_item(it)
             self._update_count()
+
+    def set_edited(self, items, on: bool):
+        for it in items:
+            if it.edited != on:
+                it.edited = on
+                self._update_list_item(it)
+        self._update_count()
+        s = "s" if len(items) != 1 else ""
+        self.statusBar().showMessage(f"Marked {len(items)} photo{s} as {'edited ✎' if on else 'not edited'}.", 4000)
 
     # ---------------- rendering ----------------
     def refresh_view(self):
@@ -2355,6 +2416,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self._record_undo(it, it.edit.copy())
             it.edit = it.auto_edit.copy()
             self._mark_changed(it)
+            it.edited = False                        # back to the untouched auto proposal
+            self._update_list_item(it)
+            self._update_count()
             self.load_controls()
             self.refresh_view()
 
@@ -2456,6 +2520,10 @@ class MainWindow(QtWidgets.QMainWindow):
                        lambda: self._run_on_selected(auto.BatchSpec(scope="selected", subject_crop=True)))
         menu.addAction(f"Remove subject crop from {n} photo{s}", self.remove_crop_selected)
         menu.addSeparator()
+        sel = self.selected_items()
+        menu.addAction(f"Mark {n} photo{s} as edited ✎", lambda: self.set_edited(sel, True))
+        menu.addAction(f"Mark {n} photo{s} as not edited", lambda: self.set_edited(sel, False))
+        menu.addSeparator()
         menu.addAction(f"Paste settings to {n} photo{s}", self.paste_settings).setEnabled(self.clip_edit is not None)
         menu.addAction("Batch edit (raise / lower / set sliders)…", self.open_batch)
         menu.exec(view.viewport().mapToGlobal(pos))
@@ -2525,8 +2593,9 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._run_batch_on(items, spec)
 
-    def _run_batch_on(self, items, spec):
-        self._undo = {it.path: (it.edit.copy(), it.status, it.wb) for it in items}
+    def _run_batch_on(self, items, spec, mark_edited=True):
+        self._batch_mark = mark_edited
+        self._undo = {it.path: (it.edit.copy(), it.status, it.wb, it.edited) for it in items}
         self.act_undo_batch.setEnabled(True)
         if not spec.needs_decode:                      # plain setting changes are instant
             for it in items:
@@ -2573,7 +2642,10 @@ class MainWindow(QtWidgets.QMainWindow):
     def _after_batch_item(self, it):
         if it.status in ("rejected",):
             it.status = "ready"
+        was = it.edited
         self._mark_changed(it)
+        if not getattr(self, "_batch_mark", True):
+            it.edited = was                             # re-applying auto to everything isn't "your" edit
         if self.chk_autowrite.isChecked():
             self._write(it, quiet=True)
         else:
@@ -2592,10 +2664,12 @@ class MainWindow(QtWidgets.QMainWindow):
     def undo_batch(self):
         if not self._undo:
             return
-        for path, (edit, status, wb) in self._undo.items():
+        for path, (edit, status, wb, *rest) in self._undo.items():
             it = self.items.get(path)
             if it is None:
                 continue
+            if rest:
+                it.edited = rest[0]
             if it.edit is not None:
                 self._record_undo(it, it.edit.copy())
             it.edit, it.wb = edit, wb
@@ -2638,19 +2712,53 @@ class MainWindow(QtWidgets.QMainWindow):
             self.view.set_image(to_qimage(self._split_image()), [], "")
 
     # ---------------- find / grid size ----------------
-    def apply_filter(self, text):
+    def _show_ok(self, it) -> bool:
+        mode = self.show_combo.currentIndex() if hasattr(self, "show_combo") else 0
+        if it is None or mode == 0:
+            return True
+        return [True, not it.edited, it.edited, it.status in ("ready", "modified", "loading"),
+                it.status == "approved", it.status == "rejected"][mode]
+
+    def _refilter(self):
+        if hasattr(self, "search"):
+            self.apply_filter(self.search.text(), quiet=True)
+
+    def select_where(self, pred):
+        """Select (in the list and the grid) every shown photo that matches."""
+        self.list.blockSignals(True)
+        first = None
+        n = 0
+        for r in range(self.list.count()):
+            li = self.list.item(r)
+            it = self.items.get(li.data(Qt.ItemDataRole.UserRole))
+            on = it is not None and not li.isHidden() and bool(pred(it))
+            li.setSelected(on)
+            if on:
+                n += 1
+                if first is None:
+                    first = r
+        self.list.blockSignals(False)
+        self._sync_grid_from_list()
+        cur = self.list.currentItem()
+        if first is not None and (cur is None or not cur.isSelected()):
+            self.list.setCurrentRow(first, QtCore.QItemSelectionModel.SelectionFlag.NoUpdate)
+        self.statusBar().showMessage(f"{n} photo(s) selected.", 4000)
+
+    def apply_filter(self, text, quiet=False):
         q = text.strip().lower()
         shown = 0
         for r in range(self.list.count()):
             li = self.list.item(r)
             hide = bool(q) and q not in os.path.basename(li.data(Qt.ItemDataRole.UserRole)).lower()
+            hide = hide or not self._show_ok(self.items.get(li.data(Qt.ItemDataRole.UserRole)))
             li.setHidden(hide)
             gi = self.grid.item(r)
             if gi is not None:
                 gi.setHidden(hide)
             shown += not hide
-        if q:
+        if q and not quiet:
             self.statusBar().showMessage(f"{shown} photo(s) match '{text.strip()}'", 3000)
+        if q or self.show_combo.currentIndex():
             cur = self.list.currentItem()
             if cur is None or cur.isHidden():
                 for r in range(self.list.count()):
@@ -2687,7 +2795,7 @@ class MainWindow(QtWidgets.QMainWindow):
         spec = auto.BatchSpec(scope="all", groups=groups, level_mode=o.level_mode, allow_upright=o.allow_upright,
                               strength=o.strength, exposure_bias=o.exposure_bias, punch=o.punch, colour=o.colour,
                               rules=dict(o.rules), user_rules=True, subject_crop=o.subject_crop)
-        self._run_batch_on(items, spec)
+        self._run_batch_on(items, spec, mark_edited=False)
 
     # ---------------- view menu / help ----------------
     def _build_view_menu(self):
@@ -2882,6 +2990,10 @@ class MainWindow(QtWidgets.QMainWindow):
         except (TypeError, ValueError):
             pass
         self.chk_split.setChecked(bool(st.get("split", False)))
+        try:
+            self.show_combo.setCurrentIndex(int(st.get("show_filter", 0)))
+        except (TypeError, ValueError):
+            pass
 
     def _settings_dict(self):
         o = self.opts
@@ -2900,6 +3012,8 @@ class MainWindow(QtWidgets.QMainWindow):
             "show_wb_samples": self.chk_samples.isChecked(),
             "show_masks": self.chk_masks.isChecked(),
             "apply_auto_last": self._settings.get("apply_auto_last"),
+            "mark_edited": self._settings.get("mark_edited", True),
+            "show_filter": self.show_combo.currentIndex(),
             "collapsed": [t for t, (c, _f) in self._panels.items() if not c.isVisible()],
             "ui_scale": self._settings.get("ui_scale", 1.0),
             "tour_done": self._settings.get("tour_done", False),
@@ -2920,6 +3034,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 "status": it.status if it.edit is not None else (saved or {}).get("status", "ready"),
                 "checked": it.list_item.checkState() == Qt.CheckState.Checked,
                 "rating": it.rating, "label": it.label,
+                "edited": it.edited if it.edit is not None else bool((saved or {}).get("edited")),
                 "edit": core.edit_to_dict(it.edit) if it.edit is not None else (saved or {}).get("edit"),
             })
         return {"version": __version__, "current": self.list.currentRow(), "photos": photos}

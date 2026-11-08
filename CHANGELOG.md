@@ -1,5 +1,18 @@
 # Changelog
 
+## v1.8.2
+
+- **✎ Edited mark:** any photo you change after its auto proposal (sliders, white balance, straighten, crop, paste,
+  ⚡ Auto selected, batch edit…) is labelled **✎ Edited** in the list and grid, and the count shows how many are
+  edited. Reset to auto proposal clears it, and so does Undo batch. Re-applying My auto settings to all photos
+  doesn't count as an edit. The mark is kept between sessions. Turn automatic marking off under *Select ▾*.
+- **Mark by hand:** *Select ▾* or right-click → Mark as edited / Mark as not edited.
+- **New Select ▾ button** (next to Check ▾): select Not edited, Edited, Not edited and not yet reviewed, Not yet
+  reviewed, Checked, All shown or None, then use ⚡ Auto selected… or right-click on them. Check ▾ also has
+  Edited / Not edited.
+- **Show filter** next to the search box: Show all / not edited / edited / to review / approved / rejected, for the
+  list and the grid. It sticks between sessions.
+
 ## v1.8.1
 
 - **Auto settings for just the photos you pick.** Select photos in the list or grid (Ctrl-click / Shift-click),
