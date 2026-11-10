@@ -1,5 +1,14 @@
 # Changelog
 
+## v1.9.2
+
+- **Tidier toolbar:** the row of fourteen buttons is now a few groups, so nothing is cut off any more.
+  *Add ▾* (files, folder, clear list) · *Grid* · *Auto ▾* (auto selected photos, batch edit, undo batch,
+  My auto settings, the tools that run on new photos, auto-write XMP) · *Cull suggestions* ·
+  **☑ Check all** · **Approve checked (n)** · *▾* (Approve all to-review).
+- **Check all** button next to *Approve checked*, which now shows how many photos are ticked and is greyed out when
+  none are.
+
 ## v1.9.1
 
 - **Fixed: photos overexposed in Lightroom.** Lightroom applies Adobe's default tone curve to every raw, which

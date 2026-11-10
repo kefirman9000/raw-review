@@ -26,7 +26,7 @@ Space Station (public domain). A tungsten-light cast was simulated, then removed
 - **Starts from your existing Lightroom edits** when a photo already has them, and keeps your own Lightroom crop and masks.
 - **Star ratings and colour labels**, written to Lightroom on approve.
 - **Remembers your settings and the photos you had open**, even across updates.
-- **My auto settings:** make auto edits brighter or moodier, punchier or softer, and set rules like *Sharpening always 60* or *never touch white balance*. Every new photo follows them.
+- **My auto settings** (*Auto ▾*): make auto edits brighter or moodier, punchier or softer, and set rules like *Sharpening always 60* or *never touch white balance*. Every new photo follows them.
 - **Hold-to-compare and split view**, finer sliders, **undo approval**, find by name, analysis progress with pause, foldable panels and interface sizing.
 - **Drag and drop** photos or whole folders (subfolders included).
 - **Smart auto white balance**
@@ -37,13 +37,13 @@ Space Station (public domain). A tungsten-light cast was simulated, then removed
 - **Eyedropper** WB: click anything that should be white, grey or black.
 - **Straighten modes:** Off · Auto (best guess) · Horizon (rotate) · Verticals (rotate) · Lightroom **Upright: Level / Vertical / Auto / Full** (Full = architecture).
 - **✎ Edited mark:** photos you change are marked ✎ Edited. Use *Select ▾ → Not edited* or the *Show* filter to find the ones you haven't touched yet.
-- **Auto selected photos:** select photos, then *⚡ Auto selected…* (Ctrl+Shift+E) or right-click to run chosen auto tools with their own options on just those photos.
-- **Subject crop (optional):** a minimal, same-aspect crop that centres the main subject (planes, cars…). Turn it on in *Auto options*, or per photo under *Geometry*.
-- **Auto tone, each one separate:** exposure, levels (blacks & whites), shadows & highlights, contrast, colour (vibrance & saturation). Aims for a normal-looking photo; strength and an exposure bias are adjustable under *Auto options*.
+- **Auto selected photos:** select photos, then *Auto ▾ → Auto selected photos* (Ctrl+Shift+E) or right-click to run chosen auto tools with their own options on just those photos.
+- **Subject crop (optional):** a minimal, same-aspect crop that centres the main subject (planes, cars…). Turn it on in *Auto ▾ → Tools that run on new photos*, or per photo under *Geometry*.
+- **Auto tone, each one separate:** exposure, levels (blacks & whites), shadows & highlights, contrast, colour (vibrance & saturation). Aims for a normal-looking photo; strength and an exposure bias are adjustable under *Auto ▾ → Tools that run on new photos*.
 - **Auto sharpening and noise reduction**, from noise and softness measured on the full-resolution image.
 - **Check boxes per photo** plus **Batch edit…**: run any auto tool, or increase / decrease / set / reset any setting, on this photo, the selected ones, the checked ones or all. *Undo batch* reverts the last one.
 - **Auto-write Lightroom XMP** option: writes each sidecar as soon as a photo is analysed.
-- **DNG colour profiles:** colours come from the colour matrices and embedded profile inside the DNG (dual-illuminant matrices, forward matrices, hue/sat map, look table, tone curve, baseline exposure), so files like Google Pixel DNGs render with correct colour. Pixel's local HDR tone map (`ProfileGainTableMap`) and lens shading are applied too, so the preview matches the camera's own rendering. Adjust under *Auto options -> Camera profile (DNG colour)*.
+- **DNG colour profiles:** colours come from the colour matrices and embedded profile inside the DNG (dual-illuminant matrices, forward matrices, hue/sat map, look table, tone curve, baseline exposure), so files like Google Pixel DNGs render with correct colour. Pixel's local HDR tone map (`ProfileGainTableMap`) and lens shading are applied too, so the preview matches the camera's own rendering. Adjust under *Auto ▾ → Tools that run on new photos → Camera profile (DNG colour)*.
 - **RAW and DNG** are both supported. Lightroom ignores sidecars for DNG, so for DNG an *edited copy* is exported as `name.dng` into a `RAW Review export` folder next to the original (settings embedded in its XMP packet, image data untouched). The original DNG is never modified and no `.original` files are made. Import that folder into Lightroom.
 - **Sliders:** Temperature, Tint, Exposure, Contrast, Highlights, Shadows, Whites, Blacks, Vibrance, Saturation, Sharpening (amount, radius, detail, masking), Noise reduction (luminance, detail, color), Straighten, and lens profile corrections.
 - **Hold-to-compare and split before/after**, copy/paste settings to many photos, and "Approve all".
@@ -106,12 +106,12 @@ The updater only replaces the app's own files and never looks at your photos.
 - **Sky / subject masks:** Lightroom computes them itself. If it shows a warning on a mask, select the photos and use *Update AI Settings*. If a sky's exposure looks 4× too strong or weak in Lightroom, change `LOCAL_EXPOSURE_SCALE` at the top of `raw_review_core.py`.
 
 - The preview approximates Lightroom's rendering. What counts is the values written to the sidecar.
-- **Pixel DNGs:** the preview applies the DNG's local HDR tone map (`ProfileGainTableMap`) and lens shading, so it matches Google's own rendering. The tone map stays inside the DNG (only the XMP packet is ever rewritten), and Lightroom reads it from there. I could not test that in Lightroom itself. If a Pixel photo looks *darker in Lightroom than in the preview*, your Lightroom isn't applying the table: turn off *Auto options -> Camera profile -> Pixel local HDR tone map*, and the auto tools will brighten with Exposure and Shadows instead (a close approximation, not identical).
+- **Pixel DNGs:** the preview applies the DNG's local HDR tone map (`ProfileGainTableMap`) and lens shading, so it matches Google's own rendering. The tone map stays inside the DNG (only the XMP packet is ever rewritten), and Lightroom reads it from there. I could not test that in Lightroom itself. If a Pixel photo looks *darker in Lightroom than in the preview*, your Lightroom isn't applying the table: turn off *Auto ▾ → Tools that run on new photos → Camera profile → Pixel local HDR tone map*, and the auto tools will brighten with Exposure and Shadows instead (a close approximation, not identical).
 - Not applied: the DNG's geometric lens-distortion opcodes (ultrawide Pixel shots keep their distortion in the preview; Lightroom's lens profile corrects it) and the newer `ProfileGainTableMap2` layout.
 - `TARGET_KEY_HDR` in `raw_review_auto.py` sets how bright Auto exposure aims for files with a tone map. It is calibrated on two Pixel 7 Pro files; use *Exposure bias* if yours run consistently lighter or darker.
 - Upright is calculated by Lightroom itself, so it isn't shown in the preview.
 - Sharpening and noise reduction are written to Lightroom but not shown in the preview. Their auto values come from measurements that were tuned by estimate, so check a few photos at 100% in Lightroom and use *Auto strength* to adjust.
-- Auto exposure assumes Lightroom adds about +0.5 EV before your Exposure slider (`PREVIEW_BASE_EV` in `raw_review_core.py`). If photos come out consistently too bright or dark in Lightroom, use *Auto options → Exposure bias*.
+- The preview applies Adobe's default tone curve, as Lightroom does, so auto exposure centres the histogram you'll see in Lightroom (calibrated on Lightroom exports of RAW Review's edits; `PREVIEW_ADOBE_EV` in `raw_review_core.py`). If photos still come out consistently too bright or dark in Lightroom, set *Brightness* in *Auto ▾ → My auto settings*.
 - Only settings you or an auto tool have set (whites, blacks, saturation, sharpening, noise) are written, so an existing sidecar's values are left alone otherwise.
 - If straightened photos tilt the wrong way in Lightroom, change `XMP_ANGLE_SIGN` at the top of `raw_review_core.py`.
 

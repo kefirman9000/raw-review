@@ -61,7 +61,7 @@ type a value. Double-click a slider's name to reset it. (The wheel only moves a 
 panel never changes settings by accident.)</p>
 <h3>Tips</h3>
 <ul>
-<li><b>My auto settings</b> (toolbar) is your own recipe: how bright / punchy / colourful auto edits should be, and a
+<li><b>My auto settings</b> (toolbar: <i>Auto ▾</i>) is your own recipe: how bright / punchy / colourful auto edits should be, and a
 rule for any setting (always this value, add to auto, or don't touch). It's applied to every new photo automatically.</li>
 <li><b>Edits apply to</b> (top of the controls) copies slider changes to selected or checked photos.</li>
 <li>Click a panel's title to fold it away. <b>View</b> menu: interface size, fold / unfold all panels.</li>
@@ -80,7 +80,7 @@ TOUR_PAGES = [
      "Hold <b>\\</b> to see the original. Press <b>G</b> for a grid of the whole shoot. "
      "<b>1-5</b> rate, <b>6-9</b> colour-label."),
     ("Make auto edits yours",
-     "Open <b>My auto settings</b> in the toolbar: make auto edits brighter or moodier, punchier or softer, and set rules "
+     "Open <b>Auto ▾ → My auto settings</b> in the toolbar: make auto edits brighter or moodier, punchier or softer, and set rules "
      "such as <i>Sharpening always 60</i> or <i>never touch white balance</i>. Every new photo follows them."),
     ("Tweak many at once",
      "Change <b>Edits apply to</b> (top of the controls) to <i>Selected</i> or <i>Checked photos</i> and every slider "
@@ -935,7 +935,7 @@ class ApplyAutoDialog(QtWidgets.QDialog):
         quick = QtWidgets.QHBoxLayout()
         b_all = QtWidgets.QPushButton("All")
         b_none = QtWidgets.QPushButton("None")
-        b_mine = QtWidgets.QPushButton("Same as Auto options")
+        b_mine = QtWidgets.QPushButton("Same as for new photos")
         b_mine.setToolTip("Tick the same tools and options that new photos get")
         b_all.clicked.connect(lambda: [c.setChecked(True) for c in self.checks.values()])
         b_none.clicked.connect(lambda: [c.setChecked(False) for c in self.checks.values()])
@@ -1265,40 +1265,75 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sliders = {}
         tb = self.addToolBar("Main")
         tb.setMovable(False)
-        tb.addAction("Add Files…", self.open_files)
-        tb.addAction("Add Folder…", self.open_folder)
+
+        def menu_button(text, tip=""):
+            btn = QtWidgets.QToolButton()
+            btn.setText(text)
+            btn.setToolTip(tip)
+            btn.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
+            m = QtWidgets.QMenu(btn)
+            btn.setMenu(m)
+            tb.addWidget(btn)
+            return m
+
+        # Add ▾
+        m_add = menu_button("Add ▾", "Add photos, or clear the list")
+        m_add.addAction("Add Files…", self.open_files)
+        m_add.addAction("Add Folder…", self.open_folder)
+        m_add.addSeparator()
+        m_add.addAction("Clear List", self.clear_list)
         tb.addSeparator()
-        self.act_grid = tb.addAction("▦ Grid view (G)")
+        self.act_grid = tb.addAction("▦ Grid (G)")
         self.act_grid.setCheckable(True)
         self.act_grid.setToolTip("Switch between one large photo and a grid of all photos (G). "
                                  "Double-click or Enter opens a photo.")
         self.act_grid.toggled.connect(self.set_grid)
         tb.addSeparator()
-        tb.addWidget(self._build_auto_menu())
-        self.act_myauto = tb.addAction("★ My auto settings…", self.open_my_auto)
-        self.act_myauto.setToolTip("Your own recipe for auto edits: brightness, punch, colour, and a rule per setting")
-        self.act_auto_sel = tb.addAction("⚡ Auto selected…", self.open_apply_auto)
+
+        # Auto ▾
+        m_auto = menu_button("Auto ▾", "Run automatic edits on several photos, and choose how auto works")
+        self.act_auto_sel = m_auto.addAction("⚡ Auto selected photos…", self.open_apply_auto)
         self.act_auto_sel.setShortcut(QtGui.QKeySequence("Ctrl+Shift+E"))
+        self.act_auto_sel.setShortcutVisibleInContextMenu(True)
         self.act_auto_sel.setToolTip("Run auto tools, with options you pick, on just the photos selected in the\n"
-                                     "list or grid (Ctrl/Shift-click to select several). Also on right-click. "
-                                     "(Ctrl+Shift+E)")
-        self.act_batch = tb.addAction("Batch edit…", self.open_batch)
+                                     "list or grid (Ctrl/Shift-click to select several). Also on right-click.")
+        self.addAction(self.act_auto_sel)                       # keep Ctrl+Shift+E working from anywhere
+        self.act_batch = m_auto.addAction("Batch edit…", self.open_batch)
         self.act_batch.setToolTip("Run auto tools or raise/lower/set settings on checked, selected or all photos")
-        self.act_undo_batch = tb.addAction("Undo batch", self.undo_batch)
+        self.act_undo_batch = m_auto.addAction("Undo batch", self.undo_batch)
         self.act_undo_batch.setEnabled(False)
-        tb.addSeparator()
-        self.chk_autowrite = QtWidgets.QCheckBox("Auto-write Lightroom XMP")
-        self.chk_autowrite.setToolTip(
+        m_auto.addSeparator()
+        self.act_myauto = m_auto.addAction("★ My auto settings…", self.open_my_auto)
+        self.act_myauto.setToolTip("Your own recipe for auto edits: brightness, punch, colour, and a rule per setting")
+        self._auto_tools_btn = self._build_auto_menu()          # keep a reference: it owns the menu
+        tools = self._auto_tools_btn.menu()
+        tools.setTitle("Tools that run on new photos")
+        m_auto.addMenu(tools)
+        m_auto.addSeparator()
+        self.chk_autowrite = QtWidgets.QCheckBox("Auto-write Lightroom XMP")   # state lives here (saved setting)
+        self.act_autowrite = m_auto.addAction("Auto-write Lightroom XMP")
+        self.act_autowrite.setCheckable(True)
+        self.act_autowrite.setToolTip(
             "Write the .xmp sidecar for each photo as soon as it is analysed (and after batch edits),\n"
             "without waiting for you to approve. Off by default so you can review first.")
-        tb.addWidget(self.chk_autowrite)
+        self.act_autowrite.toggled.connect(self.chk_autowrite.setChecked)
+        self.chk_autowrite.toggled.connect(self.act_autowrite.setChecked)
+        m_auto.setToolTipsVisible(True)
         tb.addSeparator()
+
         self.act_cull = tb.addAction("Cull suggestions…", self.open_cull)
         self.act_cull.setToolTip("Photos that look soft, blown out or very dark, and the weaker frames of bursts:\n"
                                  "check them to look them over, or reject them in one go")
-        tb.addAction("Approve checked", self.approve_checked)
-        tb.addAction("Approve All To-Review…", self.approve_all)
-        tb.addAction("Clear List", self.clear_list)
+        tb.addSeparator()
+
+        # Check all · Approve checked · Approve ▾
+        act = tb.addAction("☑ Check all", lambda: self.check_where(lambda it: True))
+        act.setToolTip("Tick every photo in the list (the Check ▾ menu on the left has more choices)")
+        self.act_approve_checked = tb.addAction("Approve checked", self.approve_checked)
+        self.act_approve_checked.setToolTip("Approve the ticked photos and write their Lightroom XMP")
+        self.act_approve_checked.setEnabled(False)
+        m_appr = menu_button("▾", "More ways to approve")
+        m_appr.addAction("Approve All To-Review…", self.approve_all)
         spacer = QtWidgets.QWidget()
         spacer.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Preferred)
         tb.addWidget(spacer)
@@ -1344,7 +1379,7 @@ class MainWindow(QtWidgets.QMainWindow):
         cm.addAction("Not edited", lambda: self.check_where(lambda it: not it.edited and it.edit is not None))
         sel_btn = QtWidgets.QToolButton()
         sel_btn.setText("Select ▾")
-        sel_btn.setToolTip("Select photos by state (then ⚡ Auto selected…, right-click, Approve…)")
+        sel_btn.setToolTip("Select photos by state (then Auto ▾ → Auto selected photos, right-click, Approve…)")
         sel_btn.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
         sm = QtWidgets.QMenu(sel_btn)
         sm.addAction("Not edited", lambda: self.select_where(lambda it: not it.edited and it.edit is not None))
@@ -1624,7 +1659,7 @@ class MainWindow(QtWidgets.QMainWindow):
         g_misc = QtWidgets.QGroupBox("This photo")
         ml = QtWidgets.QGridLayout(g_misc)
         self.btn_enhance = QtWidgets.QPushButton("Auto-enhance (E)")
-        self.btn_enhance.setToolTip("Run every automatic tool ticked in 'Auto options'")
+        self.btn_enhance.setToolTip("Run every automatic tool ticked in Auto ▾ → Tools that run on new photos")
         self.btn_reset_auto = QtWidgets.QPushButton("Reset to auto")
         self.btn_reset_auto.setToolTip("Go back to the automatic proposal for this photo")
         self.btn_reset_shot = QtWidgets.QPushButton("Reset to As Shot")
@@ -2640,6 +2675,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def _update_checked_label(self):
         n = sum(1 for it in self.items.values() if it.list_item.checkState() == Qt.CheckState.Checked)
         self.checked_lbl.setText(f"{n} checked")
+        if hasattr(self, "act_approve_checked"):
+            self.act_approve_checked.setText(f"Approve checked ({n})" if n else "Approve checked")
+            self.act_approve_checked.setEnabled(bool(n))
 
     def check_where(self, pred):
         self.list.blockSignals(True)
@@ -2677,7 +2715,7 @@ class MainWindow(QtWidgets.QMainWindow):
         s = "s" if n != 1 else ""
         menu = QtWidgets.QMenu(view)
         menu.addAction(f"⚡ Auto settings for {n} selected photo{s}…", self.open_apply_auto)
-        menu.addAction(f"Auto-enhance {n} photo{s} (current Auto options)", self.auto_enhance_selected)
+        menu.addAction(f"Auto-enhance {n} photo{s} (tools for new photos)", self.auto_enhance_selected)
         menu.addAction(f"Crop {n} photo{s} to centre the subject",
                        lambda: self._run_on_selected(auto.BatchSpec(scope="selected", subject_crop=True)))
         menu.addAction(f"Remove subject crop from {n} photo{s}", self.remove_crop_selected)
