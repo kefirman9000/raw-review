@@ -77,6 +77,8 @@ LEVEL_MODES = {
     "Upright: Vertical":    {"kind": "upright", "upright": "Vertical"},  # keystone, verticals
     "Upright: Auto":        {"kind": "upright", "upright": "Auto"},      # balanced
     "Upright: Full":        {"kind": "upright", "upright": "Full"},      # architecture
+    "Upright: Guided (verticals)": {"kind": "upright", "upright": "Guided", "guides": "v"},
+    "Upright: Guided (verticals + horizontals)": {"kind": "upright", "upright": "Guided", "guides": "vh"},
     "Manual":               {"kind": "manual"},                          # slider moved by hand
 }
 
@@ -330,6 +332,7 @@ class Decoded:
     source_size: tuple       # (w, h) of the decoded half-size image
     quality: ImageQuality = field(default_factory=ImageQuality)
     masks: dict = field(default_factory=dict)      # preview mask estimates, computed on demand
+    flip: int = 0            # LibRaw orientation: 0 none, 3 = 180°, 5 = 90° CCW, 6 = 90° CW (cam is shown upright)
 
 
 def decode_raw(path: str) -> Decoded:
@@ -343,6 +346,7 @@ def decode_raw(path: str) -> Decoded:
     )
     profile = dng_profile.read_dng_profile(path) if path.lower().endswith(".dng") else None  # read-only
     with rawpy.imread(path) as raw:          # LibRaw opens the file read-only
+        flip = int(getattr(raw.sizes, "flip", 0) or 0)
         try:
             rgb = raw.postprocess(half_size=True, **kwargs)
         except Exception:
@@ -350,7 +354,9 @@ def decode_raw(path: str) -> Decoded:
         cam_xyz = np.array(raw.rgb_xyz_matrix, dtype=np.float64)
         as_shot = np.array(raw.camera_whitebalance, dtype=np.float64)
 
-    return make_decoded(rgb.astype(np.float32) / 65535.0, cam_xyz, as_shot, profile)
+    dec = make_decoded(rgb.astype(np.float32) / 65535.0, cam_xyz, as_shot, profile)
+    dec.flip = flip
+    return dec
 
 
 def _apply_lens_shading(cam_full: np.ndarray, profile) -> np.ndarray:
@@ -494,6 +500,11 @@ class Edit:
     nr_color: int = 25           # 0..100
     angle: float = 0.0           # degrees, + = counter-clockwise
     upright: str = "Off"         # key of UPRIGHT_MODES
+    # Upright as RAW Review solved it, so the preview and Lightroom show the same correction:
+    # mode -> 9 numbers (row-major forward homography, 0..1 coordinates of the photo as shown).
+    upright_matrices: dict | None = None
+    upright_guides: list | None = None   # Guided: [[x1, y1, x2, y2], ...] 0..1 of the photo as shown
+    constrain_crop: bool = True          # crop away the empty corners Upright leaves
     level_mode: str = "Off"      # key of LEVEL_MODES
     lens_profile: bool = True
     # Lightroom AI masks (Select Sky / Select Subject) with their local adjustments
@@ -1143,7 +1154,13 @@ def render(dec: Decoded, edit: Edit, original: bool = False, rotate: bool = True
     img = (np.clip(g, 0, 1) * 255 + 0.5).astype(np.uint8)
     Hup = None
     if rotate and not original and edit.upright != "Off":
-        Hup = upright_for(dec, edit.upright, img)
+        stored = (edit.upright_matrices or {}).get(edit.upright)
+        if stored is not None:
+            ih, iw = img.shape[:2]
+            N = np.array([[iw, 0, 0], [0, ih, 0], [0, 0, 1]], float)
+            Hup = N @ np.asarray(stored, float).reshape(3, 3) @ np.linalg.inv(N)
+        elif edit.upright_matrices is None:          # not solved by RAW Review (e.g. read from Lightroom)
+            Hup = upright_for(dec, edit.upright, img)
         if Hup is not None:
             img = cv2.warpPerspective(img, Hup, (img.shape[1], img.shape[0]), flags=cv2.INTER_LINEAR,
                                       borderMode=cv2.BORDER_CONSTANT, borderValue=UPRIGHT_PREVIEW_FILL)
@@ -1402,17 +1419,27 @@ def _vanishing_point(seg, wts, cx, cy, scale):
     return V
 
 
-def upright_matrix(rgb: np.ndarray, mode: str):
-    """3x3 warp (in this image's pixels) previewing Lightroom Upright `mode`, or None."""
-    if mode not in ("Level", "Vertical", "Auto", "Full"):
+def upright_matrix(rgb: np.ndarray, mode: str, guides=None, seg_cache=None):
+    """3x3 warp (in this image's pixels) for Lightroom Upright `mode`, or None.
+    Guided uses `guides` ([[x1, y1, x2, y2], ...] in 0..1) instead of every line in the photo."""
+    if mode not in ("Level", "Vertical", "Auto", "Full", "Guided"):
         return None
     h, w = rgb.shape[:2]
-    seg, ln = _segments(rgb)
+    if mode == "Guided":
+        if not guides:
+            return None
+        seg = np.array([[g[0] * w, g[1] * h, g[2] * w, g[3] * h] for g in guides], float)
+        ln = np.hypot(seg[:, 2] - seg[:, 0], seg[:, 3] - seg[:, 1])
+    else:
+        seg, ln = seg_cache if seg_cache is not None else _segments(rgb)
     if len(seg) == 0:
         return None
+    need = 2 if mode == "Guided" else 3
     dx, dy = seg[:, 2] - seg[:, 0], seg[:, 3] - seg[:, 1]
     ang = np.degrees(np.arctan2(dy, dx)) % 180.0
-    vert = np.abs(ang - 90.0) <= 25.0
+    # Real verticals lean at most ~15° even on a wide lens tilted up; beyond that it's usually
+    # a diagonal (roof trusses, stairs) that would twist the correction.
+    vert = np.abs(ang - 90.0) <= 15.0
     horz = (ang <= 15.0) | (ang >= 165.0)
     cx, cy, sc = w / 2.0, h / 2.0, max(w, h) / 2.0
     C = np.array([[1 / sc, 0, -cx / sc], [0, 1 / sc, -cy / sc], [0, 0, 1]])   # pixels -> centred units
@@ -1429,7 +1456,7 @@ def upright_matrix(rgb: np.ndarray, mode: str):
         return np.array([[math.cos(a), -math.sin(a), 0], [math.sin(a), math.cos(a), 0], [0, 0, 1]])
 
     def vertical_fix(strength):
-        if vert.sum() < 3:
+        if vert.sum() < need:
             return np.eye(3)
         V = _vanishing_point(seg[vert], ln[vert], cx, cy, sc)
         if abs(V[2]) < 1e-9 * (abs(V[0]) + abs(V[1])):
@@ -1453,7 +1480,7 @@ def upright_matrix(rgb: np.ndarray, mode: str):
         return P @ R
 
     def horizontal_fix(H0):
-        if horz.sum() < 3:
+        if horz.sum() < need:
             return np.eye(3)
         hs = seg[horz].copy()
         for k in (0, 2):                                   # horizontal segments after the vertical fix
@@ -1475,7 +1502,7 @@ def upright_matrix(rgb: np.ndarray, mode: str):
         Hc = vertical_fix(0.6)
         if np.allclose(Hc, np.eye(3)):
             Hc = level_rotation()
-    elif mode == "Full":
+    elif mode in ("Full", "Guided"):
         Hc = vertical_fix(1.0)
         Hc = horizontal_fix(Hc) @ Hc
     # Negligible correction (measurement noise on a photo that's already straight): no warp.
@@ -1493,6 +1520,146 @@ def upright_matrix(rgb: np.ndarray, mode: str):
     k = min(w / (x1 - x0), h / (y1 - y0))
     T = np.array([[k, 0, (w - k * (x1 + x0)) / 2], [0, k, (h - k * (y1 + y0)) / 2], [0, 0, 1]])
     return T @ H
+
+
+def suggest_guides(rgb: np.ndarray, kinds: str = "v", exclude=()) -> list:
+    """
+    Guide lines for Guided Upright, picked like you would: the longest clear verticals, one on
+    each side of the photo when possible (and with "vh" two horizontals, one high and one low).
+    Lightroom allows four guides. `exclude` = guides you rejected; lines along them are skipped.
+    Returns [[x1, y1, x2, y2], ...] in 0..1 of the image.
+    """
+    h, w = rgb.shape[:2]
+    seg, ln = _segments(rgb)
+    if len(seg) == 0:
+        return []
+    n = np.c_[seg[:, 0] / w, seg[:, 1] / h, seg[:, 2] / w, seg[:, 3] / h]
+    ang = np.degrees(np.arctan2(seg[:, 3] - seg[:, 1], seg[:, 2] - seg[:, 0])) % 180.0
+
+    def near(a, b):                                   # same line? (angle and position)
+        da = abs(math.degrees(math.atan2(a[3] - a[1], a[2] - a[0]) - math.atan2(b[3] - b[1], b[2] - b[0])))
+        da = min(da % 180, 180 - da % 180)
+        ma, mb = ((a[0] + a[2]) / 2, (a[1] + a[3]) / 2), ((b[0] + b[2]) / 2, (b[1] + b[3]) / 2)
+        # distance of b's midpoint from a's line
+        dx, dy = a[2] - a[0], a[3] - a[1]
+        d = abs(dy * (mb[0] - a[0]) - dx * (mb[1] - a[1])) / (math.hypot(dx, dy) + 1e-9)
+        return da < 4 and d < 0.03
+
+    def pick(mask, axis, count):
+        idx = [i for i in np.argsort(-ln) if mask[i] and not any(near(n[i], x) for x in exclude)]
+        chosen = []
+        halves = [lambda c: c < 0.5, lambda c: c >= 0.5]
+        for half in halves:                            # best line in each half first
+            for i in idx:
+                c = (n[i][axis] + n[i][axis + 2]) / 2
+                if half(c) and not any(near(n[i], n[j]) for j in chosen):
+                    chosen.append(i)
+                    break
+        for i in idx:                                  # then the next longest, if still short
+            if len(chosen) >= count:
+                break
+            if i not in chosen and not any(near(n[i], n[j]) for j in chosen):
+                chosen.append(i)
+        return chosen[:count]
+
+    cx, cy, sc = w / 2.0, h / 2.0, max(w, h) / 2.0
+
+    def consistent(mask):
+        """Lines in `mask` that agree on one vanishing point (a stray diagonal disagrees), and that point."""
+        idx = np.where(mask)[0]
+        if len(idx) < 2:
+            return mask & False, None
+        V = _vanishing_point(seg[idx], ln[idx] ** 2, cx, cy, sc)
+        keep = np.zeros(len(seg), bool)
+        for i in idx:
+            mx, my = ((seg[i, 0] + seg[i, 2]) / 2 - cx) / sc, ((seg[i, 1] + seg[i, 3]) / 2 - cy) / sc
+            if abs(V[2]) > 1e-9:
+                tx, ty = V[0] / V[2] - mx, V[1] / V[2] - my
+            else:
+                tx, ty = V[0], V[1]
+            dx, dy = seg[i, 2] - seg[i, 0], seg[i, 3] - seg[i, 1]
+            c = abs(tx * dx + ty * dy) / (math.hypot(tx, ty) * math.hypot(dx, dy) + 1e-12)
+            keep[i] = math.degrees(math.acos(min(1.0, c))) < 1.0
+        return keep, V
+
+    out = []
+    vmask, _V = consistent((np.abs(ang - 90) <= 12) & (ln >= 0.12 * h))
+    out += pick(vmask, 0, 2 if "h" in kinds else 3)
+    if "h" in kinds:
+        hmask, Vh = consistent(((ang <= 8) | (ang >= 172)) & (ln >= 0.12 * w))
+        hp = pick(hmask, 1, 2)
+        # only real "facade" horizontals: their vanishing point must be far away (a gentle correction);
+        # edges receding into the distance (shelves down an aisle) would twist the photo instead
+        if len(hp) == 2 and (Vh is None or abs(Vh[2]) < 1e-9 or abs(Vh[0] / Vh[2]) > 3.0):
+            out += hp
+    return [[round(float(v), 6) for v in n[i]] for i in out][:4]
+
+
+def upright_all(rgb: np.ndarray, guides=None) -> dict:
+    """Every Upright mode's correction for this photo (0..1 units, 9 numbers each, None = nothing to fix)."""
+    h, w = rgb.shape[:2]
+    N = np.array([[w, 0, 0], [0, h, 0], [0, 0, 1]], float)
+    seg = _segments(rgb)
+    out = {}
+    for mode in ("Auto", "Full", "Level", "Vertical", "Guided"):
+        H = upright_matrix(rgb, mode, guides, seg_cache=seg)
+        out[mode] = None if H is None else [float(v) for v in (np.linalg.inv(N) @ H @ N).ravel()]
+    return out
+
+
+def constrained_box(Hn, w: int, h: int, margin: float = 0.004):
+    """
+    Lightroom's Constrain Crop: the largest crop at the photo's aspect ratio that has photo
+    everywhere (no empty corners) after the Upright warp `Hn` (0..1 units, 9 numbers or 3x3).
+    Returns [l, t, r, b] in 0..1, or None when no crop is needed.
+    """
+    if Hn is None:
+        return None
+    Hn = np.asarray(Hn, float).reshape(3, 3)
+    q = Hn @ np.array([[0, 1, 1, 0], [0, 0, 1, 1], [1, 1, 1, 1]], float)
+    quad = np.c_[q[0] / q[2] * w, q[1] / q[2] * h]          # the warped photo's corners, in pixels
+    e1, e2 = quad[1] - quad[0], quad[2] - quad[1]
+    sign = np.sign(e1[0] * e2[1] - e1[1] * e2[0])          # winding of the warped corners
+
+    def inside(pts):
+        for k in range(4):
+            a, b = quad[k], quad[(k + 1) % 4]
+            if np.any(sign * ((b[0] - a[0]) * (pts[:, 1] - a[1]) - (b[1] - a[1]) * (pts[:, 0] - a[0])) < -1e-9):
+                return False
+        return True
+
+    best = None
+    for fy in np.linspace(0.3, 0.7, 9):
+        for fx in np.linspace(0.3, 0.7, 9):
+            cx, cy = fx * w, fy * h
+            lo, hi = 0.0, 1.0
+            for _ in range(22):
+                s = (lo + hi) / 2
+                hw_, hh_ = s * w / 2, s * h / 2
+                pts = np.array([[cx - hw_, cy - hh_], [cx + hw_, cy - hh_], [cx + hw_, cy + hh_], [cx - hw_, cy + hh_]])
+                lo, hi = (s, hi) if inside(pts) else (lo, s)
+            score = (round(lo, 4), -abs(fx - 0.5) - abs(fy - 0.5))   # biggest, then most central
+            if best is None or score > best[0]:
+                best = (score, cx, cy, lo)
+    _sc, cx, cy, s = best
+    if s >= 0.999:
+        return None
+    s *= 1 - margin
+    hw_, hh_ = s / 2, s / 2
+    return [round(float(cx / w - hw_), 5), round(float(cy / h - hh_), 5),
+            round(float(cx / w + hw_), 5), round(float(cy / h + hh_), 5)]
+
+
+def shown_to_recorded(flip: int):
+    """3x3 map from 0..1 coordinates of the photo as shown to the photo as the camera recorded it
+    (before turning portrait shots upright). Lightroom's crop and Upright use the recorded frame."""
+    if flip == 6:      # shown = recorded turned 90° clockwise: u = 1 - t, v = s  ->  s = v, t = 1 - u
+        return np.array([[0, 1, 0], [-1, 0, 1], [0, 0, 1]], float)
+    if flip == 5:      # 90° counter-clockwise: u = t, v = 1 - s  ->  s = 1 - v, t = u
+        return np.array([[0, -1, 1], [1, 0, 0], [0, 0, 1]], float)
+    if flip == 3:      # 180°
+        return np.array([[-1, 0, 1], [0, -1, 1], [0, 0, 1]], float)
+    return np.eye(3)
 
 
 def upright_for(dec, mode: str, rgb: np.ndarray):
@@ -1703,6 +1870,67 @@ def crs_values(edit: Edit):
     return v, remove
 
 
+def _turn_crop(vals: dict, flip: int) -> dict:
+    """Lightroom keeps the crop on the photo as recorded (before a portrait shot is turned upright)."""
+    if not flip or "CropLeft" not in vals:
+        return vals
+    F = shown_to_recorded(flip)
+    pts = np.array([[float(vals["CropLeft"]), float(vals["CropTop"]), 1.0],
+                    [float(vals["CropRight"]), float(vals["CropBottom"]), 1.0]]).T
+    q = F @ pts
+    out = dict(vals)
+    out.update({"CropLeft": f"{q[0].min():.6f}", "CropTop": f"{q[1].min():.6f}",
+                "CropRight": f"{q[0].max():.6f}", "CropBottom": f"{q[1].max():.6f}"})
+    return out
+
+
+UPRIGHT_ORDER = ["Off", "Auto", "Full", "Level", "Vertical", "Guided"]     # UprightTransform_0 .. _5
+UPRIGHT_VERSION = "151388160"
+_UPRIGHT_KEYS = ([f"UprightTransform_{i}" for i in range(6)] + ["UprightTransformCount", "UprightVersion",
+                 "UprightFourSegmentsCount", "UprightGuidedDependentDigest", "CropConstrainToWarp"]
+                 + [f"UprightFourSegments_{i}" for i in range(4)])
+
+
+def _write_upright(desc, edit: Edit, flip: int = 0):
+    """
+    Give Lightroom the Upright correction RAW Review solved, so it shows exactly the preview:
+    UprightTransform_0.._5 (one per mode, row-major forward matrix in 0..1 of the recorded photo;
+    Camera Raw renders the stored matrix), Guided's guides as UprightFourSegments_n "x1,y1,x2,y2",
+    and Constrain Crop. Field formats as documented by the RAWmakase project from Camera Raw 18.7.
+    """
+    marker = _q("rrv", "UprightByRawReview")
+    mats = edit.upright_matrices
+    if edit.upright != "Off" and mats:
+        F = shown_to_recorded(flip)
+        Fi = np.linalg.inv(F)
+        for i, mode in enumerate(UPRIGHT_ORDER):
+            m = mats.get(mode) if mode != "Off" else None
+            M = np.eye(3) if m is None else np.asarray(m, float).reshape(3, 3)
+            R = F @ M @ Fi
+            R = R / R[2, 2]
+            _set(desc, _q("crs", f"UprightTransform_{i}"), ",".join(f"{v:.9f}" for v in R.ravel()))
+        _set(desc, _q("crs", "UprightTransformCount"), "6")
+        _set(desc, _q("crs", "UprightVersion"), UPRIGHT_VERSION)
+        for i in range(4):
+            _remove(desc, _q("crs", f"UprightFourSegments_{i}"))
+        _remove(desc, _q("crs", "UprightGuidedDependentDigest"))   # Lightroom's record of other guides
+        guides = edit.upright_guides if edit.upright == "Guided" else None
+        if guides:
+            _set(desc, _q("crs", "UprightFourSegmentsCount"), str(len(guides[:4])))
+            for i, g in enumerate(guides[:4]):
+                q = F @ np.array([[g[0], g[2]], [g[1], g[3]], [1.0, 1.0]])
+                _set(desc, _q("crs", f"UprightFourSegments_{i}"),
+                     ",".join(f"{v:.9f}" for v in (q[0, 0], q[1, 0], q[0, 1], q[1, 1])))
+        else:
+            _remove(desc, _q("crs", "UprightFourSegmentsCount"))
+        _set(desc, _q("crs", "CropConstrainToWarp"), "1" if edit.constrain_crop else "0")
+        desc.set(marker, "True")
+    elif desc.get(marker) is not None:              # we wrote these before; Upright is off now
+        for k in _UPRIGHT_KEYS:
+            _remove(desc, _q("crs", k))
+        desc.attrib.pop(marker, None)
+
+
 def _crop_values(edit: Edit, src_w: float, src_h: float):
     """Lightroom crop: the straighten crop, narrowed to the subject crop box when one is set."""
     k = crop_factor(src_w, src_h, edit.angle)
@@ -1850,7 +2078,7 @@ def _write_meta(desc, meta):
             _remove(desc, _q("xmp", "Label"))
 
 
-def _write_sidecar(raw_path: str, edit: Edit, src_size=(3, 2), meta=None) -> str:
+def _write_sidecar(raw_path: str, edit: Edit, src_size=(3, 2), meta=None, flip: int = 0) -> str:
     """
     Write/update the Lightroom sidecar for raw_path. The RAW itself is never
     opened for writing; its size and timestamp are verified unchanged.
@@ -1912,7 +2140,7 @@ def _write_sidecar(raw_path: str, edit: Edit, src_size=(3, 2), meta=None) -> str
     if keep_lr_crop:
         pass                                  # the crop you made in Lightroom stays as it is
     elif abs(edit.angle) >= 0.01 or edit.crop_box:
-        for k, val in _crop_values(edit, *src_size).items():
+        for k, val in _turn_crop(_crop_values(edit, *src_size), flip).items():
             _set(desc, _q("crs", k), val)
         desc.set(marker, "True")
         if edit.crop_box:
@@ -1926,6 +2154,8 @@ def _write_sidecar(raw_path: str, edit: Edit, src_size=(3, 2), meta=None) -> str
                        "CropTop": "0", "CropRight": "1", "CropBottom": "1"}.items():
             _set(desc, _q("crs", k), val)
         desc.attrib.pop(marker, None)
+
+    _write_upright(desc, edit, flip)
 
     data = ET.tostring(tree.getroot(), encoding="unicode")
     folder = os.path.dirname(os.path.abspath(target))
@@ -2006,7 +2236,8 @@ def _embed_xmp_in_tiff(data: bytes, xmp: bytes) -> bytes:
     return bytes(out)
 
 
-def _write_dng(dng_path: str, edit: Edit, src_size=(3, 2), out_dir: str | None = None, meta=None) -> str:
+def _write_dng(dng_path: str, edit: Edit, src_size=(3, 2), out_dir: str | None = None, meta=None,
+               flip: int = 0) -> str:
     """
     Export an edited COPY of the DNG for Lightroom: <out_dir>/<name>.dng, with the develop
     settings embedded in its XMP packet. The source DNG is only read, never changed, and
@@ -2046,7 +2277,7 @@ def _write_dng(dng_path: str, edit: Edit, src_size=(3, 2), out_dir: str | None =
         if existing:
             with open(side, "wb") as f:
                 f.write(existing)
-        _write_sidecar(fake, edit, src_size, meta)
+        _write_sidecar(fake, edit, src_size, meta, flip)
         with open(side, "rb") as f:
             body = f.read().decode("utf-8")
     packet = ('<?xpacket begin="\ufeff" id="W5M0MpCehiHzreSzNTczkc9d"?>\n' + body
@@ -2086,11 +2317,13 @@ def _write_dng(dng_path: str, edit: Edit, src_size=(3, 2), out_dir: str | None =
     return f"Exported {stem}.dng to {out_dir} (import this folder into Lightroom)"
 
 
-def write_xmp(raw_path: str, edit: Edit, src_size=(3, 2), out_dir: str | None = None, meta=None) -> str:
-    """Write the Lightroom settings: a .xmp sidecar for RAW files, an exported edited .dng copy for DNG."""
+def write_xmp(raw_path: str, edit: Edit, src_size=(3, 2), out_dir: str | None = None, meta=None,
+              flip: int = 0) -> str:
+    """Write the Lightroom settings: a .xmp sidecar for RAW files, an exported edited .dng copy for DNG.
+    flip = the photo's orientation (Decoded.flip): Lightroom's crop and Upright are on the recorded frame."""
     if os.path.splitext(raw_path)[1].lower() == ".dng":
-        return _write_dng(raw_path, edit, src_size, out_dir, meta)
-    return _write_sidecar(raw_path, edit, src_size, meta)
+        return _write_dng(raw_path, edit, src_size, out_dir, meta, flip)
+    return _write_sidecar(raw_path, edit, src_size, meta, flip)
 
 
 def is_raw(path: str) -> bool:

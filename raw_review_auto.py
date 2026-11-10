@@ -287,22 +287,50 @@ def apply_level_mode(dec, edit, mode: str, allow_upright: bool = True):
     if kind == "manual":
         return None
     edit.level_mode = mode
+    was_upright = edit.upright != "Off"
+    edit.upright_matrices, edit.upright_guides = None, None
+    if was_upright and edit.constrain_crop:
+        edit.crop_box = None                        # that crop was for the old correction
     if kind == "off":
         edit.angle, edit.upright = 0.0, "Off"
         replace_note(edit, "Straighten", "Straighten: off")
         return None
+    plain = edit.copy()
+    plain.upright, plain.crop_box = "Off", None
+    img, _ = core.render(dec, plain, rotate=False, look=False)
     if kind == "upright":
         edit.angle, edit.upright = 0.0, spec["upright"]
-        replace_note(edit, "Straighten",
-                     f"Straighten: Lightroom Upright {spec['upright']} (Lightroom computes the correction)")
+        if spec.get("guides"):
+            edit.upright_guides = core.suggest_guides(img, spec["guides"])
+        note = solve_upright(edit, img)
+        replace_note(edit, "Straighten", note)
         return None
-    img, _ = core.render(dec, edit, rotate=False, look=False)
     st = core.auto_straighten(img, allow_upright, spec["source"])
     edit.angle, edit.upright = st.angle, st.upright
     if st.upright != "Off":                         # best guess chose Upright Vertical
         edit.level_mode = "Upright: " + st.upright
+        solve_upright(edit, img)
     replace_note(edit, "Straighten", st.note)
     return st
+
+
+def solve_upright(edit, img) -> str:
+    """Solve every Upright mode on the (unwarped) photo, keep them on the edit, and constrain the crop."""
+    edit.upright_matrices = core.upright_all(img, edit.upright_guides)
+    H = edit.upright_matrices.get(edit.upright)
+    h, w = img.shape[:2]
+    if edit.constrain_crop:
+        edit.crop_box = core.constrained_box(H, w, h)
+    name = f"Upright {edit.upright}"
+    if edit.upright == "Guided":
+        n = len(edit.upright_guides or [])
+        if n < 2:
+            return f"Straighten: {name} – not enough clear lines to use as guides"
+        name += f" ({n} guides suggested)"
+    if H is None:
+        return f"Straighten: {name} – nothing to correct"
+    return f"Straighten: {name} (RAW Review's correction; Lightroom shows the same)" + (
+        ", crop constrained" if edit.crop_box and edit.constrain_crop else "")
 
 
 def apply_subject_crop(dec, edit) -> str:

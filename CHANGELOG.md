@@ -1,5 +1,24 @@
 # Changelog
 
+## v1.9.7
+
+- **Guided Upright with suggested guides:** Straighten mode → *Upright: Guided (verticals)* or *(verticals +
+  horizontals)*. RAW Review picks the guide lines for you: the clearest true verticals (lines that agree on where
+  the verticals converge, so roof trusses and other diagonals are skipped), plus level horizontals when they'd give
+  a gentle correction (edges receding down an aisle are skipped). The guides are drawn on the photo (blue vertical,
+  pink horizontal); click one to swap it for the next best line. Up to four guides, like Lightroom.
+- **Lightroom shows exactly the preview:** RAW Review now writes the Upright correction it solved for every mode
+  (`UprightTransform_0`–`_5`, which Camera Raw renders as stored) and Guided's guides (`UprightFourSegments_n`), so
+  Lightroom shows the same correction as the preview instead of its own estimate. Switching Upright off removes
+  what RAW Review wrote. Clicking an Upright button in Lightroom still re-analyses there.
+- **Constrain crop:** on by default (Geometry). After an Upright correction the largest crop at the photo's own shape
+  with no empty corners is applied and written (with `CropConstrainToWarp`), like Lightroom's checkbox.
+- **Better Upright Vertical:** diagonals up to 25° off vertical (roof trusses) could twist the correction; only lines
+  within 15° count now.
+- **Fixed: crops on portrait photos.** Lightroom keeps crops on the photo as the camera recorded it (before turning a
+  vertical shot upright); RAW Review wrote them on the photo as shown, so on portrait shots a crop or straighten
+  crop could land in the wrong place in Lightroom. Crops, Upright corrections and guides are now turned correctly.
+
 ## v1.9.6
 
 - **Upright shows in the preview:** Upright Level, Vertical, Auto and Full used to be written to Lightroom but not

@@ -16,6 +16,7 @@ from __future__ import annotations
 import base64
 import copy
 import json
+import math
 from collections import deque
 import os
 import sys
@@ -47,6 +48,7 @@ HELP_HTML = """
 <tr><td><b>G</b></td><td>Grid view on / off (double-click or Enter opens a photo)</td></tr>
 <tr><td><b>1-5</b>, <b>0</b></td><td>Star rating, clear rating</td></tr>
 <tr><td><b>6 7 8 9</b></td><td>Red / yellow / green / blue label (press again to clear). Right-click for Purple or to label several photos; labelled photos get a coloured band. <i>Check ▾ → By colour label</i> and <i>Batch edit → Colour label</i> work on photos by colour</td></tr>
+<tr><td><i>Upright</i></td><td>Straighten mode → Upright Level / Vertical / Auto / Full / Guided. Guided suggests guide lines (blue = vertical, pink = horizontal); click one to swap it. Lightroom gets the same correction. <i>Constrain crop</i> removes the empty corners</td></tr>
 <tr><td><b>R</b></td><td>Crop by hand: drag the corners or the frame, pick an aspect ratio in Geometry; Enter = done, Esc = cancel</td></tr>
 <tr><td><b>J</b></td><td>Show clipping: blown highlights red, pure black blue (the histogram's triangles light up when it happens)</td></tr>
 <tr><td><b>E</b> / <b>W</b></td><td>Auto-enhance (uses <i>My auto settings</i>) / auto white balance</td></tr>
@@ -116,6 +118,8 @@ class Item:
         self.wb: core.WBResult | None = None
         self.color: core.CameraColor | None = None
         self.src_size = (3, 2)
+        self.flip = 0                 # orientation (Lightroom's crop / Upright use the recorded frame)
+        self.guide_rejects = []       # Guided Upright: guides you clicked away
         self.error = ""
         self.list_item: QtWidgets.QListWidgetItem | None = None
         self.grid_item: QtWidgets.QListWidgetItem | None = None
@@ -253,6 +257,7 @@ class ImageView(QtWidgets.QWidget):
         self.setMinimumSize(420, 300)
         self.img: QtGui.QImage | None = None
         self.overlay = []                # (x, y, QColor) in displayed-image coords
+        self.lines = []                  # (x1, y1, x2, y2, QColor) in displayed-image coords (Upright guides)
         self.message = "Drag RAW photos or folders here"
         self.badge = ""
         self.crosshair = False
@@ -291,6 +296,17 @@ class ImageView(QtWidgets.QWidget):
             for x, y, col in self.overlay:
                 p.setPen(QtGui.QPen(col, 1.5))
                 p.drawEllipse(QtCore.QPointF(r.x() + x * s, r.y() + y * s), 3, 3)
+            for x1, y1, x2, y2, col in self.lines:
+                a = QtCore.QPointF(r.x() + x1 * s, r.y() + y1 * s)
+                b = QtCore.QPointF(r.x() + x2 * s, r.y() + y2 * s)
+                p.setPen(QtGui.QPen(QtGui.QColor(0, 0, 0, 160), 4))
+                p.drawLine(a, b)
+                p.setPen(QtGui.QPen(col, 2))
+                p.drawLine(a, b)
+                p.setBrush(col)
+                for pt in (a, b):
+                    p.drawEllipse(pt, 4, 4)
+                p.setBrush(Qt.BrushStyle.NoBrush)
             if self.crop_mode:
                 self._paint_crop(p, r)
             if self.split_on and not self.crop_mode:
@@ -1954,6 +1970,10 @@ class MainWindow(QtWidgets.QMainWindow):
         row2.addWidget(QtWidgets.QLabel("Straighten mode"))
         self.level_combo = QtWidgets.QComboBox()
         self.level_combo.addItems(list(core.LEVEL_MODES.keys()))
+        self.level_combo.setSizeAdjustPolicy(
+            QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.level_combo.setMinimumContentsLength(12)     # long mode names must not widen the panel
+        self.level_combo.view().setMinimumWidth(320)
         self.level_combo.setToolTip(
             "Horizon / Verticals (rotate): measured here, written as a crop angle.\n"
             "Upright: Level / Vertical / Auto / Full: Lightroom's own Upright; Lightroom computes it\n"
@@ -1982,6 +2002,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_crop_reset.clicked.connect(self.reset_crop)
         crow.addWidget(self.btn_crop_reset)
         gl.addLayout(crow)
+        self.chk_constrain = QtWidgets.QCheckBox("Constrain crop (no empty corners after Upright)")
+        self.chk_constrain.setChecked(True)
+        self.chk_constrain.setToolTip("Like Lightroom's Constrain Crop: crop away the empty corners an Upright\n"
+                                      "correction leaves (largest crop at the photo's shape)")
+        self.chk_constrain.toggled.connect(self.on_constrain)
+        gl.addWidget(self.chk_constrain)
         self.chk_subject_crop = QtWidgets.QCheckBox("Crop to centre the subject")
         self.chk_subject_crop.setToolTip("Minimal crop (same aspect ratio) that puts the main subject - a plane,\n"
                                          "a car - in the middle of the frame. Untick to remove the crop.")
@@ -2107,7 +2133,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _set_controls_enabled(self, on):
         widgets = [self.wb_combo, self.btn_auto_wb, self.btn_eyedrop, self.level_combo, self.btn_level,
-                   self.chk_lens, self.chk_subject_crop, self.btn_crop, self.btn_crop_reset,
+                   self.chk_lens, self.chk_subject_crop, self.chk_constrain, self.btn_crop, self.btn_crop_reset,
                    self.crop_aspect_combo, self.btn_enhance, self.btn_reset_auto, self.btn_reset_shot,
                    self.btn_copy, self.btn_paste, self.btn_approve, self.btn_reject]
         mask_keys = set(core.MASK_KEYS["sky"]) | set(core.MASK_KEYS["subject"])
@@ -2269,6 +2295,7 @@ class MainWindow(QtWidgets.QMainWindow):
         dec = res["dec"]
         self._cache_put(path, dec)
         it.color, it.src_size = dec.color, (dec.cam.shape[1], dec.cam.shape[0])
+        it.flip = dec.flip
         if "edit" in res:
             it.edit, it.auto_edit, it.wb = res["edit"], res.get("auto_edit", res["edit"]).copy(), res["wb"]
             if res.get("cull") is not None:
@@ -2731,6 +2758,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.level_combo.setCurrentText(e.level_mode if e.level_mode in core.LEVEL_MODES else "Manual")
         self.chk_lens.setChecked(e.lens_profile)
         self.chk_subject_crop.setChecked(bool(e.crop_box))
+        self.chk_constrain.setChecked(e.constrain_crop)
         self.box_sky.setChecked(e.sky_on)
         self.box_subj.setChecked(e.subj_on)
         self._loading_controls = False
@@ -2869,9 +2897,17 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.view.crop_mode:
             badge = "Crop: drag the corners or the frame · Enter = done · Esc = cancel"
         if not before and it.edit.upright != "Off":
-            badge = (f"Upright {it.edit.upright}: approximate preview – Lightroom computes the exact correction"
-                     if self.geom.H is not None else
-                     f"Upright {it.edit.upright}: no clear lines found to preview – Lightroom will still apply it")
+            if it.edit.upright == "Guided":
+                n = len(it.edit.upright_guides or [])
+                badge = (f"Upright Guided: {n} suggested guides (blue = vertical, pink = horizontal) · "
+                         "click a guide to swap it for the next best line" if n >= 2 else
+                         "Upright Guided: not enough clear lines for guides")
+            elif self.geom.H is None:
+                badge = f"Upright {it.edit.upright}: nothing to correct here"
+            elif it.edit.upright_matrices:
+                badge = f"Upright {it.edit.upright}: Lightroom will show this same correction"
+            else:
+                badge = f"Upright {it.edit.upright}: approximate preview – Lightroom computes its own"
         elif not before and not self.view.crop_mode and (it.edit.sky_on or it.edit.subj_on):
             on = " + ".join(n for n, f in (("Sky", it.edit.sky_on), ("Subject", it.edit.subj_on)) if f)
             badge = f"{on} mask: approximate preview – Lightroom computes the exact mask"
@@ -2885,6 +2921,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._split_cache = None
             if self.chk_clip.isChecked():
                 img = core.clip_overlay(img)
+        self.view.lines = [] if (before or split) else self._guide_lines(it, dec)
         self.view.set_image(to_qimage(img), overlay, badge)
         self.view.set_message("Click a neutral spot…" if self.btn_eyedrop.isChecked() else "")
 
@@ -2929,6 +2966,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if mode == "Manual":
             return
         self._record_undo(it, it.edit.copy())
+        it.guide_rejects = []
         auto.apply_level_mode(dec, it.edit, mode, self.opts.allow_upright)
         self._remember_auto(it, {"angle": it.edit.angle})
         self._mark_changed(it)
@@ -2952,6 +2990,72 @@ class MainWindow(QtWidgets.QMainWindow):
         self._mark_changed(it)
         self.load_controls()
         self.refresh_view()
+
+    # ---------------- Upright: constrain crop, guides ----------------
+    def _plain_render(self, it, dec):
+        """The photo with no Upright and no crop (what Upright is solved on)."""
+        plain = it.edit.copy()
+        plain.upright, plain.crop_box, plain.upright_matrices = "Off", None, None
+        return core.render(dec, plain, rotate=False, look=False)[0]
+
+    def on_constrain(self, on):
+        if self._loading_controls:
+            return
+        it, dec = self._current_dec()
+        if dec is None:
+            return
+        self._record_undo(it, it.edit.copy())
+        e = it.edit
+        e.constrain_crop = on
+        if e.upright != "Off" and e.upright_matrices:
+            h, w = dec.cam.shape[:2]
+            e.crop_box = core.constrained_box(e.upright_matrices.get(e.upright), w, h) if on else None
+        self._mark_changed(it)
+        self.load_controls()
+        self.refresh_view()
+
+    def _guide_lines(self, it, dec):
+        """Guided Upright's guides in displayed-image coordinates (blue vertical, pink horizontal)."""
+        e = it.edit
+        if e.upright != "Guided" or not e.upright_guides:
+            return []
+        h, w = dec.cam.shape[:2]
+        out = []
+        for g in e.upright_guides:
+            x1, y1 = self.geom.to_display(g[0] * w, g[1] * h)
+            x2, y2 = self.geom.to_display(g[2] * w, g[3] * h)
+            vertical = abs(g[3] - g[1]) * h > abs(g[2] - g[0]) * w
+            out.append((x1, y1, x2, y2, QtGui.QColor(80, 190, 255) if vertical else QtGui.QColor(255, 110, 200)))
+        return out
+
+    def _click_guide(self, x, y) -> bool:
+        """Clicking a suggested guide swaps it for the next best line of the same kind."""
+        it, dec = self._current_dec()
+        if dec is None or it.edit.upright != "Guided" or not self.view.lines:
+            return False
+        best, bd = None, 12.0 / max(self.view._target()[1], 1e-6)       # ~12 screen pixels
+        for i, (x1, y1, x2, y2, _c) in enumerate(self.view.lines):
+            dx, dy = x2 - x1, y2 - y1
+            t = min(max(((x - x1) * dx + (y - y1) * dy) / max(dx * dx + dy * dy, 1e-9), 0), 1)
+            d = math.hypot(x - (x1 + t * dx), y - (y1 + t * dy))
+            if d < bd:
+                best, bd = i, d
+        if best is None:
+            return False
+        kinds = core.LEVEL_MODES.get(it.edit.level_mode, {}).get("guides", "v")
+        self._record_undo(it, it.edit.copy())
+        it.guide_rejects.append(it.edit.upright_guides[best])
+        img = self._plain_render(it, dec)
+        it.edit.upright_guides = core.suggest_guides(img, kinds, exclude=it.guide_rejects)
+        note = auto.solve_upright(it.edit, img)
+        auto.replace_note(it.edit, "Straighten", note)
+        self._mark_changed(it)
+        self.load_controls()
+        self.refresh_view()
+        n = len(it.edit.upright_guides or [])
+        self.statusBar().showMessage(f"Guide swapped for the next best line ({n} guides)." if n >= 2 else
+                                     "No more clear lines to use – re-run the mode to start over.", 5000)
+        return True
 
     # ---------------- hand crop ----------------
     def _crop_aspect_value(self, img_w, img_h):
@@ -3040,6 +3144,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def on_image_click(self, x, y):
         it = self.current
+        if not self.btn_eyedrop.isChecked() and self._click_guide(x, y):
+            return
         if not self.btn_eyedrop.isChecked() or it is None or it.edit is None:
             return
         dec = self._dec(it)
@@ -3836,7 +3942,7 @@ class MainWindow(QtWidgets.QMainWindow):
             snap = None
         try:
             msg = core.write_xmp(it.path, it.edit, it.src_size,
-                                 meta={"rating": it.rating, "label": it.label})
+                                 meta={"rating": it.rating, "label": it.label}, flip=it.flip)
             if snap is not None:
                 old = it.approve_undo
                 if old and old[0].get("copy") and os.path.isfile(old[0]["copy"]):
