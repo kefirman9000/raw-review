@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.8.4
+
+- **Auto levels no longer crushes the shadows:** on hazy or daylight scenes with no true black, Auto levels pulled
+  Blacks very far (e.g. -71 on a treeline), making shadows heavy and the photo look harsher and more contrasty than it
+  is. It now moves the black point only part of the way and never past -40.
+
 ## v1.8.3
 
 - **Auto exposure a touch darker:** photos were often coming out slightly overexposed. The histogram's middle is

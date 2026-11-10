@@ -60,6 +60,8 @@ SHARP_RATIO_SOFT = 1.6     # ... and of a very soft one
 NOISE_FLOOR = 0.005        # luminance noise below this needs no reduction
 # Histogram centring (see center_exposure): after the tone tools have run, exposure is nudged
 # until the finished photo's median brightness sits in the middle of the histogram.
+BLACKS_PULL = 0.6          # Auto levels moves the black point this share of the way to true black
+BLACKS_FLOOR = -40.0       # ...and never further than this
 TARGET_MEDIAN = 0.45       # median luminance of the finished photo (display units, 0..1); 0.50 read slightly bright
 CENTER_MAX_CLIPPED = 0.005 # Highlights is pulled down until no more than this share is blown
 # ---------------------------------------------------------------------------
@@ -174,7 +176,9 @@ def auto_levels(dec, edit, strength=1.0) -> str:
     full = (pw - pb) / 0.97
     lo = pb - 0.015 * full
     hi = lo + full
-    blacks = min(max(-lo / 0.15 * 100.0, -100.0), 15.0)
+    # Only partway, and never past BLACKS_FLOOR: a hazy or daylight scene has no true black,
+    # and forcing one crushed shadow detail (e.g. treelines went to -70 and beyond).
+    blacks = min(max(-lo / 0.15 * 100.0 * BLACKS_PULL, BLACKS_FLOOR), 15.0)
     whites = min(max((1.0 - hi) / 0.30 * 100.0, -60.0), 10.0)   # never push whites into clipping
     _set(edit, "blacks", _scaled(blacks, 0, strength))
     _set(edit, "whites", _scaled(whites, 0, strength))

@@ -107,3 +107,13 @@ def test_centring_crushes_highlights_instead_of_staying_dark():
     assert abs(float(np.median(L)) - auto.TARGET_MEDIAN) < 0.05
     assert e.highlights < 0
     assert float((L > 0.985).mean()) <= auto.CENTER_MAX_CLIPPED + 0.01
+
+
+def test_auto_levels_never_crushes_blacks_past_the_floor():
+    rng = np.random.default_rng(5)
+    cam = (0.03 + rng.uniform(0, 1, (120, 180, 3)) * 0.1).astype(np.float32)   # hazy: no true black
+    dec = core.Decoded(cam=cam, color=core.CameraColor(np.linalg.inv(core.XYZ_FROM_SRGB), [1, 1, 1]),
+                       baseline=1.0, source_size=(180, 120))
+    e = core.as_shot_edit(dec)
+    auto.auto_levels(dec, e)
+    assert auto.BLACKS_FLOOR <= e.blacks < 0
