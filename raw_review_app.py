@@ -22,6 +22,7 @@ import os
 import sys
 import time
 import traceback
+import types
 from collections import OrderedDict
 
 import numpy as np
@@ -1659,6 +1660,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.act_approve_checked.setEnabled(False)
         m_appr = menu_button("▾", "More ways to approve")
         m_appr.addAction("Approve All To-Review…", self.approve_all)
+        tb.addSeparator()
+        m_reset = menu_button("Reset ▾", "Reset the ticked photos: to the auto settings, As Shot (no edits),\n"
+                                         "or the settings they had in Lightroom")
+        m_reset.setToolTipsVisible(True)
+        m_reset.aboutToShow.connect(lambda m=m_reset: self._reset_menu(
+            m, self.checked_items, lambda n: f"{n} checked photo" + ("" if n == 1 else "s")))
         spacer = QtWidgets.QWidget()
         spacer.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Preferred)
         tb.addWidget(spacer)
@@ -3172,6 +3179,69 @@ class MainWindow(QtWidgets.QMainWindow):
         for k, v in values.items():
             setattr(it.auto_edit, k, v)
 
+    # ---------------- reset several photos ----------------
+    RESET_KINDS = {
+        "auto": ("auto settings", "the automatic edit RAW Review proposed"),
+        "shot": ("As Shot", "the camera's settings: no edits at all"),
+        "lr": ("Lightroom settings", "the settings the photo already had in Lightroom (photos without any are skipped)"),
+    }
+
+    def reset_photos(self, items, kind, ask=True):
+        """Reset these photos' edits to their auto proposal, As Shot, or their Lightroom settings.
+        Undo with Undo batch (all of them) or Ctrl+Z (one photo)."""
+        items = [it for it in items if it is not None and it.edit is not None]
+        if kind == "auto":
+            items = [it for it in items if it.auto_edit is not None]
+        elif kind == "shot":
+            items = [it for it in items if it.color is not None]
+        else:
+            items = [it for it in items if it.lr_edit is not None]
+        name, what = self.RESET_KINDS[kind]
+        if not items:
+            self.statusBar().showMessage(f"No photos to reset to {name}.", 5000)
+            return
+        if ask and len(items) > 1:
+            r = QtWidgets.QMessageBox.question(
+                self, "Reset photos",
+                f"Reset {len(items)} photos to {name}?\n\nThat's {what}. All other edits on them are "
+                "replaced. You can undo it with Auto ▾ → Undo batch.")
+            if r != QtWidgets.QMessageBox.StandardButton.Yes:
+                return
+        self._undo = {it.path: (it.edit.copy(), it.status, it.wb, it.edited) for it in items}
+        self.act_undo_batch.setEnabled(True)
+        for it in items:
+            self._record_undo(it, it.edit.copy())
+            if kind == "auto":
+                it.edit = it.auto_edit.copy()
+                it.edited = False
+            elif kind == "shot":
+                it.edit = core.as_shot_edit(types.SimpleNamespace(color=it.color))
+                it.edit.notes = ["Reset to As Shot"]
+            else:
+                it.edit = it.lr_edit.copy()
+            it.guide_rejects = []
+            self._mark_changed(it)
+            if kind == "auto":
+                it.edited = False
+            self._update_list_item(it)
+            self._update_grid_item(it)
+            self._queue_thumb(it)
+        self._update_count()
+        self.load_controls()
+        self.refresh_view()
+        self.statusBar().showMessage(f"Reset {len(items)} photo(s) to {name} (not yet approved). "
+                                     "Auto ▾ → Undo batch puts them back.", 8000)
+
+    def _reset_menu(self, menu, items_fn, label_fn):
+        """Fill `menu` with the three resets for the photos items_fn() returns."""
+        menu.clear()
+        n = len(items_fn())
+        for kind in ("auto", "shot", "lr"):
+            name = self.RESET_KINDS[kind][0]
+            a = menu.addAction(f"Reset {label_fn(n)} to {name}", lambda k=kind: self.reset_photos(items_fn(), k))
+            a.setEnabled(n > 0)
+            a.setToolTip(self.RESET_KINDS[kind][1])
+
     def reset_auto(self):
         it = self.current
         if it and it.auto_edit and it.edit is not None:
@@ -3297,6 +3367,9 @@ class MainWindow(QtWidgets.QMainWindow):
         menu.addAction(f"Remove subject crop from {n} photo{s}", self.remove_crop_selected)
         menu.addSeparator()
         sel = self.selected_items()
+        rm = menu.addMenu(f"Reset {n} photo{s}")
+        rm.setToolTipsVisible(True)
+        self._reset_menu(rm, lambda: list(sel), lambda k: f"{k} selected photo" + ("" if k == 1 else "s"))
         lm = menu.addMenu(f"Colour label for {n} photo{s}")
         for i, lab in enumerate(core.LABELS):
             a = lm.addAction(self._label_icon(lab), lab + (f"    ({'6789'[i]})" if i < 4 else ""),

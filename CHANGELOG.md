@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.9.8
+
+- **Reset several photos at once:** a *Reset ▾* menu in the toolbar resets every ticked photo to its **auto settings**,
+  to **As Shot** (no edits at all), or to the **settings it had in Lightroom**. It asks first when it's more than one
+  photo, and *Auto ▾ → Undo batch* puts them all back (Ctrl+Z still undoes one photo). Right-click → *Reset N photos*
+  does the same for the photos selected in the list.
+
 ## v1.9.7
 
 - **Guided Upright with suggested guides:** Straighten mode → *Upright: Guided (verticals)* or *(verticals +
