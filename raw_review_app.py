@@ -2869,7 +2869,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.view.crop_mode:
             badge = "Crop: drag the corners or the frame · Enter = done · Esc = cancel"
         if not before and it.edit.upright != "Off":
-            badge = f"Upright: {it.edit.upright} (applied by Lightroom, not shown here)"
+            badge = (f"Upright {it.edit.upright}: approximate preview – Lightroom computes the exact correction"
+                     if self.geom.H is not None else
+                     f"Upright {it.edit.upright}: no clear lines found to preview – Lightroom will still apply it")
         elif not before and not self.view.crop_mode and (it.edit.sky_on or it.edit.subj_on):
             on = " + ".join(n for n, f in (("Sky", it.edit.sky_on), ("Subject", it.edit.subj_on)) if f)
             badge = f"{on} mask: approximate preview – Lightroom computes the exact mask"

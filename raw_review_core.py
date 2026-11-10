@@ -66,8 +66,8 @@ UPRIGHT_MODES = {"Off": 0, "Auto": 1, "Full": 2, "Level": 3, "Vertical": 4, "Gui
 
 # Straighten / level modes offered in the app.
 #   "rotate" modes are measured by this app and written as a plain crop angle.
-#   "Upright" modes are written as Lightroom's Upright setting; Lightroom itself
-#   does the maths when it reads the sidecar (so they are not shown in the preview).
+#   "Upright" modes are written as Lightroom's Upright setting; Lightroom itself does the
+#   exact maths when it reads the sidecar. The preview shows an approximation (upright_matrix).
 LEVEL_MODES = {
     "Off":                  {"kind": "off"},
     "Auto (best guess)":    {"kind": "rotate", "source": "auto"},
@@ -645,8 +645,12 @@ class Geometry:
     M: np.ndarray | None = None   # 2x3 affine (working -> rotated); None = no rotation
     x0: int = 0
     y0: int = 0
+    H: np.ndarray | None = None   # 3x3 Upright warp in working pixels, applied first; None = none
 
     def to_display(self, x, y):
+        if self.H is not None:
+            v = self.H @ np.array([x, y, 1.0])
+            x, y = v[0] / v[2], v[1] / v[2]
         if self.M is not None:
             x, y = (self.M[0, 0] * x + self.M[0, 1] * y + self.M[0, 2],
                     self.M[1, 0] * x + self.M[1, 1] * y + self.M[1, 2])
@@ -654,11 +658,14 @@ class Geometry:
 
     def to_source(self, x, y):
         rx, ry = x + self.x0, y + self.y0
-        if self.M is None:
-            return rx, ry
-        inv = cv2.invertAffineTransform(self.M)
-        return (inv[0, 0] * rx + inv[0, 1] * ry + inv[0, 2],
-                inv[1, 0] * rx + inv[1, 1] * ry + inv[1, 2])
+        if self.M is not None:
+            inv = cv2.invertAffineTransform(self.M)
+            rx, ry = (inv[0, 0] * rx + inv[0, 1] * ry + inv[0, 2],
+                      inv[1, 0] * rx + inv[1, 1] * ry + inv[1, 2])
+        if self.H is not None:
+            v = np.linalg.inv(self.H) @ np.array([rx, ry, 1.0])
+            rx, ry = v[0] / v[2], v[1] / v[2]
+        return rx, ry
 
 
 def _box_pixels(w: int, h: int, box):
@@ -1094,6 +1101,9 @@ def half_decoded(dec: Decoded, edit: Edit | None = None) -> Decoded:
         half = Decoded(cam=cam, color=dec.color, baseline=dec.baseline, source_size=dec.source_size,
                        quality=dec.quality, masks={})
         dec.masks["_half"] = half
+    for k, v in dec.masks.items():
+        if k.startswith("_upright:") and k not in half.masks:
+            half.masks[k] = v
     hh, hw = half.cam.shape[:2]
     for key, on, fn in (("sky", edit is not None and edit.sky_on, estimate_sky),
                         ("subject", edit is not None and edit.subj_on, estimate_subject)):
@@ -1131,8 +1141,16 @@ def render(dec: Decoded, edit: Edit, original: bool = False, rotate: bool = True
                 g = g * (1 - m) + np.array(tint, dtype=np.float32) * m
 
     img = (np.clip(g, 0, 1) * 255 + 0.5).astype(np.uint8)
+    Hup = None
+    if rotate and not original and edit.upright != "Off":
+        Hup = upright_for(dec, edit.upright, img)
+        if Hup is not None:
+            img = cv2.warpPerspective(img, Hup, (img.shape[1], img.shape[0]), flags=cv2.INTER_LINEAR,
+                                      borderMode=cv2.BORDER_CONSTANT, borderValue=UPRIGHT_PREVIEW_FILL)
     if rotate and not original:
-        return rotate_and_crop(img, edit.angle, edit.crop_box)
+        out, geo = rotate_and_crop(img, edit.angle, edit.crop_box)
+        geo.H = Hup
+        return out, geo
     return np.ascontiguousarray(img), Geometry()
 
 
@@ -1332,6 +1350,166 @@ def wb_from_point(dec: Decoded, x: float, y: float, radius: int = 3):
 # --------------------------------------------------------------------------
 # Auto straighten
 # --------------------------------------------------------------------------
+
+# --------------------------------------------------------------------------
+# Upright preview (approximate). Lightroom computes the real correction from the sidecar's
+# PerspectiveUpright; this shows something close so you can judge it here:
+#   Level    rotate so near-horizontal lines are level
+#   Vertical send the vertical vanishing point to infinity: converging verticals become parallel
+#   Auto     Level + a partial Vertical correction (Lightroom's balanced mode)
+#   Full     Vertical + the same for the horizontal vanishing point
+# --------------------------------------------------------------------------
+UPRIGHT_PREVIEW_FILL = (40, 40, 42)          # uncovered corners, like Lightroom without Constrain Crop
+
+
+def _segments(rgb: np.ndarray, max_side: int = 1000):
+    """Straight line segments (N x 4, in the given image's pixels) and their lengths."""
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    h, w = gray.shape
+    s = max_side / max(h, w)
+    if s < 1:
+        gray = cv2.resize(gray, (round(w * s), round(h * s)), interpolation=cv2.INTER_AREA)
+    else:
+        s = 1.0
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    med = float(np.median(gray))
+    edges = cv2.Canny(gray, int(max(10, 0.66 * med)), int(min(255, max(40, 1.33 * med))))
+    gh, gw = gray.shape
+    diag = math.hypot(gw, gh)
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 720, threshold=50,
+                            minLineLength=int(0.06 * diag), maxLineGap=int(0.006 * diag) + 2)
+    if lines is None:
+        return np.zeros((0, 4)), np.zeros(0)
+    seg = np.asarray(lines, dtype=float).reshape(-1, 4) / s
+    return seg, np.hypot(seg[:, 2] - seg[:, 0], seg[:, 3] - seg[:, 1])
+
+
+def _vanishing_point(seg, wts, cx, cy, scale):
+    """Least-squares intersection of the segments' lines (homogeneous, centred / scaled coords)."""
+    p1 = np.c_[(seg[:, 0] - cx) / scale, (seg[:, 1] - cy) / scale, np.ones(len(seg))]
+    p2 = np.c_[(seg[:, 2] - cx) / scale, (seg[:, 3] - cy) / scale, np.ones(len(seg))]
+    L = np.cross(p1, p2)
+    L /= np.linalg.norm(L[:, :2], axis=1, keepdims=True) + 1e-12
+    w = np.asarray(wts, float)
+    for _ in range(3):                                    # re-weight: drop lines that disagree
+        A = (L * w[:, None]).T @ L
+        _vals, vecs = np.linalg.eigh(A)
+        V = vecs[:, 0]
+        r = np.abs(L @ V) / (np.linalg.norm(V[:2]) + 1e-12)
+        w = np.asarray(wts, float) * (r < max(0.02, 2.5 * np.median(r) + 1e-9))
+        if w.sum() == 0:
+            break
+    return V
+
+
+def upright_matrix(rgb: np.ndarray, mode: str):
+    """3x3 warp (in this image's pixels) previewing Lightroom Upright `mode`, or None."""
+    if mode not in ("Level", "Vertical", "Auto", "Full"):
+        return None
+    h, w = rgb.shape[:2]
+    seg, ln = _segments(rgb)
+    if len(seg) == 0:
+        return None
+    dx, dy = seg[:, 2] - seg[:, 0], seg[:, 3] - seg[:, 1]
+    ang = np.degrees(np.arctan2(dy, dx)) % 180.0
+    vert = np.abs(ang - 90.0) <= 25.0
+    horz = (ang <= 15.0) | (ang >= 165.0)
+    cx, cy, sc = w / 2.0, h / 2.0, max(w, h) / 2.0
+    C = np.array([[1 / sc, 0, -cx / sc], [0, 1 / sc, -cy / sc], [0, 0, 1]])   # pixels -> centred units
+    Hc = np.eye(3)
+
+    def level_rotation():
+        if horz.sum() < 2:
+            return np.eye(3)
+        t = np.degrees(np.arctan2(dy[horz], dx[horz]))
+        t = np.where(t > 90, t - 180, np.where(t < -90, t + 180, t))
+        a = math.radians(-_weighted_median(t, ln[horz]))
+        if abs(math.degrees(a)) > 12:
+            return np.eye(3)
+        return np.array([[math.cos(a), -math.sin(a), 0], [math.sin(a), math.cos(a), 0], [0, 0, 1]])
+
+    def vertical_fix(strength):
+        if vert.sum() < 3:
+            return np.eye(3)
+        V = _vanishing_point(seg[vert], ln[vert], cx, cy, sc)
+        if abs(V[2]) < 1e-9 * (abs(V[0]) + abs(V[1])):
+            px, py, inf = V[0], V[1], True                 # already parallel: just rotate upright
+        else:
+            px, py, inf = V[0] / V[2], V[1] / V[2], False
+        phi = math.atan2(px, py)                           # rotate the vanishing point onto the y axis
+        if phi > math.pi / 2:
+            phi -= math.pi
+        elif phi < -math.pi / 2:
+            phi += math.pi
+        if abs(math.degrees(phi)) > 15:
+            return np.eye(3)
+        R = np.array([[math.cos(phi), -math.sin(phi), 0], [math.sin(phi), math.cos(phi), 0], [0, 0, 1]])
+        if inf:
+            return R
+        d = math.sin(phi) * px + math.cos(phi) * py        # its distance along the y axis
+        if abs(d) < 1.2:                                   # absurdly strong: leave it
+            return np.eye(3)
+        P = np.array([[1, 0, 0], [0, 1, 0], [0, -strength / d, 1]])
+        return P @ R
+
+    def horizontal_fix(H0):
+        if horz.sum() < 3:
+            return np.eye(3)
+        hs = seg[horz].copy()
+        for k in (0, 2):                                   # horizontal segments after the vertical fix
+            v = H0 @ np.c_[(hs[:, k] - cx) / sc, (hs[:, k + 1] - cy) / sc, np.ones(len(hs))].T
+            hs[:, k], hs[:, k + 1] = v[0] / v[2] * sc + cx, v[1] / v[2] * sc + cy
+        V = _vanishing_point(hs, ln[horz], cx, cy, sc)
+        if abs(V[2]) < 1e-9 or abs(V[0] / V[2]) < 1.2:
+            return np.eye(3)
+        hx, hy = V[0] / V[2], V[1] / V[2]
+        P = np.array([[1, 0, 0], [0, 1, 0], [-1 / hx, 0, 1]])   # keeps verticals vertical
+        S = np.array([[1, 0, 0], [-hy / hx, 1, 0], [0, 0, 1]])  # then level the now-parallel lines
+        return S @ P
+
+    if mode == "Level":
+        Hc = level_rotation()
+    elif mode == "Vertical":
+        Hc = vertical_fix(1.0)
+    elif mode == "Auto":
+        Hc = vertical_fix(0.6)
+        if np.allclose(Hc, np.eye(3)):
+            Hc = level_rotation()
+    elif mode == "Full":
+        Hc = vertical_fix(1.0)
+        Hc = horizontal_fix(Hc) @ Hc
+    # Negligible correction (measurement noise on a photo that's already straight): no warp.
+    # The frame corners in centred units (-1..1) may move by at most ~0.15 % of the frame.
+    cc = np.array([[-1, -1, 1], [1, -1, 1], [1, 1, 1], [-1, 1, 1]], float).T * [[w / 2 / sc], [h / 2 / sc], [1]]
+    q = Hc @ cc
+    if np.abs(q[:2] / q[2] - cc[:2]).max() < 0.003:
+        return None
+    H = np.linalg.inv(C) @ Hc @ C
+    # fit the warped photo back into the frame (Lightroom shows it whole, uncovered corners empty)
+    corners = np.array([[0, 0, 1], [w, 0, 1], [w, h, 1], [0, h, 1]], float).T
+    q = H @ corners
+    q = q[:2] / q[2]
+    x0, y0, x1, y1 = q[0].min(), q[1].min(), q[0].max(), q[1].max()
+    k = min(w / (x1 - x0), h / (y1 - y0))
+    T = np.array([[k, 0, (w - k * (x1 + x0)) / 2], [0, k, (h - k * (y1 + y0)) / 2], [0, 0, 1]])
+    return T @ H
+
+
+def upright_for(dec, mode: str, rgb: np.ndarray):
+    """Upright warp for `dec`, cached on it in 0..1 units so the half-size preview can reuse it."""
+    key = "_upright:" + mode
+    if key not in dec.masks:
+        h, w = rgb.shape[:2]
+        H = upright_matrix(rgb, mode)
+        N = np.array([[w, 0, 0], [0, h, 0], [0, 0, 1]], float)
+        dec.masks[key] = None if H is None else np.linalg.inv(N) @ H @ N
+    Hn = dec.masks[key]
+    if Hn is None:
+        return None
+    h, w = rgb.shape[:2]
+    N = np.array([[w, 0, 0], [0, h, 0], [0, 0, 1]], float)
+    return N @ Hn @ np.linalg.inv(N)
+
 
 @dataclass
 class StraightenResult:

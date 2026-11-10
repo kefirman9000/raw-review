@@ -1,5 +1,14 @@
 # Changelog
 
+## v1.9.6
+
+- **Upright shows in the preview:** Upright Level, Vertical, Auto and Full used to be written to Lightroom but not
+  shown. The preview now applies an approximation: Level rotates so horizontal lines are level, Vertical makes
+  converging verticals (buildings, shelves, poles) upright and parallel, Full also squares up the horizontals, and
+  Auto does a balanced, partial correction. Like Lightroom without *Constrain crop*, the warped photo shows empty
+  corners; crop it with ✂ Crop. Lightroom still computes the exact correction, so expect small differences. If a
+  photo has no clear lines, the preview says so (Lightroom still applies Upright).
+
 ## v1.9.5
 
 - **Livelier preview:** while you drag a slider the photo now follows it (about 15-20 updates a second instead of
