@@ -37,7 +37,7 @@ Space Station (public domain). A tungsten-light cast was simulated, then removed
 - **Eyedropper** WB: click anything that should be white, grey or black.
 - **Straighten modes:** Off · Auto (best guess) · Horizon (rotate) · Verticals (rotate) · Lightroom **Upright: Level / Vertical / Auto / Full** (Full = architecture).
 - **✎ Edited mark:** photos you change are marked ✎ Edited. Use *Select ▾ → Not edited* or the *Show* filter to find the ones you haven't touched yet.
-- **Auto selected photos:** select photos, then *Auto ▾ → Auto selected photos* (Ctrl+Shift+E) or right-click to run chosen auto tools with their own options on just those photos.
+- **Apply auto settings to selected / checked:** select photos (or tick them), then *Apply auto settings to selected…* (Ctrl+Shift+E) or *…to checked* in the toolbar, or right-click, to run chosen auto tools with their own options on just those photos.
 - **Subject crop (optional):** a minimal, same-aspect crop that centres the main subject (planes, cars…). Turn it on in *Auto ▾ → Tools that run on new photos*, or per photo under *Geometry*.
 - **Auto tone, each one separate:** exposure, levels (blacks & whites), shadows & highlights, contrast, colour (vibrance & saturation). Aims for a normal-looking photo; strength and an exposure bias are adjustable under *Auto ▾ → Tools that run on new photos*.
 - **Auto sharpening and noise reduction**, from noise and softness measured on the full-resolution image.

@@ -1,5 +1,17 @@
 # Changelog
 
+## v1.9.4
+
+- **Choose what Paste copies:** Paste now asks which parts to copy (white balance, exposure, tone, colour, masks,
+  sharpening, noise reduction, straighten & lens). By default it pastes the look and keeps each photo's own white
+  balance, exposure and straightening; your choice is remembered. It used to overwrite everything.
+- **See what you changed:** a slider you've moved away from where auto put it gets an orange dot, and an orange
+  tick under each slider marks the auto value. Re-running auto updates the ticks.
+- **↺ back to auto:** the dot comes with a ↺ button that puts that one slider back to its auto value.
+  (Double-clicking a slider's name still resets it to the default.)
+- **Apply auto settings to selected / checked:** two toolbar buttons next to *Check all* (the checked one shows how
+  many are ticked). They replace *⚡ Auto selected*; Ctrl+Shift+E and right-click still work.
+
 ## v1.9.3
 
 - **Colour codes you can see:** photos with a colour label get a coloured band along the bottom and left of their

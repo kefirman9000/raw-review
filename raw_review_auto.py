@@ -632,6 +632,28 @@ class BatchSpec:
         return bool(self.groups) or self.subject_crop or self.fresh
 
 
+# The settings each automatic tool decides (exposure centring also sets Highlights and Lights).
+# Used to remember "where auto put it" so the panel can mark what you changed afterwards.
+GROUP_KEYS = {
+    "wb": ("temp", "tint"),
+    "level": ("angle",),
+    "exposure": ("exposure", "highlights", "lights"),
+    "levels": ("blacks", "whites"),
+    "shhi": ("shadows", "highlights"),
+    "contrast": ("contrast",),
+    "colour": ("vibrance", "saturation"),
+    "masks": tuple(k for k in core.SETTINGS if k.startswith(("sky_", "subj_"))),
+    "sharpen": tuple(k for k in core.SETTINGS if k.startswith("sharp_")),
+    "noise": tuple(k for k in core.SETTINGS if k.startswith("nr_")),
+}
+
+
+def auto_values(edit, groups) -> dict:
+    """The values of the settings these auto tools decide, as they are in `edit` right now."""
+    keys = {k for g in groups for k in GROUP_KEYS.get(g, ())}
+    return {k: getattr(edit, k) for k in keys}
+
+
 def apply_batch(dec, edit, spec: BatchSpec) -> dict:
     """Apply a BatchSpec to one photo's edit: auto tools first, then manual changes."""
     out = {}
@@ -648,6 +670,8 @@ def apply_batch(dec, edit, spec: BatchSpec) -> dict:
                        user_rules=spec.user_rules)
     if spec.subject_crop and "crop" not in out:          # asked for on its own, without straighten
         out["crop"] = apply_subject_crop(dec, edit)
+    if spec.groups:
+        out["auto_values"] = auto_values(edit, spec.groups)   # before the manual changes below
     apply_changes(edit, spec.changes)
     return out
 

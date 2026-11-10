@@ -210,7 +210,7 @@ class BatchTask(QRunnable):
             dec = self.dec if self.dec is not None else core.decode_raw(self.path)   # read-only
             res = auto.apply_batch(dec, self.edit, self.spec)
             self.signals.done.emit(self.gen, self.path,
-                                   {"edit": self.edit, "wb": res.get("wb"),
+                                   {"edit": self.edit, "wb": res.get("wb"), "auto_values": res.get("auto_values"),
                                     "thumb": make_thumb(dec, self.edit)}, "")
         except Exception as ex:  # noqa: BLE001
             traceback.print_exc()
@@ -441,10 +441,32 @@ class HistogramWidget(QtWidgets.QWidget):
 
 
 class FineSlider(QtWidgets.QSlider):
-    """Mouse wheel nudges only a slider you've clicked (so scrolling the panel is safe); Shift = finest."""
+    """Mouse wheel nudges only a slider you've clicked (so scrolling the panel is safe); Shift = finest.
+    auto_pos (slider units) draws a small tick where the automatic edit put this setting."""
     def __init__(self, *a):
         super().__init__(*a)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.auto_pos = None
+
+    def paintEvent(self, e):
+        super().paintEvent(e)
+        if self.auto_pos is None or self.maximum() == self.minimum():
+            return
+        opt = QtWidgets.QStyleOptionSlider()
+        self.initStyleOption(opt)
+        groove = self.style().subControlRect(QtWidgets.QStyle.ComplexControl.CC_Slider, opt,
+                                             QtWidgets.QStyle.SubControl.SC_SliderGroove, self)
+        handle = self.style().subControlRect(QtWidgets.QStyle.ComplexControl.CC_Slider, opt,
+                                             QtWidgets.QStyle.SubControl.SC_SliderHandle, self)
+        span = groove.width() - handle.width()
+        frac = (self.auto_pos - self.minimum()) / (self.maximum() - self.minimum())
+        x = groove.left() + handle.width() / 2 + frac * span
+        p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        p.setPen(QtGui.QPen(QtGui.QColor(230, 170, 60), 2))
+        cy = groove.center().y()
+        p.drawLine(QtCore.QPointF(x, cy + 5), QtCore.QPointF(x, cy + 10))     # tick under the groove
+        p.end()
 
     def wheelEvent(self, e):
         if not self.hasFocus():
@@ -478,8 +500,16 @@ class SliderRow(QtWidgets.QWidget):
         self.default = default
         lay = QtWidgets.QGridLayout(self)
         lay.setContentsMargins(0, 2, 0 , 2)
+        self.name = label
+        self.auto_val = None
         self.lbl = QtWidgets.QLabel(label)
-        self.lbl.setToolTip("Double-click to reset")
+        self.lbl.setToolTip("Double-click to reset to the default")
+        self.reset_btn = QtWidgets.QToolButton()
+        self.reset_btn.setText("↺")
+        self.reset_btn.setAutoRaise(True)
+        self.reset_btn.setStyleSheet("QToolButton{color:#e6aa3c;font-weight:bold;padding:0 4px;}")
+        self.reset_btn.clicked.connect(lambda: self.auto_val is not None and self.setValue(self.auto_val, emit=True))
+        self.reset_btn.setVisible(False)
         self.slider = FineSlider(Qt.Orientation.Horizontal)
         self.slider.setRange(int(round(lo * self.scale)), int(round(hi * self.scale)))
         self.slider.setToolTip("Click, then mouse wheel to nudge (Shift = finest). Double-click the name to reset.")
@@ -490,23 +520,44 @@ class SliderRow(QtWidgets.QWidget):
         self.spin.setFixedWidth(78)
         self.spin.setKeyboardTracking(False)
         lay.addWidget(self.lbl, 0, 0)
-        lay.addWidget(self.spin, 0, 1, Qt.AlignmentFlag.AlignRight)
-        lay.addWidget(self.slider, 1, 0, 1, 2)
+        lay.addWidget(self.reset_btn, 0, 1, Qt.AlignmentFlag.AlignRight)
+        lay.addWidget(self.spin, 0, 2, Qt.AlignmentFlag.AlignRight)
+        lay.addWidget(self.slider, 1, 0, 1, 3)
+        lay.setColumnStretch(0, 1)
         self.slider.valueChanged.connect(self._from_slider)
         self.spin.valueChanged.connect(self._from_spin)
         self.lbl.mouseDoubleClickEvent = lambda _e: self.setValue(self.default, emit=True)
+
+    def set_auto(self, val):
+        """Where the automatic edit put this setting (None = unknown): tick + 'changed by you' marker."""
+        self.auto_val = val
+        self.slider.auto_pos = None if val is None else int(round(val * self.scale))
+        self.slider.update()
+        self._refresh_mark()
+
+    def _refresh_mark(self):
+        changed = self.auto_val is not None and abs(self.value() - self.auto_val) > 0.5 / self.scale
+        self.lbl.setText(f"{self.name}  <span style='color:#e6aa3c'>●</span>" if changed else self.name)
+        self.reset_btn.setVisible(changed)
+        if self.auto_val is not None:
+            shown = f"{self.auto_val:.{self.spin.decimals()}f}"
+            self.reset_btn.setToolTip(f"Back to the auto value ({shown})")
+            self.slider.setToolTip(f"Auto value: {shown} (orange tick). Click, then mouse wheel to nudge "
+                                   "(Shift = finest).")
 
     def _from_slider(self, v):
         val = v / self.scale
         self.spin.blockSignals(True)
         self.spin.setValue(val)
         self.spin.blockSignals(False)
+        self._refresh_mark()
         self.changed.emit(val)
 
     def _from_spin(self, val):
         self.slider.blockSignals(True)
         self.slider.setValue(int(round(val * self.scale)))
         self.slider.blockSignals(False)
+        self._refresh_mark()
         self.changed.emit(val)
 
     def value(self):
@@ -519,6 +570,7 @@ class SliderRow(QtWidgets.QWidget):
         self.slider.setValue(int(round(val * self.scale)))
         for w in (self.slider, self.spin):
             w.blockSignals(False)
+        self._refresh_mark()
         if emit:
             self.changed.emit(val)
 
@@ -749,6 +801,80 @@ class TourDialog(QtWidgets.QDialog):
         self.lbl.setText(f"{i + 1} / {self.stack.count()}")
         self.b_back.setEnabled(i > 0)
         self.b_next.setText("Done" if i == self.stack.count() - 1 else "Next")
+
+
+# What "Paste settings" can copy, in groups you tick (like Lightroom's Paste dialog).
+PASTE_GROUPS = [
+    ("wb", "White balance", ("wb_mode", "temp", "tint")),
+    ("exposure", "Exposure", ("exposure",)),
+    ("tone", "Contrast, highlights, shadows, whites, blacks, tone curve", ("contrast", "highlights", "shadows",
+                                                                          "whites", "blacks", "lights")),
+    ("colour", "Vibrance & saturation", ("vibrance", "saturation")),
+    ("masks", "Sky & subject masks", tuple(k for k in core.SETTINGS if k.startswith(("sky_", "subj_")))
+     + ("sky_on", "subj_on")),
+    ("sharpen", "Sharpening", tuple(k for k in core.SETTINGS if k.startswith("sharp_"))),
+    ("noise", "Noise reduction", tuple(k for k in core.SETTINGS if k.startswith("nr_"))),
+    ("geometry", "Straighten & lens correction", ("angle", "upright", "level_mode", "lr_crop_angle",
+                                                  "lens_profile")),
+]
+PASTE_SHORT = {"wb": "White balance", "exposure": "Exposure", "tone": "Tone", "colour": "Colour",
+               "masks": "Masks", "sharpen": "Sharpening", "noise": "Noise reduction", "geometry": "Straighten"}
+# First time: the "look", not the settings that belong to each photo's own light and framing
+PASTE_DEFAULT = {"tone", "colour", "masks", "sharpen", "noise"}
+
+
+def paste_fields(edit_from, edit_to, groups):
+    """Copy the fields of the ticked paste groups from one edit to another (optional settings too)."""
+    for key, _label, fields in PASTE_GROUPS:
+        if key not in groups:
+            continue
+        for f in fields:
+            setattr(edit_to, f, copy.deepcopy(getattr(edit_from, f)))
+            if f in core.SETTINGS and core.SETTINGS[f].optional:
+                if f in edit_from.touched:
+                    edit_to.touched.add(f)
+                else:
+                    edit_to.touched.discard(f)
+
+
+class PasteDialog(QtWidgets.QDialog):
+    """Pick which parts of the copied settings to paste."""
+
+    def __init__(self, parent, n, src_name, chosen):
+        super().__init__(parent)
+        self.setWindowTitle("Paste settings")
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.addWidget(QtWidgets.QLabel(f"Paste settings copied from <b>{src_name}</b> to <b>{n}</b> photo"
+                                       + ("" if n == 1 else "s") + ".<br>Only the ticked parts change; "
+                                       "everything else on those photos stays as it is."))
+        self.checks = {}
+        for key, label, _fields in PASTE_GROUPS:
+            cb = QtWidgets.QCheckBox(label.replace("&", "&&"))
+            cb.setChecked(key in chosen)
+            self.checks[key] = cb
+            lay.addWidget(cb)
+        row = QtWidgets.QHBoxLayout()
+        for text, on in (("All", True), ("None", False)):
+            b = QtWidgets.QPushButton(text)
+            b.clicked.connect(lambda _c, on=on: [c.setChecked(on) for c in self.checks.values()])
+            row.addWidget(b)
+        row.addStretch(1)
+        lay.addLayout(row)
+        note = QtWidgets.QLabel("A subject crop is never pasted: it belongs to its own photo.")
+        note.setStyleSheet("color:#888;font-size:11px;")
+        lay.addWidget(note)
+        bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Ok
+                                        | QtWidgets.QDialogButtonBox.StandardButton.Cancel)
+        self.ok = bb.button(QtWidgets.QDialogButtonBox.StandardButton.Ok)
+        self.ok.setText(f"Paste to {n} photo" + ("" if n == 1 else "s"))
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+        for c in self.checks.values():
+            c.toggled.connect(lambda _v: self.ok.setEnabled(bool(self.chosen())))
+
+    def chosen(self):
+        return {k for k, c in self.checks.items() if c.isChecked()}
 
 
 class BatchDialog(QtWidgets.QDialog):
@@ -1328,12 +1454,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Auto ▾
         m_auto = menu_button("Auto ▾", "Run automatic edits on several photos, and choose how auto works")
-        self.act_auto_sel = m_auto.addAction("⚡ Auto selected photos…", self.open_apply_auto)
-        self.act_auto_sel.setShortcut(QtGui.QKeySequence("Ctrl+Shift+E"))
-        self.act_auto_sel.setShortcutVisibleInContextMenu(True)
-        self.act_auto_sel.setToolTip("Run auto tools, with options you pick, on just the photos selected in the\n"
-                                     "list or grid (Ctrl/Shift-click to select several). Also on right-click.")
-        self.addAction(self.act_auto_sel)                       # keep Ctrl+Shift+E working from anywhere
         self.act_batch = m_auto.addAction("Batch edit…", self.open_batch)
         self.act_batch.setToolTip("Run auto tools or raise/lower/set settings on checked, selected or all photos")
         self.act_undo_batch = m_auto.addAction("Undo batch", self.undo_batch)
@@ -1365,6 +1485,13 @@ class MainWindow(QtWidgets.QMainWindow):
         # Check all · Approve checked · Approve ▾
         act = tb.addAction("☑ Check all", lambda: self.check_where(lambda it: True))
         act.setToolTip("Tick every photo in the list (the Check ▾ menu on the left has more choices)")
+        self.act_auto_sel = tb.addAction("Apply auto settings to selected…", lambda: self.open_apply_auto("selected"))
+        self.act_auto_sel.setShortcut(QtGui.QKeySequence("Ctrl+Shift+E"))
+        self.act_auto_sel.setToolTip("Run auto tools, with options you pick, on the photos selected in the list or "
+                                     "grid\n(Ctrl/Shift-click to select several). Also on right-click. (Ctrl+Shift+E)")
+        self.act_auto_chk = tb.addAction("Apply auto settings to checked…", lambda: self.open_apply_auto("checked"))
+        self.act_auto_chk.setToolTip("Run auto tools, with options you pick, on every ticked ☑ photo")
+        self.act_auto_chk.setEnabled(False)
         self.act_approve_checked = tb.addAction("Approve checked", self.approve_checked)
         self.act_approve_checked.setToolTip("Approve the ticked photos and write their Lightroom XMP")
         self.act_approve_checked.setEnabled(False)
@@ -1420,7 +1547,7 @@ class MainWindow(QtWidgets.QMainWindow):
         cm.addAction("Not edited", lambda: self.check_where(lambda it: not it.edited and it.edit is not None))
         sel_btn = QtWidgets.QToolButton()
         sel_btn.setText("Select ▾")
-        sel_btn.setToolTip("Select photos by state (then Auto ▾ → Auto selected photos, right-click, Approve…)")
+        sel_btn.setToolTip("Select photos by state (then Apply auto settings to selected, right-click, Approve…)")
         sel_btn.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
         sm = QtWidgets.QMenu(sel_btn)
         sm.addAction("Not edited", lambda: self.select_where(lambda it: not it.edited and it.edit is not None))
@@ -2422,8 +2549,11 @@ class MainWindow(QtWidgets.QMainWindow):
         e = it.edit
         self._loading_controls = True
         self.wb_combo.setCurrentIndex(1 if e.wb_mode == "custom" else 0)
+        ae = it.auto_edit
         for key, s in self.sliders.items():
+            s.auto_val = None                      # no marker flash while switching photos
             s.setValue(getattr(e, key))
+            s.set_auto(getattr(ae, key) if ae is not None else None)
         self.level_combo.setCurrentText(e.level_mode if e.level_mode in core.LEVEL_MODES else "Manual")
         self.chk_lens.setChecked(e.lens_profile)
         self.chk_subject_crop.setChecked(bool(e.crop_box))
@@ -2586,6 +2716,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._record_undo(it, it.edit.copy())
         res = auto.run_auto(dec, it.edit, groups, self._opts_snapshot(), user_rules=user_rules)
+        self._remember_auto(it, auto.auto_values(it.edit, groups))
         if res.get("wb") is not None:
             it.wb = res["wb"]
             self.chk_samples.setChecked(True)
@@ -2608,6 +2739,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._record_undo(it, it.edit.copy())
         auto.apply_level_mode(dec, it.edit, mode, self.opts.allow_upright)
+        self._remember_auto(it, {"angle": it.edit.angle})
         self._mark_changed(it)
         self.load_controls()
         self.refresh_view()
@@ -2659,6 +2791,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.load_controls()
         self.refresh_view()
 
+    def _remember_auto(self, it, values):
+        """Auto just decided these settings: they become the photo's auto values (ticks, ↺, Reset to auto)."""
+        if it.auto_edit is None:
+            it.auto_edit = it.edit.copy()
+        for k, v in values.items():
+            setattr(it.auto_edit, k, v)
+
     def reset_auto(self):
         it = self.current
         if it and it.auto_edit and it.edit is not None:
@@ -2685,27 +2824,32 @@ class MainWindow(QtWidgets.QMainWindow):
     def copy_settings(self):
         if self.current and self.current.edit:
             self.clip_edit = self.current.edit.copy()
+            self.clip_name = os.path.basename(self.current.path)
             self.statusBar().showMessage("Settings copied. Check or select photos in the list, then Paste.", 6000)
 
     def paste_settings(self):
         if self.clip_edit is None:
             return
-        targets = self.checked_items() or self.selected_items()
-        n = 0
+        targets = [it for it in (self.checked_items() or self.selected_items()) if it.edit is not None]
+        if not targets:
+            self.statusBar().showMessage("Tick or select the photos to paste to first.", 5000)
+            return
+        dlg = PasteDialog(self, len(targets), getattr(self, "clip_name", "the copied photo"),
+                          set(self._settings.get("paste_groups") or PASTE_DEFAULT))
+        if dlg.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        groups = dlg.chosen()
+        self._settings["paste_groups"] = sorted(groups)
+        names = ", ".join(PASTE_SHORT[key] for key, _label, _f in PASTE_GROUPS if key in groups)
         for it in targets:
-            if it.edit is None:
-                continue
             self._record_undo(it, it.edit.copy())
-            own_crop = it.edit.crop_box              # a subject crop belongs to its own photo
-            it.edit = self.clip_edit.copy()
-            it.edit.crop_box = own_crop
-            it.edit.notes = ["Pasted settings"]
+            paste_fields(self.clip_edit, it.edit, groups)
+            it.edit.notes = [n for n in it.edit.notes if not n.startswith("Pasted")] + [f"Pasted: {names}"]
             self._mark_changed(it)
             self._queue_thumb(it)
-            n += 1
         self.load_controls()
         self.refresh_view()
-        self.statusBar().showMessage(f"Pasted settings to {n} photo(s) (not yet approved).", 6000)
+        self.statusBar().showMessage(f"Pasted {names} to {len(targets)} photo(s) (not yet approved).", 6000)
 
     # ---------------- checking photos / scopes ----------------
     def checked_items(self):
@@ -2733,6 +2877,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(self, "act_approve_checked"):
             self.act_approve_checked.setText(f"Approve checked ({n})" if n else "Approve checked")
             self.act_approve_checked.setEnabled(bool(n))
+            self.act_auto_chk.setText(f"Apply auto settings to checked ({n})…" if n
+                                      else "Apply auto settings to checked…")
+            self.act_auto_chk.setEnabled(bool(n))
 
     def check_where(self, pred):
         self.list.blockSignals(True)
@@ -2769,7 +2916,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         s = "s" if n != 1 else ""
         menu = QtWidgets.QMenu(view)
-        menu.addAction(f"⚡ Auto settings for {n} selected photo{s}…", self.open_apply_auto)
+        menu.addAction(f"Apply auto settings to {n} selected photo{s}…", lambda: self.open_apply_auto("selected"))
         menu.addAction(f"Auto-enhance {n} photo{s} (tools for new photos)", self.auto_enhance_selected)
         menu.addAction(f"Crop {n} photo{s} to centre the subject",
                        lambda: self._run_on_selected(auto.BatchSpec(scope="selected", subject_crop=True)))
@@ -2800,12 +2947,18 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._run_batch_on(items, spec)
 
-    def open_apply_auto(self):
-        items = self._selected_ready()
-        if not items:
-            self.statusBar().showMessage("Select one or more analysed photos first "
-                                         "(Ctrl-click or Shift-click in the list or grid).", 6000)
-            return
+    def open_apply_auto(self, which="selected"):
+        if which == "checked":
+            items = [it for it in self.checked_items() if it.edit is not None]
+            if not items:
+                self.statusBar().showMessage("Tick ☑ one or more analysed photos first.", 6000)
+                return
+        else:
+            items = self._selected_ready()
+            if not items:
+                self.statusBar().showMessage("Select one or more analysed photos first "
+                                             "(Ctrl-click or Shift-click in the list or grid).", 6000)
+                return
         dlg = ApplyAutoDialog(self, [os.path.basename(it.path) for it in items], self._opts_snapshot(),
                               self._settings.get("apply_auto_last"))
         if dlg.exec() != QtWidgets.QDialog.DialogCode.Accepted:
@@ -2814,7 +2967,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._settings["apply_auto_last"] = v
         spec = dlg.spec()
         spec.fresh = v["fresh"]
-        self._run_on_selected(spec)
+        self._run_batch_on(items, spec)
 
     def auto_enhance_selected(self):
         o = self.opts
@@ -2892,6 +3045,8 @@ class MainWindow(QtWidgets.QMainWindow):
             it.edit = res["edit"]
             if res.get("wb") is not None:
                 it.wb = res["wb"]
+            if res.get("auto_values"):
+                self._remember_auto(it, res["auto_values"])
             self._set_thumb(it, res["thumb"])
             self._after_batch_item(it)
         self._batch_done += 1
@@ -3301,6 +3456,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "show_masks": self.chk_masks.isChecked(),
             "show_clipping": self.chk_clip.isChecked(),
             "apply_auto_last": self._settings.get("apply_auto_last"),
+            "paste_groups": self._settings.get("paste_groups"),
             "mark_edited": self._settings.get("mark_edited", True),
             "show_filter": self.show_combo.currentIndex(),
             "collapsed": [t for t, (c, _f) in self._panels.items() if not c.isVisible()],
