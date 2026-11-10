@@ -24,7 +24,7 @@ Space Station (public domain). A tungsten-light cast was simulated, then removed
 - **Automatic sky and subject masks**, written as Lightroom's own Select Sky / Select Subject (Lightroom computes the exact mask).
 - **Per-photo Undo / Redo** (`Ctrl+Z` / `Ctrl+Y`).
 - **Starts from your existing Lightroom edits** when a photo already has them, and keeps your own Lightroom crop and masks.
-- **Star ratings and colour labels**, written to Lightroom on approve.
+- **Star ratings and colour labels**, written to Lightroom on approve. Labelled photos get a coloured band in the list and grid; right-click to label several at once, *Check ▾ → By colour label* to tick them, and *Batch edit → Colour label* to edit every photo with the colours you pick.
 - **Remembers your settings and the photos you had open**, even across updates.
 - **My auto settings** (*Auto ▾*): make auto edits brighter or moodier, punchier or softer, and set rules like *Sharpening always 60* or *never touch white balance*. Every new photo follows them.
 - **Hold-to-compare and split view**, finer sliders, **undo approval**, find by name, analysis progress with pause, foldable panels and interface sizing.
@@ -79,7 +79,7 @@ Space Station (public domain). A tungsten-light cast was simulated, then removed
 | `G` | Grid view on / off (double-click or `Enter` opens a photo; with several selected, `A` / `X` act on all of them) |
 | `Ctrl+Z` / `Ctrl+Y` | Undo / redo the last change to this photo (each photo has its own history) |
 | `1`–`5` / `0` | Star rating / clear (several selected photos at once) |
-| `6` `7` `8` `9` | Red / yellow / green / blue label (press again to clear) |
+| `6` `7` `8` `9` | Red / yellow / green / blue label (press again to clear; right-click for Purple or several photos) |
 | `Ctrl+F` | Find a photo by name |
 | `?` / `F1` | All shortcuts and tips |
 | `Ctrl+C` / `Ctrl+V` | Copy settings / paste to the photos selected in the list |

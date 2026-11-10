@@ -46,7 +46,7 @@ HELP_HTML = """
 <tr><td><b>Hold \\</b></td><td>Show the original while held. Tick <i>Split</i> for a draggable before/after view</td></tr>
 <tr><td><b>G</b></td><td>Grid view on / off (double-click or Enter opens a photo)</td></tr>
 <tr><td><b>1-5</b>, <b>0</b></td><td>Star rating, clear rating</td></tr>
-<tr><td><b>6 7 8 9</b></td><td>Red / yellow / green / blue label (press again to clear)</td></tr>
+<tr><td><b>6 7 8 9</b></td><td>Red / yellow / green / blue label (press again to clear). Right-click for Purple or to label several photos; labelled photos get a coloured band. <i>Check ▾ → By colour label</i> and <i>Batch edit → Colour label</i> work on photos by colour</td></tr>
 <tr><td><b>J</b></td><td>Show clipping: blown highlights red, pure black blue (the histogram's triangles light up when it happens)</td></tr>
 <tr><td><b>E</b> / <b>W</b></td><td>Auto-enhance (uses <i>My auto settings</i>) / auto white balance</td></tr>
 <tr><td><b>C</b></td><td>Check / uncheck this photo</td></tr>
@@ -107,6 +107,8 @@ STATUS_STYLE = {
 class Item:
     def __init__(self, path):
         self.path = path
+        self._thumb = None          # last thumbnail (redrawn when the colour label changes)
+        self._thumb_label = None
         self.status = "loading"
         self.edit: core.Edit | None = None
         self.auto_edit: core.Edit | None = None
@@ -762,7 +764,9 @@ class BatchDialog(QtWidgets.QDialog):
         lay = QtWidgets.QVBoxLayout(self)
 
         g = QtWidgets.QGroupBox("Apply to")
-        gl = QtWidgets.QHBoxLayout(g)
+        gv = QtWidgets.QVBoxLayout(g)
+        gl = QtWidgets.QHBoxLayout()
+        gv.addLayout(gl)
         self.scope_btns = {}
         grp = QtWidgets.QButtonGroup(self)
         for key, label in [("current", "This photo"), ("selected", "Selected in list"),
@@ -775,6 +779,31 @@ class BatchDialog(QtWidgets.QDialog):
             self.scope_btns[key] = rb
         # Default to what you deliberately picked (ticked, or several selected), else just this photo.
         # Never "All photos" unless you choose it.
+        # Colour labels: tick one or more colours; the photos with any of them get the batch edit
+        self.label_counts = counts.get("labels", {})
+        g2 = QtWidgets.QWidget()
+        ll = QtWidgets.QHBoxLayout(g2)
+        ll.setContentsMargins(0, 0, 0, 0)
+        rb = QtWidgets.QRadioButton("Colour label:")
+        rb.setEnabled(any(self.label_counts.values()))
+        rb.setToolTip("Photos with any of the colours you pick (label them with keys 6-9 or right-click)")
+        grp.addButton(rb)
+        self.scope_btns["label"] = rb
+        ll.addWidget(rb)
+        self.label_btns = {}
+        for lab in list(core.LABELS) + ["None"]:
+            n = self.label_counts.get("" if lab == "None" else lab, 0)
+            b = QtWidgets.QPushButton(f"{'No label' if lab == 'None' else lab} ({n})")
+            b.setCheckable(True)
+            b.setEnabled(n > 0)
+            col = LABEL_COLOURS.get(lab, "#6a6a70")
+            b.setStyleSheet(f"QPushButton{{border-left:6px solid {col};padding:3px 8px;}}"
+                            f"QPushButton:checked{{background:{col};border-color:{col};color:white;}}")
+            b.toggled.connect(lambda on: (on and rb.setChecked(True), self._update_apply_text()))
+            self.label_btns[lab] = b
+            ll.addWidget(b)
+        ll.addStretch(1)
+        gv.addWidget(g2)
         first = next((k for k in ("checked", "selected") if counts.get(k, 0) > (0 if k == "checked" else 1)),
                      "current" if counts.get("current", 0) else "all")
         self.scope_btns[first].setChecked(True)
@@ -787,7 +816,7 @@ class BatchDialog(QtWidgets.QDialog):
         al = QtWidgets.QGridLayout(ga)
         self.auto_checks = {}
         for i, (key, label) in enumerate(auto.AUTO_GROUPS):
-            cb = QtWidgets.QCheckBox(label)
+            cb = QtWidgets.QCheckBox(label.replace("&", "&&"))
             self.auto_checks[key] = cb
             if key == "level":
                 self.level_combo = QtWidgets.QComboBox()
@@ -882,11 +911,18 @@ class BatchDialog(QtWidgets.QDialog):
         if not hasattr(self, "apply_btn"):
             return
         key = next((k for k, rb in self.scope_btns.items() if rb.isChecked()), "current")
-        n = self.counts.get(key, 0)
+        if key == "label":
+            n = sum(self.label_counts.get("" if lab == "None" else lab, 0)
+                    for lab, b in self.label_btns.items() if b.isChecked())
+        else:
+            n = self.counts.get(key, 0)
         self.apply_btn.setText(f"Apply to {n} photo" + ("" if n == 1 else "s"))
+        self.apply_btn.setEnabled(n > 0)
 
     def spec(self) -> "auto.BatchSpec":
         scope = next(k for k, rb in self.scope_btns.items() if rb.isChecked())
+        if scope == "label":
+            scope = "label:" + ",".join(lab for lab, b in self.label_btns.items() if b.isChecked())
         groups = [k for k in auto.GROUP_ORDER if self.auto_checks[k].isChecked()]
         changes = []
         for key, (cb, combo, spin) in self.rows.items():
@@ -922,7 +958,7 @@ class ApplyAutoDialog(QtWidgets.QDialog):
         al = QtWidgets.QGridLayout(ga)
         self.checks = {}
         for i, (key, label) in enumerate(auto.AUTO_GROUPS):
-            cb = QtWidgets.QCheckBox(label)
+            cb = QtWidgets.QCheckBox(label.replace("&", "&&"))
             self.checks[key] = cb
             if key == "level":
                 self.level_combo = QtWidgets.QComboBox()
@@ -1139,7 +1175,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for key, label in auto.AUTO_GROUPS:
             if key == "level":
                 continue
-            a = menu.addAction("Auto " + label[0].lower() + label[1:])
+            a = menu.addAction(("Auto " + label[0].lower() + label[1:]).replace("&", "&&"))
             a.setCheckable(True)
             a.setChecked(key in self.opts.groups)
             a.toggled.connect(self._opts_changed)
@@ -1248,7 +1284,7 @@ class MainWindow(QtWidgets.QMainWindow):
             menu.addAction("All of these", lambda: self.run_auto_groups(groups))
             menu.addSeparator()
         for g in groups:
-            menu.addAction(auto.GROUP_LABEL[g], lambda g=g: self.run_auto_groups([g]))
+            menu.addAction(auto.GROUP_LABEL[g].replace("&", "&&"), lambda g=g: self.run_auto_groups([g]))
         btn.setMenu(menu)
         return btn
 
@@ -1373,6 +1409,11 @@ class MainWindow(QtWidgets.QMainWindow):
             lambda it: bool(it.wb and it.wb.applied and it.wb.confidence < 0.5)))
         cm.addAction("Suggested rejects (soft, bursts…)", lambda: self.check_where(
             lambda it: it.path in self._cull_why and it.status in ("ready", "modified")))
+        lm = cm.addMenu("By colour label")
+        for lab in core.LABELS:
+            lm.addAction(self._label_icon(lab), lab, lambda lab=lab: self.check_where(lambda it: it.label == lab))
+        lm.addSeparator()
+        lm.addAction("No label", lambda: self.check_where(lambda it: not it.label))
         cm.addAction("Invert", self.check_invert)
         chk_btn.setMenu(cm)
         cm.addAction("Edited ✎", lambda: self.check_where(lambda it: it.edited))
@@ -1978,6 +2019,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ---------------- list / navigation ----------------
     def _update_list_item(self, it):
+        if getattr(it, "_thumb", None) is not None and getattr(it, "_thumb_label", None) != it.label:
+            self._set_thumb(it, it._thumb)            # label changed: redraw the thumbnail's colour band
         label, col = STATUS_STYLE[it.status]
         has = (os.path.exists(core.dng_export_path(it.path)) if it.path.lower().endswith(".dng")
                else os.path.exists(core.sidecar_path(it.path)))
@@ -2108,7 +2151,16 @@ class MainWindow(QtWidgets.QMainWindow):
             gi.setToolTip(f"{it.path}\n{it.error}")
 
     def _set_thumb(self, it, rgb):
-        icon = QtGui.QIcon(QtGui.QPixmap.fromImage(to_qimage(rgb)))
+        it._thumb, it._thumb_label = rgb, it.label
+        pm = QtGui.QPixmap.fromImage(to_qimage(rgb))
+        col = LABEL_COLOURS.get(it.label or "")
+        if col:                                   # colour label: a band along the bottom and a stripe on the left
+            p = QtGui.QPainter(pm)
+            band = max(6, pm.height() // 9)
+            p.fillRect(0, pm.height() - band, pm.width(), band, QtGui.QColor(col))
+            p.fillRect(0, 0, max(4, band // 2), pm.height(), QtGui.QColor(col))
+            p.end()
+        icon = QtGui.QIcon(pm)
         if it.list_item is not None:
             it.list_item.setIcon(icon)
         if it.grid_item is not None:
@@ -2664,6 +2716,9 @@ class MainWindow(QtWidgets.QMainWindow):
         return [self.items[li.data(Qt.ItemDataRole.UserRole)] for li in self.list.selectedItems()]
 
     def scope_items(self, scope):
+        if scope.startswith("label:"):
+            want = {("" if x == "None" else x) for x in scope[6:].split(",") if x}
+            return [it for it in self.items.values() if (it.label or "") in want]
         if scope == "current":
             return [self.current] if self.current else []
         if scope == "selected":
@@ -2721,6 +2776,12 @@ class MainWindow(QtWidgets.QMainWindow):
         menu.addAction(f"Remove subject crop from {n} photo{s}", self.remove_crop_selected)
         menu.addSeparator()
         sel = self.selected_items()
+        lm = menu.addMenu(f"Colour label for {n} photo{s}")
+        for i, lab in enumerate(core.LABELS):
+            a = lm.addAction(self._label_icon(lab), lab + (f"    ({'6789'[i]})" if i < 4 else ""),
+                             lambda lab=lab: self.set_label_on(sel, lab))
+        lm.addSeparator()
+        lm.addAction("No label", lambda: self.set_label_on(sel, ""))
         menu.addAction(f"Mark {n} photo{s} as edited ✎", lambda: self.set_edited(sel, True))
         menu.addAction(f"Mark {n} photo{s} as not edited", lambda: self.set_edited(sel, False))
         menu.addSeparator()
@@ -2780,8 +2841,11 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self.items:
             self.statusBar().showMessage("Add some photos first.", 4000)
             return
+        labels = {}
+        for it in self.items.values():
+            labels[it.label or ""] = labels.get(it.label or "", 0) + 1
         counts = {"current": 1 if self.current else 0, "selected": len(self.selected_items()),
-                  "checked": len(self.checked_items()), "all": len(self.items)}
+                  "checked": len(self.checked_items()), "all": len(self.items), "labels": labels}
         dlg = BatchDialog(self, counts, self._opts_snapshot())
         if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted:
             self.run_batch(dlg.spec())
@@ -3103,6 +3167,30 @@ class MainWindow(QtWidgets.QMainWindow):
             self.statusBar().showMessage(("Label cleared" if same else f"{lab} label") +
                                          f" on {len(targets)} photo(s).", 3000)
         self._update_rating_label()
+
+    def set_label_on(self, items, lab):
+        """Give these photos colour label `lab` ("" clears it)."""
+        items = [t for t in items if t is not None]
+        for t in items:
+            t.label = lab
+            self._mark_changed(t)
+            self._update_list_item(t)
+            self._update_grid_item(t)
+        if items:
+            self.statusBar().showMessage(("Label cleared" if not lab else f"{lab} label") +
+                                         f" on {len(items)} photo(s) – written to Lightroom when approved.", 4000)
+        self._update_rating_label()
+
+    def _label_icon(self, lab):
+        pm = QtGui.QPixmap(12, 12)
+        pm.fill(Qt.GlobalColor.transparent)
+        p = QtGui.QPainter(pm)
+        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        p.setBrush(QtGui.QColor(LABEL_COLOURS.get(lab, "#00000000")))
+        p.setPen(QtGui.QPen(QtGui.QColor("#aaa"), 1))
+        p.drawEllipse(1, 1, 10, 10)
+        p.end()
+        return QtGui.QIcon(pm)
 
     def _update_rating_label(self):
         it = self.current
@@ -3545,6 +3633,14 @@ QCheckBox::indicator {{
 }}
 QCheckBox::indicator:hover {{ border-color: #b0b0b8; }}
 QCheckBox::indicator:checked {{ background: {ACCENT}; border-color: {ACCENT}; image: none; }}
+QRadioButton {{ spacing: 6px; }}
+QRadioButton::indicator {{
+    width: 14px; height: 14px; border: 1px solid #8a8a92; border-radius: 8px; background: #26262a;
+}}
+QRadioButton::indicator:hover {{ border-color: #b0b0b8; }}
+QRadioButton::indicator:checked {{ background: qradialgradient(cx:0.5, cy:0.5, radius:0.5, fx:0.5, fy:0.5,
+    stop:0 white, stop:0.35 white, stop:0.45 {ACCENT}, stop:1 {ACCENT}); border-color: {ACCENT}; }}
+QRadioButton::indicator:disabled {{ border-color: #55555c; background: #2a2a2d; }}
 QSlider::groove:horizontal {{ height: 4px; background: #4a4a52; border-radius: 2px; }}
 QSlider::sub-page:horizontal {{ background: #6f8fbf; border-radius: 2px; }}
 QSlider::handle:horizontal {{

@@ -1,5 +1,16 @@
 # Changelog
 
+## v1.9.3
+
+- **Colour codes you can see:** photos with a colour label get a coloured band along the bottom and left of their
+  thumbnail, in the list and the grid.
+- **Label several photos at once:** right-click → *Colour label for N photos* (Red, Yellow, Green, Blue, Purple,
+  or No label). Keys 6–9 still work too.
+- **Batch edit by colour:** *Batch edit → Apply to → Colour label*, then click any mix of colours (and/or *No label*);
+  the counts update and the button says how many photos it will change.
+- **Check by colour:** *Check ▾ → By colour label* ticks every photo with that colour (e.g. to approve them).
+- Fixed: "&" showed as "_" in auto tool names ("Shadows _highlights"); radio buttons are easier to read.
+
 ## v1.9.2
 
 - **Tidier toolbar:** the row of fourteen buttons is now a few groups, so nothing is cut off any more.
