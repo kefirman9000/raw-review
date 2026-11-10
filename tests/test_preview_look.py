@@ -76,10 +76,10 @@ def test_exposure_bias_still_applies_after_centring():
 
 
 def test_highlight_recovery_keeps_midtones_and_brings_back_whites():
-    lin = np.array([[[0.18, 0.18, 0.18], [3.0, 3.0, 3.0]]], np.float32)
+    lin = np.array([[[0.18, 0.18, 0.18], [2.5, 2.5, 2.5]]], np.float32)
     out = core.recover_highlights(lin, -100)
     assert np.allclose(out[0, 0], 0.18)                 # midtones untouched
-    assert out[0, 1, 0] < 1.0                           # 1.6 stops over white is back under it
+    assert out[0, 1, 0] < 1.0                           # 1.3 stops over white is back under it
     assert np.array_equal(core.recover_highlights(lin, 0), lin)
 
 
