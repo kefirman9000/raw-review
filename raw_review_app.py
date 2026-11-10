@@ -47,6 +47,7 @@ HELP_HTML = """
 <tr><td><b>G</b></td><td>Grid view on / off (double-click or Enter opens a photo)</td></tr>
 <tr><td><b>1-5</b>, <b>0</b></td><td>Star rating, clear rating</td></tr>
 <tr><td><b>6 7 8 9</b></td><td>Red / yellow / green / blue label (press again to clear). Right-click for Purple or to label several photos; labelled photos get a coloured band. <i>Check ▾ → By colour label</i> and <i>Batch edit → Colour label</i> work on photos by colour</td></tr>
+<tr><td><b>R</b></td><td>Crop by hand: drag the corners or the frame, pick an aspect ratio in Geometry; Enter = done, Esc = cancel</td></tr>
 <tr><td><b>J</b></td><td>Show clipping: blown highlights red, pure black blue (the histogram's triangles light up when it happens)</td></tr>
 <tr><td><b>E</b> / <b>W</b></td><td>Auto-enhance (uses <i>My auto settings</i>) / auto white balance</td></tr>
 <tr><td><b>C</b></td><td>Check / uncheck this photo</td></tr>
@@ -258,6 +259,11 @@ class ImageView(QtWidgets.QWidget):
         self.split_on = False
         self.split_pos = 0.5
         self._dragging = False
+        # Crop mode: the straightened photo with a draggable frame, box = [l, t, r, b] in 0..1
+        self.crop_mode = False
+        self.crop_box = [0.0, 0.0, 1.0, 1.0]
+        self.crop_aspect = None             # width / height in pixels, None = free
+        self._crop_drag = None              # ("move" | "new" | corner index, start pos, start box)
         self.setMouseTracking(True)
 
     def set_image(self, img, overlay=None, badge=""):
@@ -285,7 +291,9 @@ class ImageView(QtWidgets.QWidget):
             for x, y, col in self.overlay:
                 p.setPen(QtGui.QPen(col, 1.5))
                 p.drawEllipse(QtCore.QPointF(r.x() + x * s, r.y() + y * s), 3, 3)
-            if self.split_on:
+            if self.crop_mode:
+                self._paint_crop(p, r)
+            if self.split_on and not self.crop_mode:
                 x = r.x() + self.split_pos * r.width()
                 p.setPen(QtGui.QPen(QtGui.QColor(255, 255, 255), 2))
                 p.drawLine(QtCore.QPointF(x, r.y()), QtCore.QPointF(x, r.bottom()))
@@ -318,6 +326,123 @@ class ImageView(QtWidgets.QWidget):
                            Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignLeft, self.message)
         p.end()
 
+    # ---- crop frame ----
+    HANDLE = 12
+
+    def _crop_rect(self):
+        r, _s = self._target()
+        l, t, rr, b = self.crop_box
+        return QtCore.QRectF(r.x() + l * r.width(), r.y() + t * r.height(),
+                             (rr - l) * r.width(), (b - t) * r.height())
+
+    def _paint_crop(self, p, r):
+        c = self._crop_rect()
+        shade = QtGui.QColor(0, 0, 0, 150)
+        p.fillRect(QtCore.QRectF(r.left(), r.top(), r.width(), c.top() - r.top()), shade)
+        p.fillRect(QtCore.QRectF(r.left(), c.bottom(), r.width(), r.bottom() - c.bottom()), shade)
+        p.fillRect(QtCore.QRectF(r.left(), c.top(), c.left() - r.left(), c.height()), shade)
+        p.fillRect(QtCore.QRectF(c.right(), c.top(), r.right() - c.right(), c.height()), shade)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QtGui.QPen(QtGui.QColor(255, 255, 255, 110), 1))
+        for f in (1 / 3, 2 / 3):                                  # rule of thirds
+            p.drawLine(QtCore.QPointF(c.left() + f * c.width(), c.top()),
+                       QtCore.QPointF(c.left() + f * c.width(), c.bottom()))
+            p.drawLine(QtCore.QPointF(c.left(), c.top() + f * c.height()),
+                       QtCore.QPointF(c.right(), c.top() + f * c.height()))
+        p.setPen(QtGui.QPen(QtGui.QColor(255, 255, 255), 1.5))
+        p.drawRect(c)
+        p.setBrush(QtGui.QColor(255, 255, 255))
+        for pt in self._corners(c):
+            p.drawRect(QtCore.QRectF(pt.x() - 5, pt.y() - 5, 10, 10))
+
+    @staticmethod
+    def _corners(c):
+        return [c.topLeft(), c.topRight(), c.bottomRight(), c.bottomLeft()]
+
+    def _to_norm(self, pos):
+        r, _s = self._target()
+        return (min(max((pos.x() - r.x()) / max(r.width(), 1.0), 0.0), 1.0),
+                min(max((pos.y() - r.y()) / max(r.height(), 1.0), 0.0), 1.0))
+
+    def _aspect_norm(self):
+        """Required (width / height) of the box in 0..1 units, or None for free."""
+        if not self.crop_aspect or self.img is None:
+            return None
+        return self.crop_aspect * self.img.height() / self.img.width()
+
+    def _box_from_corner(self, ax, ay, x, y):
+        """Box spanning anchor (ax, ay) to the pointer (x, y), honouring the aspect ratio and the frame."""
+        a = self._aspect_norm()
+        w, h = abs(x - ax), abs(y - ay)
+        if a:
+            if w / max(h, 1e-6) > a:
+                w = h * a
+            else:
+                h = w / a
+        sx, sy = (1 if x >= ax else -1), (1 if y >= ay else -1)
+        maxw = (1 - ax) if sx > 0 else ax
+        maxh = (1 - ay) if sy > 0 else ay
+        if w > maxw:
+            w = maxw
+            h = w / a if a else h
+        if h > maxh:
+            h = maxh
+            w = h * a if a else w
+        x2, y2 = ax + sx * w, ay + sy * h
+        return [min(ax, x2), min(ay, y2), max(ax, x2), max(ay, y2)]
+
+    def conform_crop(self):
+        """Fit the current box to the aspect ratio, keeping its centre and staying inside the photo."""
+        a = self._aspect_norm()
+        if not a:
+            return
+        l, t, r, b = self.crop_box
+        cx, cy, w, h = (l + r) / 2, (t + b) / 2, r - l, b - t
+        if w / max(h, 1e-6) > a:
+            w = h * a
+        else:
+            h = w / a
+        if w > 1:
+            w, h = 1.0, 1.0 / a
+        if h > 1:
+            h, w = 1.0, a
+        cx = min(max(cx, w / 2), 1 - w / 2)
+        cy = min(max(cy, h / 2), 1 - h / 2)
+        self.crop_box = [cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2]
+        self.update()
+
+    def _crop_press(self, pos):
+        c = self._crop_rect()
+        for i, pt in enumerate(self._corners(c)):
+            if abs(pos.x() - pt.x()) <= self.HANDLE and abs(pos.y() - pt.y()) <= self.HANDLE:
+                self._crop_drag = (i, pos, list(self.crop_box))
+                return
+        if c.contains(pos):
+            self._crop_drag = ("move", pos, list(self.crop_box))
+        else:
+            x, y = self._to_norm(pos)
+            self._crop_drag = ("new", (x, y), list(self.crop_box))
+
+    def _crop_move(self, pos):
+        kind, start, box = self._crop_drag
+        x, y = self._to_norm(pos)
+        if kind == "move":
+            sx, sy = self._to_norm(start)
+            w, h = box[2] - box[0], box[3] - box[1]
+            l = min(max(box[0] + x - sx, 0.0), 1.0 - w)
+            t = min(max(box[1] + y - sy, 0.0), 1.0 - h)
+            self.crop_box = [l, t, l + w, t + h]
+        elif kind == "new":
+            ax, ay = start
+            if abs(x - ax) > 0.01 or abs(y - ay) > 0.01:
+                self.crop_box = self._box_from_corner(ax, ay, x, y)
+        else:
+            opp = [(box[2], box[3]), (box[0], box[3]), (box[0], box[1]), (box[2], box[1])][kind]
+            nb = self._box_from_corner(opp[0], opp[1], x, y)
+            if nb[2] - nb[0] > 0.03 and nb[3] - nb[1] > 0.03:
+                self.crop_box = nb
+        self.update()
+
     def _split_to(self, pos):
         r, _s = self._target()
         self.split_pos = min(max((pos.x() - r.x()) / max(r.width(), 1.0), 0.0), 1.0)
@@ -328,6 +453,9 @@ class ImageView(QtWidgets.QWidget):
             return
         r, s = self._target()
         pos = e.position()
+        if self.crop_mode:
+            self._crop_press(pos)
+            return
         if self.split_on and not self.crosshair:
             self._dragging = True
             self._split_to(pos)
@@ -337,8 +465,19 @@ class ImageView(QtWidgets.QWidget):
 
     def mouseReleaseEvent(self, e):
         self._dragging = False
+        self._crop_drag = None
 
     def mouseMoveEvent(self, e):
+        if self.crop_mode and self.img is not None:
+            if self._crop_drag is not None:
+                self._crop_move(e.position())
+                return
+            c, pos = self._crop_rect(), e.position()
+            near = any(abs(pos.x() - pt.x()) <= self.HANDLE and abs(pos.y() - pt.y()) <= self.HANDLE
+                       for pt in self._corners(c))
+            self.setCursor(Qt.CursorShape.SizeFDiagCursor if near else
+                           Qt.CursorShape.SizeAllCursor if c.contains(pos) else Qt.CursorShape.CrossCursor)
+            return
         if self._dragging and self.img is not None:
             self._split_to(e.position())
             return
@@ -1253,8 +1392,15 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.render_timer = QTimer(self)
         self.render_timer.setSingleShot(True)
-        self.render_timer.setInterval(35)
+        self.render_timer.setInterval(15)
         self.render_timer.timeout.connect(self.refresh_view)
+        # While a slider moves the preview is drawn at half size (~4x faster) so it follows the
+        # slider; the full-size render replaces it once you pause.
+        self._fast_next = False
+        self.settle_timer = QTimer(self)
+        self.settle_timer.setSingleShot(True)
+        self.settle_timer.setInterval(220)
+        self.settle_timer.timeout.connect(self.refresh_view)
 
         self._restore_map = {}
         self._last_session_text = ""
@@ -1819,6 +1965,23 @@ class MainWindow(QtWidgets.QMainWindow):
         gl.addLayout(row2)
         self.chk_lens = QtWidgets.QCheckBox("Lens profile corrections + remove CA")
         gl.addWidget(self.chk_lens)
+        crow = QtWidgets.QHBoxLayout()
+        self.btn_crop = QtWidgets.QPushButton("✂ Crop")
+        self.btn_crop.setCheckable(True)
+        self.btn_crop.setToolTip("Crop by hand (R): drag the corners, drag inside to move, or drag a new frame.\n"
+                                 "Enter or click again = done, Esc = cancel. Written to Lightroom as its crop.")
+        self.btn_crop.toggled.connect(self.on_crop_toggle)
+        crow.addWidget(self.btn_crop)
+        self.crop_aspect_combo = QtWidgets.QComboBox()
+        self.crop_aspect_combo.addItems(["Original", "Free", "1:1", "4:5", "5:4", "3:2", "2:3", "16:9"])
+        self.crop_aspect_combo.setToolTip("Aspect ratio of the crop frame")
+        self.crop_aspect_combo.currentIndexChanged.connect(lambda _i: self._crop_aspect_changed())
+        crow.addWidget(self.crop_aspect_combo, 1)
+        self.btn_crop_reset = QtWidgets.QPushButton("Reset crop")
+        self.btn_crop_reset.setToolTip("Remove the crop (keeps the straightening)")
+        self.btn_crop_reset.clicked.connect(self.reset_crop)
+        crow.addWidget(self.btn_crop_reset)
+        gl.addLayout(crow)
         self.chk_subject_crop = QtWidgets.QCheckBox("Crop to centre the subject")
         self.chk_subject_crop.setToolTip("Minimal crop (same aspect ratio) that puts the main subject - a plane,\n"
                                          "a car - in the middle of the frame. Untick to remove the crop.")
@@ -1912,6 +2075,7 @@ class MainWindow(QtWidgets.QMainWindow):
         def sc(key, fn):
             s = QtGui.QShortcut(QtGui.QKeySequence(key), self)
             s.activated.connect(fn)
+            return s
         sc("A", self.approve)
         sc("X", self.reject)
         sc("Right", lambda: self.step(1))
@@ -1926,6 +2090,13 @@ class MainWindow(QtWidgets.QMainWindow):
         sc("C", self.toggle_check_current)
         sc("G", lambda: self.act_grid.toggle())
         sc("J", lambda: self.chk_clip.toggle())
+        sc("R", lambda: self.btn_crop.toggle())
+        # Enter / Esc finish or cancel a crop; only active while cropping (Enter opens photos in the grid)
+        self._crop_keys = [sc("Return", lambda: self.btn_crop.setChecked(False)),
+                           sc("Enter", lambda: self.btn_crop.setChecked(False)),
+                           sc("Escape", self.cancel_crop)]
+        for k in self._crop_keys:
+            k.setEnabled(False)
         for n in range(6):
             sc(str(n), lambda n=n: self.set_rating(n))
         for key, lab in zip("6789", core.LABELS):
@@ -1936,7 +2107,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _set_controls_enabled(self, on):
         widgets = [self.wb_combo, self.btn_auto_wb, self.btn_eyedrop, self.level_combo, self.btn_level,
-                   self.chk_lens, self.chk_subject_crop, self.btn_enhance, self.btn_reset_auto, self.btn_reset_shot,
+                   self.chk_lens, self.chk_subject_crop, self.btn_crop, self.btn_crop_reset,
+                   self.crop_aspect_combo, self.btn_enhance, self.btn_reset_auto, self.btn_reset_shot,
                    self.btn_copy, self.btn_paste, self.btn_approve, self.btn_reject]
         mask_keys = set(core.MASK_KEYS["sky"]) | set(core.MASK_KEYS["subject"])
         widgets += [w for k, w in self.sliders.items() if k not in mask_keys]
@@ -2502,6 +2674,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_row(self, row):
         if row < 0:
             return
+        if self.view.crop_mode:
+            self.btn_crop.setChecked(False)           # moving on: apply the crop to the photo you were on
         path = self.list.item(row).data(Qt.ItemDataRole.UserRole)
         self.current = self.items.get(path)
         self.btn_eyedrop.setChecked(False)
@@ -2613,6 +2787,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_undo_buttons()
         self._mark_changed(it)
         self._propagate(old, e)
+        self._fast_next = True
         self.render_timer.start()
 
     def _mark_changed(self, it):
@@ -2654,7 +2829,19 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         before = self.chk_before.isChecked() or self._hold_before
         split = self.chk_split.isChecked() and not before
-        img, self.geom = core.render(dec, it.edit, original=before,
+        fast = self._fast_next and not before and dec.color.model is None
+        self._fast_next = False
+        if fast:
+            dec = core.half_decoded(dec, it.edit)      # quick draft while the slider moves
+            self.settle_timer.start()
+        else:
+            self.settle_timer.stop()
+        shown = it.edit
+        if self.view.crop_mode:
+            before, split = False, False
+            shown = it.edit.copy()
+            shown.crop_box = None                     # crop mode: the whole straightened frame + the frame
+        img, self.geom = core.render(dec, shown, original=before,
                                      show_masks=self.chk_masks.isChecked() and not before)
         if split:
             orig, _g = core.render(dec, it.edit, original=True, rotate=False)
@@ -2663,7 +2850,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 import cv2
                 orig = cv2.resize(orig, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_AREA)
             self._split_cache = (orig, img)
-        if not before and it.list_item is not None:
+        if not before and not fast and it.list_item is not None:
             import cv2
             h, w = img.shape[:2]
             k = min(GRID_W / w, GRID_H / h)
@@ -2679,9 +2866,11 @@ class MainWindow(QtWidgets.QMainWindow):
                     if 0 <= dx < img.shape[1] and 0 <= dy < img.shape[0]:
                         overlay.append((dx, dy, col))
         badge = "BEFORE (as shot)" if before else ""
+        if self.view.crop_mode:
+            badge = "Crop: drag the corners or the frame · Enter = done · Esc = cancel"
         if not before and it.edit.upright != "Off":
             badge = f"Upright: {it.edit.upright} (applied by Lightroom, not shown here)"
-        elif not before and (it.edit.sky_on or it.edit.subj_on):
+        elif not before and not self.view.crop_mode and (it.edit.sky_on or it.edit.subj_on):
             on = " + ".join(n for n, f in (("Sky", it.edit.sky_on), ("Subject", it.edit.subj_on)) if f)
             badge = f"{on} mask: approximate preview – Lightroom computes the exact mask"
         self.view.split_on = split
@@ -2758,6 +2947,83 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             it.edit.crop_box = None
             auto.replace_note(it.edit, "Subject crop", "Subject crop: off")
+        self._mark_changed(it)
+        self.load_controls()
+        self.refresh_view()
+
+    # ---------------- hand crop ----------------
+    def _crop_aspect_value(self, img_w, img_h):
+        t = self.crop_aspect_combo.currentText()
+        if t == "Free":
+            return None
+        if t == "Original":
+            return img_w / max(img_h, 1)
+        a, b = (float(v) for v in t.split(":"))
+        return a / b
+
+    def _crop_aspect_changed(self):
+        v = self.view
+        if v.crop_mode and v.img is not None:
+            v.crop_aspect = self._crop_aspect_value(v.img.width(), v.img.height())
+            v.conform_crop()
+
+    def on_crop_toggle(self, on):
+        it = self.current
+        if on:
+            if it is None or it.edit is None:
+                self.btn_crop.setChecked(False)
+                return
+            self.view.crop_mode = True
+            for k in self._crop_keys:
+                k.setEnabled(True)
+            self.view.crop_box = list(it.edit.crop_box or [0.0, 0.0, 1.0, 1.0])
+            self.refresh_view()                       # shows the whole straightened photo
+            self._crop_aspect_changed()
+            if not it.edit.crop_box:
+                self.view.conform_crop()
+        else:
+            if self.view.crop_mode and not getattr(self, "_crop_cancel", False):
+                self._commit_crop()
+            self._crop_cancel = False
+            self.view.crop_mode = False
+            for k in self._crop_keys:
+                k.setEnabled(False)
+            self.refresh_view()
+
+    def cancel_crop(self):
+        if self.view.crop_mode:
+            self._crop_cancel = True
+            self.btn_crop.setChecked(False)
+
+    def _commit_crop(self):
+        it = self.current
+        if it is None or it.edit is None:
+            return
+        box = [round(float(x), 5) for x in self.view.crop_box]
+        if box[0] <= 0.002 and box[1] <= 0.002 and box[2] >= 0.998 and box[3] >= 0.998:
+            box = None                                # the whole frame: no crop
+        if box == it.edit.crop_box:
+            return
+        self._record_undo(it, it.edit.copy())
+        it.edit.crop_box = box
+        auto.replace_note(it.edit, "Subject crop", "Crop: set by hand" if box else "Crop: none")
+        self._mark_changed(it)
+        self.load_controls()
+        self.statusBar().showMessage("Crop applied – written to Lightroom when approved." if box
+                                     else "Crop removed.", 4000)
+
+    def reset_crop(self):
+        if self.view.crop_mode:
+            self.view.crop_box = [0.0, 0.0, 1.0, 1.0]
+            self._crop_aspect_changed()
+            self.view.update()
+            return
+        it = self.current
+        if it is None or it.edit is None or not it.edit.crop_box:
+            return
+        self._record_undo(it, it.edit.copy())
+        it.edit.crop_box = None
+        auto.replace_note(it.edit, "Subject crop", "Crop: none")
         self._mark_changed(it)
         self.load_controls()
         self.refresh_view()

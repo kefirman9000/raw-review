@@ -789,13 +789,30 @@ def apply_tone(g: np.ndarray, e: Edit, stop: str | None = None, base_c: float = 
 
 
 def apply_colour(g: np.ndarray, e: Edit) -> np.ndarray:
+    """Vibrance (boosts muted colours most) and saturation, around each pixel's channel mean.
+    Written channel by channel: numpy's reductions across the colour axis were ~5x slower."""
+    if not e.vibrance and not e.saturation:
+        return g
+    g = np.array(g, dtype=np.float32, copy=True)
+    third = np.float32(1.0 / 3.0)
     if e.vibrance:
-        mean = g.mean(axis=2, keepdims=True)
-        sat = (g.max(axis=2) - g.min(axis=2))[..., None]
-        g = mean + (g - mean) * (1 + e.vibrance / 100.0 * (1 - np.clip(sat, 0, 1)))
+        r, gg, b = g[..., 0], g[..., 1], g[..., 2]
+        mean = (r + gg + b) * third
+        sat = np.maximum(np.maximum(r, gg), b) - np.minimum(np.minimum(r, gg), b)
+        k = np.float32(1.0) + np.float32(e.vibrance / 100.0) * (np.float32(1.0) - np.clip(sat, 0, 1))
+        for c in range(3):
+            ch = g[..., c]
+            ch -= mean
+            ch *= k
+            ch += mean
     if e.saturation:
-        mean = g.mean(axis=2, keepdims=True)
-        g = mean + (g - mean) * (1 + e.saturation / 100.0)
+        mean = (g[..., 0] + g[..., 1] + g[..., 2]) * third
+        k = np.float32(1.0 + e.saturation / 100.0)
+        for c in range(3):
+            ch = g[..., c]
+            ch -= mean
+            ch *= k
+            ch += mean
     return g
 
 
@@ -1061,6 +1078,29 @@ def apply_masks(g: np.ndarray, dec: Decoded, e: Edit) -> np.ndarray:
         g = _apply_local(g, estimate_subject(dec)[0], e.subj_exposure, e.subj_contrast, 0, e.subj_shadows,
                          0, e.subj_saturation, 0, e.subj_texture, e.subj_clarity)
     return g
+
+
+def half_decoded(dec: Decoded, edit: Edit | None = None) -> Decoded:
+    """
+    A half-size copy of `dec` (cached on it) for a quick preview while a slider is being dragged:
+    about 4x fewer pixels, so the photo follows the slider; the full-size render replaces it as
+    soon as you stop. The sky / subject masks are the full ones shrunk, so they match exactly.
+    Not for DNGs with their own profile (it may carry per-pixel maps sized to the full image).
+    """
+    half = dec.masks.get("_half")
+    if half is None:
+        h, w = dec.cam.shape[:2]
+        cam = cv2.resize(dec.cam, (max(1, w // 2), max(1, h // 2)), interpolation=cv2.INTER_AREA)
+        half = Decoded(cam=cam, color=dec.color, baseline=dec.baseline, source_size=dec.source_size,
+                       quality=dec.quality, masks={})
+        dec.masks["_half"] = half
+    hh, hw = half.cam.shape[:2]
+    for key, on, fn in (("sky", edit is not None and edit.sky_on, estimate_sky),
+                        ("subject", edit is not None and edit.subj_on, estimate_subject)):
+        if key not in half.masks and (on or key in dec.masks):
+            m, frac, conf = fn(dec)
+            half.masks[key] = (cv2.resize(m, (hw, hh), interpolation=cv2.INTER_AREA), frac, conf)
+    return half
 
 
 def render(dec: Decoded, edit: Edit, original: bool = False, rotate: bool = True, show_masks: bool = False,

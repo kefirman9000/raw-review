@@ -1,5 +1,15 @@
 # Changelog
 
+## v1.9.5
+
+- **Livelier preview:** while you drag a slider the photo now follows it (about 15-20 updates a second instead of
+  about 3): a quick half-size draft is drawn while you move, and the full-size preview replaces it as soon as you
+  pause. The full render itself is ~40% faster too (vibrance/saturation went from 160 ms to ~25 ms).
+- **Crop by hand:** *✂ Crop* in Geometry (or **R**) shows the whole straightened photo with a crop frame: drag the
+  corners, drag inside to move, or drag a new frame. Aspect ratio: Original, Free, 1:1, 4:5, 5:4, 3:2, 2:3, 16:9.
+  Enter (or the button again) applies it, Esc cancels, *Reset crop* removes it; Undo works. Written to Lightroom
+  as its crop, so it's already done when you open the photo there.
+
 ## v1.9.4
 
 - **Choose what Paste copies:** Paste now asks which parts to copy (white balance, exposure, tone, colour, masks,

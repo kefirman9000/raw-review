@@ -38,6 +38,7 @@ Space Station (public domain). A tungsten-light cast was simulated, then removed
 - **Straighten modes:** Off · Auto (best guess) · Horizon (rotate) · Verticals (rotate) · Lightroom **Upright: Level / Vertical / Auto / Full** (Full = architecture).
 - **✎ Edited mark:** photos you change are marked ✎ Edited. Use *Select ▾ → Not edited* or the *Show* filter to find the ones you haven't touched yet.
 - **Apply auto settings to selected / checked:** select photos (or tick them), then *Apply auto settings to selected…* (Ctrl+Shift+E) or *…to checked* in the toolbar, or right-click, to run chosen auto tools with their own options on just those photos.
+- **Crop by hand:** *✂ Crop* in Geometry (or `R`) shows the whole photo with a frame to drag; pick Original, Free, 1:1, 4:5, 3:2, 16:9… Written to Lightroom as its crop.
 - **Subject crop (optional):** a minimal, same-aspect crop that centres the main subject (planes, cars…). Turn it on in *Auto ▾ → Tools that run on new photos*, or per photo under *Geometry*.
 - **Auto tone, each one separate:** exposure, levels (blacks & whites), shadows & highlights, contrast, colour (vibrance & saturation). Aims for a normal-looking photo; strength and an exposure bias are adjustable under *Auto ▾ → Tools that run on new photos*.
 - **Auto sharpening and noise reduction**, from noise and softness measured on the full-resolution image.
@@ -79,6 +80,7 @@ Space Station (public domain). A tungsten-light cast was simulated, then removed
 | `G` | Grid view on / off (double-click or `Enter` opens a photo; with several selected, `A` / `X` act on all of them) |
 | `Ctrl+Z` / `Ctrl+Y` | Undo / redo the last change to this photo (each photo has its own history) |
 | `1`–`5` / `0` | Star rating / clear (several selected photos at once) |
+| `R` | Crop by hand (Enter = done, Esc = cancel) |
 | `6` `7` `8` `9` | Red / yellow / green / blue label (press again to clear; right-click for Purple or several photos) |
 | `Ctrl+F` | Find a photo by name |
 | `?` / `F1` | All shortcuts and tips |
