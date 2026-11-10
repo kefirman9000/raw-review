@@ -773,9 +773,14 @@ class BatchDialog(QtWidgets.QDialog):
             grp.addButton(rb)
             gl.addWidget(rb)
             self.scope_btns[key] = rb
-        first = next((k for k in ("checked", "selected", "all", "current") if counts.get(k, 0) > 0
-                      and (k != "selected" or counts[k] > 1)), "all")
+        # Default to what you deliberately picked (ticked, or several selected), else just this photo.
+        # Never "All photos" unless you choose it.
+        first = next((k for k in ("checked", "selected") if counts.get(k, 0) > (0 if k == "checked" else 1)),
+                     "current" if counts.get("current", 0) else "all")
         self.scope_btns[first].setChecked(True)
+        self.counts = counts
+        for rb in self.scope_btns.values():
+            rb.toggled.connect(lambda _on: self._update_apply_text())
         lay.addWidget(g)
 
         ga = QtWidgets.QGroupBox("Run automatic tools")
@@ -847,7 +852,8 @@ class BatchDialog(QtWidgets.QDialog):
 
         bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Ok |
                                         QtWidgets.QDialogButtonBox.StandardButton.Cancel)
-        bb.button(QtWidgets.QDialogButtonBox.StandardButton.Ok).setText("Apply")
+        self.apply_btn = bb.button(QtWidgets.QDialogButtonBox.StandardButton.Ok)
+        self._update_apply_text()
         bb.accepted.connect(self._accept)
         bb.rejected.connect(self.reject)
         lay.addWidget(bb)
@@ -871,6 +877,13 @@ class BatchDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.information(self, "Batch edit", "Tick at least one automatic tool or setting.")
             return
         self.accept()
+
+    def _update_apply_text(self):
+        if not hasattr(self, "apply_btn"):
+            return
+        key = next((k for k, rb in self.scope_btns.items() if rb.isChecked()), "current")
+        n = self.counts.get(key, 0)
+        self.apply_btn.setText(f"Apply to {n} photo" + ("" if n == 1 else "s"))
 
     def spec(self) -> "auto.BatchSpec":
         scope = next(k for k, rb in self.scope_btns.items() if rb.isChecked())
@@ -1412,6 +1425,21 @@ class MainWindow(QtWidgets.QMainWindow):
         bar.addWidget(self.thumb_lbl)
         bar.addWidget(self.thumb_size)
         cl.addLayout(bar)
+        self.sync_banner = QtWidgets.QFrame()
+        self.sync_banner.setObjectName("syncBanner")
+        self.sync_banner.setStyleSheet(
+            "#syncBanner{background:#5a4510;border:1px solid #c79a2a;border-radius:6px;}"
+            "#syncBanner QLabel{color:#ffe7a8;font-weight:bold;}")
+        sbl = QtWidgets.QHBoxLayout(self.sync_banner)
+        sbl.setContentsMargins(10, 4, 6, 4)
+        self.sync_banner_lbl = QtWidgets.QLabel("")
+        sbl.addWidget(self.sync_banner_lbl, 1)
+        self.sync_only_btn = QtWidgets.QPushButton("Only this photo")
+        self.sync_only_btn.setToolTip("Stop copying changes to other photos")
+        self.sync_only_btn.clicked.connect(lambda: self.scope_combo.setCurrentIndex(0))
+        sbl.addWidget(self.sync_only_btn)
+        self.sync_banner.hide()
+        cl.addWidget(self.sync_banner)
         cl.addWidget(self.stack, 1)
         self.view.splitMoved.connect(lambda _p: self._compose_split())
         self.notes_lbl = QtWidgets.QLabel("")
@@ -1468,6 +1496,7 @@ class MainWindow(QtWidgets.QMainWindow):
                                      "(e.g. +0.3 EV brighter on all of them).")
         self.scope_lbl = QtWidgets.QLabel("")
         self.scope_lbl.setStyleSheet("color:#9ab;")
+        self.scope_lbl.setWordWrap(True)
         sl.addWidget(self.scope_combo, 0, 0)
         sl.addWidget(self.chk_relative, 0, 1)
         sl.addWidget(self.scope_lbl, 1, 0, 1, 2)
@@ -1925,7 +1954,8 @@ class MainWindow(QtWidgets.QMainWindow):
         extra += self._cull_text(it)
         if it.edited:
             extra = " · ✎ Edited" + extra
-        it.list_item.setText(f"{os.path.basename(it.path)}\n{label}{extra}{sidecar}"
+        link = "🔗 " if it.path in getattr(self, "_linked", ()) else ""
+        it.list_item.setText(f"{link}{os.path.basename(it.path)}\n{label}{extra}{sidecar}"
                              + (f"\n{extra_meta}" if extra_meta else ""))
         it.list_item.setBackground(QtGui.QBrush(col) if col else QtGui.QBrush())
         it.list_item.setForeground(QtGui.QBrush(QtGui.QColor("white")) if col else QtGui.QBrush())
@@ -2035,7 +2065,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if it.edited:
             low = " · ✎ Edited" + low
         meta = self._meta_text(it)
-        gi.setText(f"{mark}{os.path.basename(it.path)}\n{label}{low}" + (f"\n{meta}" if meta else ""))
+        link = "🔗 " if it.path in getattr(self, "_linked", ()) else ""
+        gi.setText(f"{link}{mark}{os.path.basename(it.path)}\n{label}{low}" + (f"\n{meta}" if meta else ""))
         gi.setBackground(QtGui.QBrush(col) if col else QtGui.QBrush())
         gi.setForeground(QtGui.QBrush(QtGui.QColor("white")))
         if it.error:
@@ -2144,14 +2175,32 @@ class MainWindow(QtWidgets.QMainWindow):
         if not hasattr(self, "scope_lbl"):
             return
         sc = self.edit_scope()
-        if sc == "current":
-            self.scope_lbl.setText("Changes affect only the photo shown.")
-            return
-        n = len(self._scope_targets())
+        targets = self._scope_targets() if sc != "current" else []
+        n = len(targets)
         how = "added to each photo's own values" if self.chk_relative.isChecked() else "copied exactly"
         word = "selected" if sc == "selected" else "checked"
-        self.scope_lbl.setText(f"This photo + {n} other {word} photo(s) · changes {how}"
-                               if n else f"No other {word} photos – only this photo changes.")
+        if sc == "current":
+            self.scope_lbl.setText("Changes affect only the photo shown.")
+        else:
+            self.scope_lbl.setText(f"This photo + {n} other {word} photo(s) · changes {how}"
+                                   if n else f"No other {word} photos – only this photo changes.")
+        # Make multi-photo editing impossible to miss: a banner over the photo and 🔗 in the list
+        if hasattr(self, "sync_banner"):
+            if n:
+                self.sync_banner_lbl.setText(
+                    f"🔗  Editing {n + 1} photos at once: slider changes are {how} to every 🔗 photo "
+                    f"({word} in the list)")
+            self.sync_banner.setVisible(bool(n))
+        linked = {t.path for t in targets}
+        if n and self.current is not None:
+            linked.add(self.current.path)
+        old = getattr(self, "_linked", set())
+        self._linked = linked
+        for path in old ^ linked:
+            it = self.items.get(path)
+            if it is not None and it.list_item is not None:
+                self._update_list_item(it)
+                self._update_grid_item(it)
 
     def _propagate(self, old, new):
         """Copy the settings that just changed on the current photo to the scope's other photos."""
@@ -2326,10 +2375,10 @@ class MainWindow(QtWidgets.QMainWindow):
             st = core.SETTINGS[key]
             v = s.value()
             val = int(round(v)) if st.integer else round(v, st.decimals)
-            old = getattr(e, key)
-            if st.optional and (val != old or val != st.default):
+            prev = getattr(e, key)          # (not "old": that's the whole edit before this change)
+            if st.optional and (val != prev or val != st.default):
                 e.touched.add(key)          # now written to the sidecar
-            if key == "angle" and abs(val - old) > 1e-9:
+            if key == "angle" and abs(val - prev) > 1e-9:
                 e.level_mode = "Manual"
                 self._loading_controls = True
                 self.level_combo.setCurrentText("Manual")
@@ -3095,7 +3144,7 @@ class MainWindow(QtWidgets.QMainWindow):
             pass
         self.chk_autowrite.setChecked(bool(st.get("auto_write", False)))
         self.chk_relative.setChecked(bool(st.get("relative", False)))
-        self.scope_combo.setCurrentIndex(int(st.get("scope", 0)) if str(st.get("scope", 0)).isdigit() else 0)
+        self.scope_combo.setCurrentIndex(0)       # always start on "This photo" (never silently multi-photo)
         self.chk_samples.setChecked(bool(st.get("show_wb_samples", False)))
         self.chk_masks.setChecked(bool(st.get("show_masks", False)))
         self.chk_clip.setChecked(bool(st.get("show_clipping", False)))
@@ -3122,7 +3171,6 @@ class MainWindow(QtWidgets.QMainWindow):
             "last_dir": self.last_dir,
             "auto_write": self.chk_autowrite.isChecked(),
             "relative": self.chk_relative.isChecked(),
-            "scope": self.scope_combo.currentIndex(),
             "show_wb_samples": self.chk_samples.isChecked(),
             "show_masks": self.chk_masks.isChecked(),
             "show_clipping": self.chk_clip.isChecked(),

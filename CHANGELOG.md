@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- **Always clear which photos you're editing:** when slider changes go to more than one photo, an amber banner sits
+  above the photo ("Editing 3 photos at once…") with an **Only this photo** button, and every affected photo is
+  marked 🔗 in the list. The app always starts on *This photo*; it no longer remembers a multi-photo choice from last
+  time.
+- **Batch edit never defaults to all photos:** it starts on your ticked photos, or several selected ones, otherwise
+  just this photo. The button says how many it will change ("Apply to 2 photos").
+- **Fixed: slider changes going wrong.** Moving a slider (other than white balance) hit an error part-way through:
+  the value changed, but it wasn't added to Undo, wasn't copied to the other photos when editing several, and the
+  photo wasn't marked as edited.
+- Look: rounded buttons, card-style sections, visible checkboxes, styled sliders; the right panel fits its width.
+
 ## v1.9.0
 
 - **Histogram:** a Lightroom-style histogram now sits at the top of the right-hand panel: luminance plus red, green
