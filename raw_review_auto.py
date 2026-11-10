@@ -60,7 +60,7 @@ SHARP_RATIO_SOFT = 1.6     # ... and of a very soft one
 NOISE_FLOOR = 0.005        # luminance noise below this needs no reduction
 # Histogram centring (see center_exposure): after the tone tools have run, exposure is nudged
 # until the finished photo's median brightness sits in the middle of the histogram.
-TARGET_MEDIAN = 0.50       # median luminance of the finished photo (display units, 0..1)
+TARGET_MEDIAN = 0.45       # median luminance of the finished photo (display units, 0..1); 0.50 read slightly bright
 CENTER_MAX_CLIPPED = 0.005 # Highlights is pulled down until no more than this share is blown
 # ---------------------------------------------------------------------------
 

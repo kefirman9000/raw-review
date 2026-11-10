@@ -699,7 +699,7 @@ def _srgb_encode(x):
 # RECOVER_FROM (linear, ~0.63 on screen) move, and at -100 up to RECOVER_STOPS stops of
 # highlight detail above white are brought back under white. Midtones are left alone.
 RECOVER_FROM = 0.35
-RECOVER_STOPS = 2.0
+RECOVER_STOPS = 1.5            # Lightroom brings back ~1.5 stops at -100; 2.0 overstated it
 
 
 def recover_highlights(lin: np.ndarray, highlights: float) -> np.ndarray:

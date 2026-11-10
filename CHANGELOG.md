@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.8.3
+
+- **Auto exposure a touch darker:** photos were often coming out slightly overexposed. The histogram's middle is
+  now aimed a little below centre (0.45 instead of 0.50, about a third of a stop darker), and the preview assumes
+  Highlights can recover a bit less (about 1.5 stops at -100, closer to Lightroom), so bright areas get pulled back
+  harder when needed. Want it brighter or darker still? Set *Brightness* in My auto settings.
+
 ## v1.8.2
 
 - **✎ Edited mark:** any photo you change after its auto proposal (sliders, white balance, straighten, crop, paste,
