@@ -2123,3 +2123,45 @@ def restore_output(raw_path: str, snap: dict, written_hash) -> str:
     if raw_fingerprint(raw_path) != before:
         raise RawSafetyError(f"{raw_path} changed during undo - stopping.")
     return msg
+
+
+# --------------------------------------------------------------------------
+# Histogram + clipping overlay for the preview (display only)
+# --------------------------------------------------------------------------
+BLOWN_LEVEL = 254        # any channel at or above this (0..255) counts as blown
+BLACK_LEVEL = 1          # every channel at or below this counts as pure black
+
+
+@dataclass
+class Histogram:
+    r: np.ndarray            # 256 counts per channel
+    g: np.ndarray
+    b: np.ndarray
+    lum: np.ndarray          # 256 counts of luminance
+    median: float            # median luminance, 0..1 (what auto exposure aims at TARGET_MEDIAN)
+    blown: float             # share of pixels with a channel blown to white
+    black: float             # share of pixels crushed to pure black
+
+
+def histogram(img: np.ndarray) -> Histogram:
+    """Histogram of a displayed uint8 RGB image (subsampled for speed: ~250k pixels)."""
+    step = max(1, int(np.sqrt(img.shape[0] * img.shape[1] / 250_000)))
+    sub = img[::step, ::step]
+    r, g, b = (np.ascontiguousarray(sub[..., i]).ravel() for i in range(3))
+    # Rec.709 luminance in integer maths (54 + 183 + 19 = 256)
+    lum = ((r.astype(np.uint16) * 54 + g.astype(np.uint16) * 183 + b.astype(np.uint16) * 19 + 128) >> 8)
+    counts = [np.bincount(c, minlength=256)[:256] for c in (r, g, b, lum)]
+    cum = np.cumsum(counts[3])
+    median = float(np.searchsorted(cum, cum[-1] / 2)) / 255.0
+    mx = np.maximum(np.maximum(r, g), b)
+    return Histogram(*counts, median=median, blown=float((mx >= BLOWN_LEVEL).mean()),
+                     black=float((mx <= BLACK_LEVEL).mean()))
+
+
+def clip_overlay(img: np.ndarray) -> np.ndarray:
+    """Lightroom-style clipping warning: blown areas red, pure black areas blue."""
+    mx = np.maximum(np.maximum(img[..., 0], img[..., 1]), img[..., 2])
+    out = img.copy()
+    out[mx >= BLOWN_LEVEL] = (255, 0, 0)
+    out[mx <= BLACK_LEVEL] = (0, 90, 255)
+    return out

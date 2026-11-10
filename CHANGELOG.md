@@ -1,5 +1,19 @@
 # Changelog
 
+## v1.9.0
+
+- **Histogram:** a Lightroom-style histogram now sits at the top of the right-hand panel: luminance plus red, green
+  and blue. The dashed line marks the middle, where auto exposure aims; a yellow tick shows the photo's median, with
+  the median and the share of blown and pure-black pixels underneath. With *Before* held it shows the original.
+- **Clipping warning (J):** tick *Clipping* under the photo, press **J**, or click the histogram's corner triangles
+  to show blown highlights in red and pure black in blue (works in Split view too). The triangles light up when
+  anything is clipped.
+- **Auto exposure stops blowing out white subjects:** the histogram showed a white plane's fuselage blown on
+  "centred" photos. Auto exposure's highlight check looked at overall brightness before colour, but on a white
+  subject in warm light one colour channel blows first, and Vibrance can push it further. It now checks exactly what
+  the histogram's warning shows (any channel, after colour), so Highlights is pulled down far enough. On the test
+  photo, blown went from 2.5% to under 1% at the same brightness.
+
 ## v1.8.4
 
 - **Auto levels no longer crushes the shadows:** on hazy or daylight scenes with no true black, Auto levels pulled

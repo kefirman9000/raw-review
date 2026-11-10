@@ -459,6 +459,17 @@ def _finished_luma(dec, edit) -> np.ndarray:
     return _stage(dec, edit, "final")[1]
 
 
+def _blown_share(dec, edit) -> float:
+    """
+    Share of the photo the preview shows as blown (the histogram's red warning): any channel,
+    after tone and colour, with the preview's rounding. On a white subject in warm light one
+    channel blows well before overall brightness does, and Vibrance can push it over too.
+    """
+    g = core.apply_colour(_stage(dec, edit, "final")[0], edit)
+    mx = np.maximum(np.maximum(g[..., 0], g[..., 1]), g[..., 2])
+    return float((mx >= (core.BLOWN_LEVEL - 0.5) / 255.0).mean())
+
+
 def center_exposure(dec, edit, strength=1.0, bias=0.0) -> str:
     """
     Put the finished photo's histogram in the middle, the way you'd do it by hand:
@@ -471,7 +482,7 @@ def center_exposure(dec, edit, strength=1.0, bias=0.0) -> str:
     s_exp, s_hl, s_lights = edit.exposure, edit.highlights, edit.lights
 
     def clipped(e):
-        return float((_finished_luma(dec, e) > 0.985).mean())
+        return _blown_share(dec, e)
 
     def seek():
         for _ in range(8):
@@ -531,7 +542,7 @@ def run_auto(dec, edit, groups, opts: AutoOptions | None = None, user_rules: boo
     s = opts.strength
     out = {}
     base = edit.copy()
-    centre_at = GROUP_ORDER.index("contrast")
+    centre_at = GROUP_ORDER.index("colour")      # after tone and colour (vibrance can blow a channel)
     centred = "exposure" not in groups
 
     def centre():

@@ -47,6 +47,7 @@ HELP_HTML = """
 <tr><td><b>G</b></td><td>Grid view on / off (double-click or Enter opens a photo)</td></tr>
 <tr><td><b>1-5</b>, <b>0</b></td><td>Star rating, clear rating</td></tr>
 <tr><td><b>6 7 8 9</b></td><td>Red / yellow / green / blue label (press again to clear)</td></tr>
+<tr><td><b>J</b></td><td>Show clipping: blown highlights red, pure black blue (the histogram's triangles light up when it happens)</td></tr>
 <tr><td><b>E</b> / <b>W</b></td><td>Auto-enhance (uses <i>My auto settings</i>) / auto white balance</td></tr>
 <tr><td><b>C</b></td><td>Check / uncheck this photo</td></tr>
 <tr><td><b>Ctrl+Z</b> / <b>Ctrl+Y</b></td><td>Undo / redo the last change to this photo</td></tr>
@@ -345,6 +346,96 @@ class ImageView(QtWidgets.QWidget):
             self.setCursor(Qt.CursorShape.SplitHCursor)
         else:
             self.setCursor(Qt.CursorShape.ArrowCursor)
+
+
+class HistogramWidget(QtWidgets.QWidget):
+    """Lightroom-style histogram of the preview, with clipping warnings.
+    The dashed line marks the middle, where auto exposure aims the median."""
+    clipToggled = Signal()
+
+    TRI = 12                              # size of the clipping triangles
+
+    def __init__(self):
+        super().__init__()
+        self.setFixedHeight(128)
+        self.hist: core.Histogram | None = None
+        self.clip_on = False
+        self.before = False
+        self.setToolTip("Histogram of the preview: dark tones left, bright tones right.\n"
+                        "Dashed line = middle, where auto exposure aims.\n"
+                        "Triangles light up when shadows (blue) or highlights (red) are clipped;\n"
+                        "click them or press J to show clipping on the photo.")
+
+    def set_histogram(self, hist, before=False):
+        self.hist, self.before = hist, before
+        self.update()
+
+    def _plot_rect(self):
+        return QtCore.QRectF(6, self.TRI + 6, self.width() - 12, self.height() - self.TRI - 30)
+
+    def paintEvent(self, _e):
+        p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        p.fillRect(self.rect(), QtGui.QColor(28, 28, 30))
+        r = self._plot_rect()
+        guide = QtGui.QPen(QtGui.QColor(70, 70, 74), 1)
+        for f in (0.25, 0.75):
+            x = r.x() + f * r.width()
+            p.setPen(guide)
+            p.drawLine(QtCore.QPointF(x, r.top()), QtCore.QPointF(x, r.bottom()))
+        mid = QtGui.QPen(QtGui.QColor(150, 150, 155), 1, Qt.PenStyle.DashLine)
+        p.setPen(mid)
+        p.drawLine(QtCore.QPointF(r.center().x(), r.top()), QtCore.QPointF(r.center().x(), r.bottom()))
+        h = self.hist
+        if h is not None:
+            peak = max(float(max(c[1:255].max() for c in (h.r, h.g, h.b, h.lum))), 1.0)
+
+            def path(counts):
+                ys = np.sqrt(np.minimum(counts / peak, 1.0))       # sqrt: small tones stay visible
+                pp = QtGui.QPainterPath(QtCore.QPointF(r.left(), r.bottom()))
+                for i, y in enumerate(ys):
+                    pp.lineTo(r.left() + i / 255.0 * r.width(), r.bottom() - y * r.height())
+                pp.lineTo(r.right(), r.bottom())
+                pp.closeSubpath()
+                return pp
+
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QtGui.QColor(170, 170, 175, 90))
+            p.drawPath(path(h.lum))
+            p.setCompositionMode(QtGui.QPainter.CompositionMode.CompositionMode_Plus)
+            for counts, col in ((h.r, (150, 30, 30)), (h.g, (30, 130, 40)), (h.b, (35, 55, 160))):
+                p.setBrush(QtGui.QColor(*col, 200))
+                p.drawPath(path(counts))
+            p.setCompositionMode(QtGui.QPainter.CompositionMode.CompositionMode_SourceOver)
+            mx = r.left() + h.median * r.width()
+            p.setPen(QtGui.QPen(QtGui.QColor(255, 210, 90), 2))
+            p.drawLine(QtCore.QPointF(mx, r.bottom() - 6), QtCore.QPointF(mx, r.bottom()))
+        # clipping triangles
+        for left in (True, False):
+            clipped = h is not None and (h.black if left else h.blown) > 0.001
+            col = QtGui.QColor(60, 130, 255) if left else QtGui.QColor(255, 60, 60)
+            x0 = 6 if left else self.width() - 6 - self.TRI
+            pts = [QtCore.QPointF(x0, 4), QtCore.QPointF(x0 + self.TRI, 4),
+                   QtCore.QPointF(x0 if left else x0 + self.TRI, 4 + self.TRI)]
+            p.setPen(QtGui.QPen(col if clipped else QtGui.QColor(110, 110, 115), 1.5))
+            p.setBrush(col if (clipped and self.clip_on) else (col.darker(170) if clipped else Qt.BrushStyle.NoBrush))
+            p.drawPolygon(QtGui.QPolygonF(pts))
+        # readout
+        p.setPen(QtGui.QColor(205, 205, 210))
+        p.setFont(QtGui.QFont(self.font().family(), 9))
+        if h is None:
+            text = "No photo"
+        else:
+            text = (f"{'Before · ' if self.before else ''}Median {h.median:.2f}   "
+                    f"Blown {h.blown * 100:.1f}%   Black {h.black * 100:.1f}%")
+        p.drawText(QtCore.QRectF(6, self.height() - 20, self.width() - 12, 18),
+                   Qt.AlignmentFlag.AlignCenter, text)
+        p.end()
+
+    def mousePressEvent(self, e):
+        x, y = e.position().x(), e.position().y()
+        if y <= self.TRI + 8 and (x <= self.TRI + 10 or x >= self.width() - self.TRI - 10):
+            self.clipToggled.emit()
 
 
 class FineSlider(QtWidgets.QSlider):
@@ -1336,9 +1427,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chk_split = QtWidgets.QCheckBox("Split")
         self.chk_split.setToolTip("Before / after side by side: drag the divider")
         self.chk_split.toggled.connect(self._split_toggled)
+        self.chk_clip = QtWidgets.QCheckBox("Clipping  (J)")
+        self.chk_clip.setToolTip("Show blown highlights in red and pure black in blue (like Lightroom's J)")
+        self.chk_clip.toggled.connect(lambda _v: self.refresh_view())
         self.btn_reject.setStyleSheet("QPushButton{background:#6b2a2a;color:white;padding:8px 16px;}")
         self.btn_approve.setStyleSheet("QPushButton{background:#2a6b3a;color:white;padding:8px 16px;font-weight:bold;}")
-        for w in (self.btn_prev, self.chk_before, self.chk_split):
+        for w in (self.btn_prev, self.chk_before, self.chk_split, self.chk_clip):
             nav.addWidget(w)
         nav.addStretch(1)
         nav.addWidget(self.btn_reject)
@@ -1356,6 +1450,9 @@ class MainWindow(QtWidgets.QMainWindow):
         # Right: controls
         panel = QtWidgets.QWidget()
         pl = QtWidgets.QVBoxLayout(panel)
+        self.hist = HistogramWidget()
+        self.hist.clipToggled.connect(lambda: self.chk_clip.toggle())
+        pl.addWidget(self.hist)
 
         g_scope = QtWidgets.QGroupBox("Edits apply to")
         sl = QtWidgets.QGridLayout(g_scope)
@@ -1587,6 +1684,7 @@ class MainWindow(QtWidgets.QMainWindow):
         sc("E", self.auto_enhance)
         sc("C", self.toggle_check_current)
         sc("G", lambda: self.act_grid.toggle())
+        sc("J", lambda: self.chk_clip.toggle())
         for n in range(6):
             sc(str(n), lambda n=n: self.set_rating(n))
         for key, lab in zip("6789", core.LABELS):
@@ -2270,11 +2368,13 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         if it.edit is None:
             self.view.set_image(None)
+            self.hist.set_histogram(None)
             self.view.set_message("Analyzing…" if it.status == "loading" else f"Could not read:\n{it.error}")
             return
         dec = self._dec(it)
         if dec is None:
             self.view.set_image(None)
+            self.hist.set_histogram(None)
             self.view.set_message("Loading preview…")
             return
         before = self.chk_before.isChecked() or self._hold_before
@@ -2310,11 +2410,15 @@ class MainWindow(QtWidgets.QMainWindow):
             on = " + ".join(n for n, f in (("Sky", it.edit.sky_on), ("Subject", it.edit.subj_on)) if f)
             badge = f"{on} mask: approximate preview – Lightroom computes the exact mask"
         self.view.split_on = split
+        self.hist.clip_on = self.chk_clip.isChecked()
+        self.hist.set_histogram(core.histogram(img), before)     # the photo as shown (split: the edited one)
         if split:
             img = self._split_image()
             badge = ""
         else:
             self._split_cache = None
+            if self.chk_clip.isChecked():
+                img = core.clip_overlay(img)
         self.view.set_image(to_qimage(img), overlay, badge)
         self.view.set_message("Click a neutral spot…" if self.btn_eyedrop.isChecked() else "")
 
@@ -2703,7 +2807,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _split_image(self):
         before, after = self._split_cache
         x = int(round(self.view.split_pos * after.shape[1]))
-        img = after.copy()
+        img = core.clip_overlay(after) if self.chk_clip.isChecked() else after.copy()
         img[:, :x] = before[:, :x]
         return img
 
@@ -2985,6 +3089,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.scope_combo.setCurrentIndex(int(st.get("scope", 0)) if str(st.get("scope", 0)).isdigit() else 0)
         self.chk_samples.setChecked(bool(st.get("show_wb_samples", False)))
         self.chk_masks.setChecked(bool(st.get("show_masks", False)))
+        self.chk_clip.setChecked(bool(st.get("show_clipping", False)))
         try:
             self.thumb_size.setValue(int(st.get("thumb_size", 240)))
         except (TypeError, ValueError):
@@ -3011,6 +3116,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "scope": self.scope_combo.currentIndex(),
             "show_wb_samples": self.chk_samples.isChecked(),
             "show_masks": self.chk_masks.isChecked(),
+            "show_clipping": self.chk_clip.isChecked(),
             "apply_auto_last": self._settings.get("apply_auto_last"),
             "mark_edited": self._settings.get("mark_edited", True),
             "show_filter": self.show_combo.currentIndex(),
