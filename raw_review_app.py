@@ -1430,8 +1430,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chk_clip = QtWidgets.QCheckBox("Clipping  (J)")
         self.chk_clip.setToolTip("Show blown highlights in red and pure black in blue (like Lightroom's J)")
         self.chk_clip.toggled.connect(lambda _v: self.refresh_view())
-        self.btn_reject.setStyleSheet("QPushButton{background:#6b2a2a;color:white;padding:8px 16px;}")
-        self.btn_approve.setStyleSheet("QPushButton{background:#2a6b3a;color:white;padding:8px 16px;font-weight:bold;}")
+        self.btn_reject.setStyleSheet("QPushButton{background:#7a2e2e;border-color:#8e3a3a;color:white;padding:8px 18px;}"
+                                      "QPushButton:hover{background:#8e3636;}")
+        self.btn_approve.setStyleSheet("QPushButton{background:#2e7a42;border-color:#3a8e50;color:white;padding:8px 18px;"
+                                       "font-weight:bold;}QPushButton:hover{background:#36904d;}")
         for w in (self.btn_prev, self.chk_before, self.chk_split, self.chk_clip):
             nav.addWidget(w)
         nav.addStretch(1)
@@ -1478,6 +1480,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         def group(title, auto_groups=None):
             box = QtWidgets.QGroupBox()
+            box.setObjectName("fold")             # foldable: header is inside, no title gap
             outer = QtWidgets.QVBoxLayout(box)
             outer.setContentsMargins(6, 4, 6, 6)
             head = QtWidgets.QHBoxLayout()
@@ -1495,7 +1498,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
             def set_open(on, btn=btn, content=content, title=title):
                 content.setVisible(on)
-                btn.setText(("▾  " if on else "▸  ") + title)
+                btn.setText(("▾  " if on else "▸  ") + title.replace("&", "&&"))   # & would be a shortcut marker
             btn.clicked.connect(lambda _c=False, c=content, f=set_open: f(not c.isVisible()))
             set_open(title not in collapsed)
             self._panels[title] = (content, set_open)
@@ -1593,20 +1596,24 @@ class MainWindow(QtWidgets.QMainWindow):
         ml = QtWidgets.QGridLayout(g_misc)
         self.btn_enhance = QtWidgets.QPushButton("Auto-enhance (E)")
         self.btn_enhance.setToolTip("Run every automatic tool ticked in 'Auto options'")
-        self.btn_reset_auto = QtWidgets.QPushButton("Reset to auto proposal")
+        self.btn_reset_auto = QtWidgets.QPushButton("Reset to auto")
+        self.btn_reset_auto.setToolTip("Go back to the automatic proposal for this photo")
         self.btn_reset_shot = QtWidgets.QPushButton("Reset to As Shot")
-        self.btn_reset_lr = QtWidgets.QPushButton("Reset to Lightroom settings")
+        self.btn_reset_shot.setToolTip("Go back to the camera's settings: no edits")
+        self.btn_reset_lr = QtWidgets.QPushButton("Reset to Lightroom's")
         self.btn_reset_lr.setToolTip("Go back to the settings this photo already had when it was added "
                                      "(its Lightroom sidecar / DNG export)")
         self.btn_reset_lr.clicked.connect(self.reset_lr)
-        self.btn_undo = QtWidgets.QPushButton("↶ Undo (Ctrl+Z)")
-        self.btn_redo = QtWidgets.QPushButton("↷ Redo (Ctrl+Y)")
-        self.btn_undo.setToolTip("Undo the last change to this photo (each photo keeps its own history)")
+        self.btn_undo = QtWidgets.QPushButton("↶ Undo")
+        self.btn_redo = QtWidgets.QPushButton("↷ Redo")
+        self.btn_undo.setToolTip("Undo the last change to this photo, Ctrl+Z (each photo keeps its own history)")
         self.btn_redo.setToolTip("Redo (Ctrl+Y or Ctrl+Shift+Z)")
         self.btn_undo.clicked.connect(self.undo_edit)
         self.btn_redo.clicked.connect(self.redo_edit)
-        self.btn_copy = QtWidgets.QPushButton("Copy settings (Ctrl+C)")
-        self.btn_paste = QtWidgets.QPushButton("Paste to checked/selected (Ctrl+V)")
+        self.btn_copy = QtWidgets.QPushButton("Copy settings")
+        self.btn_copy.setToolTip("Copy this photo's settings (Ctrl+C)")
+        self.btn_paste = QtWidgets.QPushButton("Paste settings")
+        self.btn_paste.setToolTip("Paste the copied settings to the checked / selected photos (Ctrl+V)")
         ml.addWidget(self.btn_enhance, 0, 0, 1, 2)
         ml.addWidget(self.btn_reset_auto, 1, 0)
         ml.addWidget(self.btn_reset_shot, 1, 1)
@@ -1640,6 +1647,8 @@ class MainWindow(QtWidgets.QMainWindow):
         scroll.setWidgetResizable(True)
         scroll.setWidget(panel)
         scroll.setMinimumWidth(340)
+        scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)   # panel fits its width
         split.addWidget(scroll)
         split.setSizes([260, 880, 360])
 
@@ -3194,7 +3203,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_undo.setEnabled(bool(has and it.undo))
         self.btn_redo.setEnabled(bool(has and it.redo))
         if has:
-            self.btn_undo.setText(f"↶ Undo (Ctrl+Z){'  ·  ' + str(len(it.undo)) if it.undo else ''}")
+            self.btn_undo.setText(f"↶ Undo{'  ·  ' + str(len(it.undo)) if it.undo else ''}")
 
     def _restore(self, it, edit, verb):
         it.edit = edit
@@ -3415,15 +3424,69 @@ class MainWindow(QtWidgets.QMainWindow):
         super().closeEvent(e)
 
 
-def main():
-    try:
-        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-            scale = float(json.load(f).get("ui_scale", 1.0))
-        if 0.5 <= scale <= 2.5 and abs(scale - 1.0) > 0.01 and "QT_SCALE_FACTOR" not in os.environ:
-            os.environ["QT_SCALE_FACTOR"] = str(scale)
-    except (OSError, ValueError, AttributeError):
-        pass
-    app = QtWidgets.QApplication(sys.argv)
+ACCENT = "#4a80d4"
+STYLESHEET = f"""
+QPushButton {{
+    background: #3c3c41; border: 1px solid #4c4c53; border-radius: 5px;
+    padding: 5px 10px; color: #e8e8ea;
+}}
+QPushButton:hover {{ background: #46464c; border-color: #5a5a62; }}
+QPushButton:pressed {{ background: #2f2f33; }}
+QPushButton:checked {{ background: {ACCENT}; border-color: {ACCENT}; color: white; }}
+QPushButton:disabled {{ background: #333337; border-color: #3c3c41; color: #77777d; }}
+QToolButton {{ border: 1px solid transparent; border-radius: 4px; padding: 3px 6px; }}
+QToolButton:hover {{ background: #46464c; border-color: #55555c; }}
+QToolButton:pressed, QToolButton:checked {{ background: #2f2f33; }}
+QToolButton::menu-indicator {{ image: none; }}
+QGroupBox {{
+    border: 1px solid #3c3c42; border-radius: 8px; margin-top: 16px; padding: 8px 6px 6px 6px;
+    background: #2f2f32;
+}}
+QGroupBox#fold {{ margin-top: 4px; padding-top: 4px; }}
+QGroupBox::title {{
+    subcontrol-origin: margin; subcontrol-position: top left; left: 8px; padding: 0 4px;
+    color: #c8c8cc; font-weight: bold;
+}}
+QLineEdit, QComboBox, QAbstractSpinBox {{
+    background: #232326; border: 1px solid #48484f; border-radius: 4px; padding: 3px 6px;
+    selection-background-color: {ACCENT};
+}}
+QLineEdit:focus, QComboBox:focus, QAbstractSpinBox:focus {{ border-color: {ACCENT}; }}
+QComboBox QAbstractItemView {{ background: #2a2a2d; border: 1px solid #48484f; selection-background-color: {ACCENT}; }}
+QCheckBox {{ spacing: 6px; }}
+QCheckBox::indicator {{
+    width: 14px; height: 14px; border: 1px solid #8a8a92; border-radius: 3px; background: #26262a;
+}}
+QCheckBox::indicator:hover {{ border-color: #b0b0b8; }}
+QCheckBox::indicator:checked {{ background: {ACCENT}; border-color: {ACCENT}; image: none; }}
+QSlider::groove:horizontal {{ height: 4px; background: #4a4a52; border-radius: 2px; }}
+QSlider::sub-page:horizontal {{ background: #6f8fbf; border-radius: 2px; }}
+QSlider::handle:horizontal {{
+    width: 14px; height: 14px; margin: -5px 0; border-radius: 7px;
+    background: #e8e8ea; border: 1px solid #9a9aa2;
+}}
+QSlider::handle:horizontal:hover {{ background: #ffffff; border-color: {ACCENT}; }}
+QScrollBar:vertical {{ background: transparent; width: 10px; margin: 0; }}
+QScrollBar::handle:vertical {{ background: #4c4c53; border-radius: 4px; min-height: 30px; margin: 2px; }}
+QScrollBar:horizontal {{ background: transparent; height: 10px; margin: 0; }}
+QScrollBar::handle:horizontal {{ background: #4c4c53; border-radius: 4px; min-width: 30px; margin: 2px; }}
+QScrollBar::handle:hover {{ background: #5e5e66; }}
+QScrollBar::add-line, QScrollBar::sub-line, QScrollBar::add-page, QScrollBar::sub-page {{ background: none; border: none; width: 0; height: 0; }}
+QMenu {{ background: #2c2c30; border: 1px solid #48484f; padding: 4px; }}
+QMenu::item {{ padding: 5px 18px; border-radius: 4px; }}
+QMenu::item:selected {{ background: {ACCENT}; color: white; }}
+QMenu::separator {{ height: 1px; background: #48484f; margin: 4px 6px; }}
+QToolTip {{ background: #3a3a3e; color: #ececee; border: 1px solid #55555c; padding: 4px 6px; }}
+QSplitter::handle {{ background: #26262a; }}
+QSplitter::handle:hover {{ background: {ACCENT}; }}
+QStatusBar {{ color: #b8b8be; }}
+QListWidget {{ border: none; }}
+QListWidget::item:selected {{ background: #3b5f96; border-radius: 4px; }}
+"""
+
+
+def apply_theme(app):
+    """Dark Fusion theme for the whole app."""
     app.setStyle("Fusion")
     pal = QtGui.QPalette()
     for role, c in [
@@ -3433,9 +3496,27 @@ def main():
         (QtGui.QPalette.ColorRole.ButtonText, (230, 230, 230)), (QtGui.QPalette.ColorRole.Highlight, (70, 110, 170)),
         (QtGui.QPalette.ColorRole.HighlightedText, (255, 255, 255)), (QtGui.QPalette.ColorRole.ToolTipBase, (60, 60, 60)),
         (QtGui.QPalette.ColorRole.ToolTipText, (230, 230, 230)),
+        (QtGui.QPalette.ColorRole.PlaceholderText, (140, 140, 148)),
+        (QtGui.QPalette.ColorRole.Link, (110, 160, 230)),
     ]:
         pal.setColor(role, QtGui.QColor(*c))
+    for role in (QtGui.QPalette.ColorRole.WindowText, QtGui.QPalette.ColorRole.Text,
+                 QtGui.QPalette.ColorRole.ButtonText):
+        pal.setColor(QtGui.QPalette.ColorGroup.Disabled, role, QtGui.QColor(120, 120, 126))
     app.setPalette(pal)
+    app.setStyleSheet(STYLESHEET)
+
+
+def main():
+    try:
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+            scale = float(json.load(f).get("ui_scale", 1.0))
+        if 0.5 <= scale <= 2.5 and abs(scale - 1.0) > 0.01 and "QT_SCALE_FACTOR" not in os.environ:
+            os.environ["QT_SCALE_FACTOR"] = str(scale)
+    except (OSError, ValueError, AttributeError):
+        pass
+    app = QtWidgets.QApplication(sys.argv)
+    apply_theme(app)
     w = MainWindow()
     w.show()
     if len(sys.argv) > 1:
