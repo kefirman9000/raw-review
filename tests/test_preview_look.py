@@ -25,29 +25,44 @@ def test_keeps_greys_and_brightness():
     assert abs(float(np.median(lum_out) - np.median(lum_in))) < 0.01
 
 
-def test_adds_saturation_and_keeps_hue_order():
-    px = np.array([[[0.5, 0.35, 0.2]]], np.float32)  # orange
-    out = core.apply_look(px)[0, 0]
-    assert out[0] > out[1] > out[2]                 # same hue ordering
-    sat_in = (px.max() - px.min()) / px.max()
-    sat_out = (out.max() - out.min()) / out.max()
-    assert sat_out > sat_in
+def test_adobe_curve_brightens_midtones_like_lightroom_and_keeps_hue():
+    grey = np.full((1, 1, 3), 0.18, np.float32)
+    out = core.adobe_tone(grey)[0, 0]
+    assert np.allclose(out, out[0])                       # greys stay grey
+    assert out[0] > 0.30                                  # mid grey about a stop brighter, like Lightroom
+    ends = core.adobe_tone(np.array([[[0, 0, 0], [1, 1, 1]]], np.float32))
+    assert np.allclose(ends[0, 0], 0) and np.allclose(ends[0, 1], 1)
+    px = np.array([[[0.5, 0.35, 0.2]]], np.float32)       # orange
+    o = core.adobe_tone(px)[0, 0]
+    assert o[0] > o[1] > o[2]                             # same hue ordering
+    assert np.all(np.diff(core._ACR3_LUT) >= 0)           # monotone
 
 
-def test_look_off_matches_plain_render_and_auto_is_unchanged():
+def test_preview_matches_lightroom_on_the_calibration_pair():
+    """Lightroom's export of RAW Review's edits vs the old preview (Christmas aisle, Nov 2026):
+    old preview quantiles (display) and Lightroom's. Through the old preview's inverse and the
+    new pipeline (Adobe curve + PREVIEW_ADOBE_EV), the preview must land on Lightroom's tones."""
+    old_rr = np.array([0.191, 0.340, 0.439, 0.493, 0.541, 0.626, 0.791])
+    lightroom = np.array([0.291, 0.536, 0.683, 0.748, 0.794, 0.844, 0.923])
+    lin = np.where(old_rr <= 0.04045, old_rr / 12.92, ((old_rr + 0.055) / 1.055) ** 2.4)
+    k = 0.8                                               # undo the old preview's shoulder
+    lin = np.where(lin < k, lin, k + (1 - k) * np.arctanh(np.clip((lin - k) / (1 - k), 0, 0.999)))
+    px = np.repeat((lin * 2 ** core.PREVIEW_ADOBE_EV).astype(np.float32)[None, :, None], 3, axis=2)
+    new = core._srgb_encode(core.adobe_tone(px))[0, :, 0]
+    assert np.abs(new - lightroom)[:5].max() < 0.05      # shadows to upper midtones
+    assert abs(float(new[3]) - 0.748) < 0.02              # the median
+
+
+def test_auto_tools_ignore_the_display_look():
     dec = fake_decoded()
-    e = core.Edit()
-    plain, _ = core.render(dec, e, look=False)
-    shown, _ = core.render(dec, e)
-    assert not np.array_equal(shown, plain)          # display gets the look...
-    a, b = e.copy(), e.copy()
+    a, b = core.Edit(), core.Edit()
     auto.auto_levels(dec, a)
     core.PREVIEW_LOOK = False
     try:
         auto.auto_levels(dec, b)
     finally:
         core.PREVIEW_LOOK = True
-    assert (a.blacks, a.whites) == (b.blacks, b.whites)   # ...the auto tools don't
+    assert (a.blacks, a.whites) == (b.blacks, b.whites)
 
 
 def _dark_scene():

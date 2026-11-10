@@ -29,6 +29,8 @@ import tempfile
 import time
 import uuid
 import xml.etree.ElementTree as ET
+
+from adobe_curve import ACR3_CURVE
 from dataclasses import dataclass, field
 
 import cv2
@@ -92,7 +94,7 @@ PREVIEW_BASE_EV = 0.5
 # brightness is what Lightroom shows for the same settings, and auto exposure is tuned on it.
 # Display only; the auto tools measure the plain render. PREVIEW_LOOK = False turns it off.
 PREVIEW_LOOK = True
-LOOK_SATURATION = 0.15          # extra saturation at mid grey, fading to 0 at black and white
+LOOK_SATURATION = 0.0           # Adobe's curve (adobe_tone) now adds Lightroom's colour itself
 
 # Long edge of the working preview, in pixels.
 WORK_LONG_EDGE = 1400
@@ -695,6 +697,34 @@ def _srgb_encode(x):
                     1.055 * np.power(np.maximum(x, 0.0031308), 1 / 2.4) - 0.055)
 
 
+# Adobe's default tone curve. Lightroom applies it to every raw (unless the camera profile
+# brings its own), brightening the midtones by about a stop and rolling off the highlights.
+# The preview used to skip it, so Lightroom rendered RAW Review's settings ~1.3 stops brighter
+# than the preview showed. PREVIEW_ADOBE_EV was fitted on two Lightroom exports of RAW
+# Review's edits (with the curve, the preview matched Lightroom's tones to ~0.03).
+PREVIEW_ADOBE_EV = 0.23
+_ACR3_LUT = np.interp(np.linspace(0.0, 1.0, 4096), np.linspace(0.0, 1.0, len(ACR3_CURVE)),
+                      ACR3_CURVE).astype(np.float32)
+
+
+def adobe_tone(lin: np.ndarray) -> np.ndarray:
+    """Adobe's default curve, applied like the DNG SDK's RGB tone: the brightest and darkest
+    channel go through the curve and the middle one keeps its relative place, so hues hold."""
+    lin = np.clip(lin, 0.0, 1.0, dtype=np.float32)
+    n = np.float32(len(_ACR3_LUT) - 1)
+    r, g, b = lin[..., 0], lin[..., 1], lin[..., 2]
+    mx = np.maximum(np.maximum(r, g), b)
+    mn = np.minimum(np.minimum(r, g), b)
+    mx2 = np.take(_ACR3_LUT, (mx * n + 0.5).astype(np.int32))
+    mn2 = np.take(_ACR3_LUT, (mn * n + 0.5).astype(np.int32))
+    span = mx - mn
+    scale = np.divide(mx2 - mn2, span, out=np.zeros_like(span), where=span > 1e-6)
+    out = lin - mn[..., None]
+    out *= scale[..., None]
+    out += mn2[..., None]
+    return out
+
+
 # Highlights slider (negative = recover), modelled like Lightroom's: only tones above
 # RECOVER_FROM (linear, ~0.63 on screen) move, and at -100 up to RECOVER_STOPS stops of
 # highlight detail above white are brought back under white. Midtones are left alone.
@@ -725,10 +755,9 @@ def base_gamma(cam: np.ndarray, color: CameraColor, mul, exposure: float,
         lin = recover_highlights(model.render_linear(cam, mul, exposure, color.base_ev), highlights)
     else:
         lin = _cam_to_linear_srgb(cam, mul, color)
-        lin *= np.float32(2.0 ** (exposure + PREVIEW_BASE_EV))
+        lin *= np.float32(2.0 ** (exposure + PREVIEW_BASE_EV + PREVIEW_ADOBE_EV))
         lin = recover_highlights(lin, highlights)
-        knee = 0.8                                   # soft highlight shoulder
-        lin = np.where(lin < knee, lin, knee + (1 - knee) * np.tanh((lin - knee) / (1 - knee)))
+        lin = adobe_tone(lin)                        # what Lightroom does by default
     return _srgb_encode(lin).astype(np.float32)
 
 
@@ -1053,7 +1082,7 @@ def render(dec: Decoded, edit: Edit, original: bool = False, rotate: bool = True
     g = apply_colour(g, e)
     if not original and (e.sky_on or e.subj_on):
         g = apply_masks(g, dec, e)
-    if look and PREVIEW_LOOK and color.model is None:   # DNGs use their own embedded profile look
+    if look and PREVIEW_LOOK and LOOK_SATURATION and color.model is None:   # DNGs use their own profile look
         g = apply_look(g)
     if show_masks and not original:
         for key, on, tint in (("sky", e.sky_on, (0.2, 0.6, 1.0)), ("subject", e.subj_on, (1.0, 0.55, 0.1))):

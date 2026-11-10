@@ -1,6 +1,14 @@
 # Changelog
 
-## Unreleased
+## v1.9.1
+
+- **Fixed: photos overexposed in Lightroom.** Lightroom applies Adobe's default tone curve to every raw, which
+  brightens the midtones by about a stop; RAW Review's preview didn't, so auto exposure centred a preview that was a
+  stop darker than what Lightroom then showed. Two Lightroom exports of RAW Review's edits measured the gap: about
+  1.3 stops in the midtones. The preview now applies the same Adobe curve (from Adobe's DNG SDK), so it shows what
+  Lightroom will show for the same settings (matched to within ~0.03 on those exports), and auto exposure centres
+  that. Expect auto exposure about a stop lower than before and less added contrast. The histogram's middle is back
+  to the middle (0.50).
 
 - **Always clear which photos you're editing:** when slider changes go to more than one photo, an amber banner sits
   above the photo ("Editing 3 photos at once…") with an **Only this photo** button, and every affected photo is
