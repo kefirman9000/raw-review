@@ -1648,6 +1648,9 @@ class MainWindow(QtWidgets.QMainWindow):
         # Check all · Approve checked · Approve ▾
         act = tb.addAction("☑ Check all", lambda: self.check_where(lambda it: True))
         act.setToolTip("Tick every photo in the list (the Check ▾ menu on the left has more choices)")
+        self.act_uncheck_all = tb.addAction("☐ Uncheck all", lambda: self.check_where(lambda it: False))
+        self.act_uncheck_all.setToolTip("Untick every photo in the list")
+        self.act_uncheck_all.setEnabled(False)
         self.act_auto_sel = tb.addAction("Apply auto settings to selected…", lambda: self.open_apply_auto("selected"))
         self.act_auto_sel.setShortcut(QtGui.QKeySequence("Ctrl+Shift+E"))
         self.act_auto_sel.setToolTip("Run auto tools, with options you pick, on the photos selected in the list or "
@@ -3324,6 +3327,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.act_auto_chk.setText(f"Apply auto settings to checked ({n})…" if n
                                       else "Apply auto settings to checked…")
             self.act_auto_chk.setEnabled(bool(n))
+            self.act_uncheck_all.setEnabled(bool(n))
 
     def check_where(self, pred):
         self.list.blockSignals(True)

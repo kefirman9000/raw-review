@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.9.9
+
+- **☐ Uncheck all** button next to *☑ Check all* in the toolbar (greyed out when nothing is ticked).
+
 ## v1.9.8
 
 - **Reset several photos at once:** a *Reset ▾* menu in the toolbar resets every ticked photo to its **auto settings**,
