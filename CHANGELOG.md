@@ -1,5 +1,15 @@
 # Changelog
 
+## v1.9.13
+
+- **Never use Lightroom AI masks:** a new choice under **Auto options**. With it ticked, no *Select Subject* or *Select
+  Sky* mask is added (by Auto or with the Sky / Subject sliders, which are greyed out), and the masks RAW Review
+  added before are taken out of a photo's sidecar when it's written again. Lightroom records these AI masks in the
+  JPEGs it exports, and some stock agencies look for signs of AI in a photo's metadata. Masks you made in Lightroom
+  yourself are kept. Off by default; your choice is remembered.
+- Photos already exported with a RAW Review mask: write them again in RAW Review with this ticked, then export them
+  again from Lightroom (or set Lightroom's export Metadata to *All Metadata, except Camera Raw info*).
+
 ## v1.9.12
 
 - **Pixel photos: punchier.** The match to the phone's rendering (v1.9.11) came out flatter than the phone's own

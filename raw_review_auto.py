@@ -398,6 +398,9 @@ def _round_setting(key, val):
 
 def auto_masks(dec, edit, strength=1.0) -> str:
     """Turn on a Select Sky / Select Subject adjustment when the photo has a sky / a clear subject."""
+    if core.NO_AI_MASKS:
+        edit.sky_on = edit.subj_on = False
+        return "Auto masks: off (Never use Lightroom AI masks is ticked)"
     probe = edit.copy()
     probe.sky_on = probe.subj_on = False
     img, _ = core.render(dec, probe, rotate=False, look=False)

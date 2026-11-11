@@ -1447,6 +1447,24 @@ class MainWindow(QtWidgets.QMainWindow):
     def _opts_snapshot(self) -> "auto.AutoOptions":
         return copy.deepcopy(self.opts)
 
+    def _set_no_ai_masks(self, on):
+        core.NO_AI_MASKS = bool(on)
+        self._settings["no_ai_masks"] = core.NO_AI_MASKS
+        self._show_no_ai_masks()
+        if on and hasattr(self, "box_sky") and (self.box_sky.isChecked() or self.box_subj.isChecked()):
+            self.box_sky.setChecked(False)          # (the current photo's masks go: written without them)
+            self.box_subj.setChecked(False)
+        if hasattr(self, "statusBar"):
+            self.statusBar().showMessage("AI masks off: no Select Subject / Select Sky is added or written."
+                                         if on else "AI masks allowed again (Sky & subject masks).", 6000)
+
+    def _show_no_ai_masks(self):
+        if not hasattr(self, "box_sky"):
+            return
+        for b in (self.box_sky, self.box_subj):
+            b.setEnabled(not core.NO_AI_MASKS)
+            b.setToolTip("Off: Never use Lightroom AI masks is ticked (Auto options)" if core.NO_AI_MASKS else "")
+
     def _opts_changed(self, *_):
         groups = {k for k, a in self.auto_actions.items() if a.isChecked()}
         if self.opts.level_mode != "Off":
@@ -1500,6 +1518,14 @@ class MainWindow(QtWidgets.QMainWindow):
                                          "40% off each side) to put it in the centre. Off by default.\n"
                                          "Runs on new photos, Auto-enhance and straighten re-runs.")
         self.act_subject_crop.toggled.connect(lambda on: setattr(self.opts, "subject_crop", bool(on)))
+        self.act_no_ai = menu.addAction("Never use Lightroom AI masks (Select Subject / Select Sky)")
+        self.act_no_ai.setCheckable(True)
+        self.act_no_ai.setChecked(core.NO_AI_MASKS)
+        self.act_no_ai.setToolTip("No Select Subject or Select Sky mask is added, by Auto or by hand, and the ones RAW\n"
+                                  "Review added before are taken out of a photo's sidecar when it's written again.\n"
+                                  "Lightroom records these AI masks in the JPEGs it exports, and some stock agencies\n"
+                                  "look for AI in a photo's metadata. Masks you made in Lightroom yourself are kept.")
+        self.act_no_ai.toggled.connect(self._set_no_ai_masks)
         menu.addSeparator()
         menu.addAction("My auto settings… (brightness, strength, your rules)", self.open_my_auto)
         menu.addSeparator()
@@ -1961,6 +1987,7 @@ class MainWindow(QtWidgets.QMainWindow):
             bl2.addWidget(self._slider(k))
         ml_.addWidget(self.box_sky)
         ml_.addWidget(self.box_subj)
+        self._show_no_ai_masks()
         self.chk_masks = QtWidgets.QCheckBox("Show masks (sky blue, subject orange)")
         self.chk_masks.toggled.connect(lambda _v: self.refresh_view())
         ml_.addWidget(self.chk_masks)
@@ -2823,8 +2850,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._loading_controls = False
             setattr(e, key, val)
         e.lens_profile = self.chk_lens.isChecked()
-        e.sky_on = self.box_sky.isChecked()
-        e.subj_on = self.box_subj.isChecked()
+        e.sky_on = self.box_sky.isChecked() and not core.NO_AI_MASKS
+        e.subj_on = self.box_subj.isChecked() and not core.NO_AI_MASKS
         changed = tuple(k for k in core.SETTINGS if getattr(old, k) != getattr(e, k))
         flags = tuple(f for f in ("wb_mode", "lens_profile", "sky_on", "subj_on", "level_mode")
                       if getattr(old, f) != getattr(e, f))
@@ -3872,6 +3899,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.opts.level_mode = "Auto (best guess)"
         dng_profile.apply_saved_options(st.get("dng_profile"), st.get("version", ""))
         auto.CAMERA_LOOK = bool(o.get("camera_look", auto.CAMERA_LOOK))
+        core.NO_AI_MASKS = bool(st.get("no_ai_masks", False))
         self.last_dir = st.get("last_dir", "") if os.path.isdir(st.get("last_dir", "") or "") else ""
 
     def _apply_saved_window(self, st):
@@ -3906,6 +3934,7 @@ class MainWindow(QtWidgets.QMainWindow):
                      "strength": o.strength, "exposure_bias": o.exposure_bias, "use_existing": o.use_existing,
                      "punch": o.punch, "colour": o.colour, "rules": o.rules, "subject_crop": o.subject_crop,
                      "camera_look": auto.CAMERA_LOOK},
+            "no_ai_masks": core.NO_AI_MASKS,
             "dng_profile": {k: getattr(dng_profile.OPTIONS, k) for k in dng_profile.OPTIONS.__dataclass_fields__},
             "geometry": base64.b64encode(bytes(self.saveGeometry())).decode("ascii"),
             "splitter": self.split.sizes(),

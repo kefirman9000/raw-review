@@ -589,6 +589,11 @@ SETTINGS = {s.key: s for s in [
 MASK_KEYS = {"sky": [k for k in SETTINGS if k.startswith("sky_")],
              "subject": [k for k in SETTINGS if k.startswith("subj_")]}
 
+# "Never use Lightroom AI masks" (Auto options): no Select Sky / Select Subject is ever turned on or written, and
+# RAW Review's own ones are taken out of sidecars it writes. Masks you made in Lightroom are never touched.
+# (Some stock agencies look for AI in a photo's metadata; a Select Subject mask is recorded in exported JPEGs.)
+NO_AI_MASKS = False
+
 # Friendly names used in the batch editor (the slider labels above are short
 # because they sit under a group heading).
 SETTING_NAMES = {
@@ -628,9 +633,9 @@ def change_setting(edit: Edit, key: str, action: str, amount: float = 0.0):
         edit.wb_mode = "custom"
     if key == "angle":
         edit.level_mode = "Manual"
-    if key.startswith("sky_"):
+    if key.startswith("sky_") and not NO_AI_MASKS:
         edit.sky_on = True
-    elif key.startswith("subj_"):
+    elif key.startswith("subj_") and not NO_AI_MASKS:
         edit.subj_on = True
 
 
@@ -2030,7 +2035,7 @@ def _write_masks(desc, edit: Edit, raw_path: str):
     """
     key = _q("crs", "MaskGroupBasedCorrections")
     group = desc.find(key)
-    wanted = [k for k, on in (("sky", edit.sky_on), ("subject", edit.subj_on)) if on]
+    wanted = [] if NO_AI_MASKS else [k for k, on in (("sky", edit.sky_on), ("subject", edit.subj_on)) if on]
     if group is None and not wanted:
         return
     if group is None:
