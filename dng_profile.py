@@ -20,13 +20,16 @@ of the Adobe DNG specification that decide how colours look:
   * ProfileToneCurve                           (the profile's contrast curve)
   * BaselineExposure                           (how much brighter the file wants to be)
 
-Also applied (v1.2.0), because Google Pixel DNGs need them to look like Google's
-own rendering:
+Also implemented (v1.2.0), for Google Pixel DNGs:
 
-  * ProfileGainTableMap  (Pixel's local HDR tone map, DNG 1.7): a spatial grid of
-    gain-vs-brightness curves that lifts shadows and holds highlights
   * OpcodeList2 GainMap   (lens shading): flat-fields the vignetting and the
-    colour shading in the corners
+    colour shading in the corners. Always applied.
+  * ProfileGainTableMap  (Pixel's local HDR tone map, DNG 1.7): a spatial grid of
+    gain-vs-brightness curves that lifts shadows and holds highlights. It is what
+    makes the phone's own JPEG 1.3-1.9 stops brighter than the plain profile render.
+    OFF by default since v1.9.10: Lightroom Classic 11 uses the DNG's embedded
+    profile but does not apply this table, so with it on the preview was that much
+    brighter than Lightroom showed for the same settings (see OPTIONS.hdr_tone_map).
 
 Not applied: the geometric lens-correction opcodes (OpcodeList3, WarpRectilinear)
 and the newer ProfileGainTableMap2 layout. They are detected and reported.
@@ -54,11 +57,39 @@ class ProfileOptions:
     look_strength: float = 1.0      # 0..1  ProfileHueSatMap + ProfileLookTable (0 = plain matrix colours)
     tone_curve: float = 1.0         # 0..1  ProfileToneCurve strength
     file_baseline_ev: bool = True   # use the file's BaselineExposure instead of PREVIEW_BASE_EV
-    hdr_tone_map: bool = True       # apply the DNG's ProfileGainTableMap (Pixel local HDR tone map)
+    # Apply the DNG's ProfileGainTableMap (Pixel local HDR tone map). Off by default: the preview's
+    # job is to show what Lightroom will show, and Lightroom Classic 11 does not apply the table.
+    # On = the phone's own look (for people whose Lightroom does apply it).
+    hdr_tone_map: bool = False
     hdr_strength: float = 1.0       # 0..1  how much of that tone map is applied (log-domain blend)
 
 
 OPTIONS = ProfileOptions()
+
+# The tone map was ON by default up to v1.9.9. Settings saved by those versions carry that old
+# default, not a choice, so it is dropped once when they are loaded (see apply_saved_options).
+HDR_DEFAULT_OFF_SINCE = (1, 9, 10)
+
+
+def _version_tuple(s) -> tuple:
+    out = []
+    for part in str(s or "").lstrip("vV").split("."):
+        digits = "".join(ch for ch in part if ch.isdigit())
+        out.append(int(digits) if digits else 0)
+    return tuple(out)
+
+
+def apply_saved_options(saved, saved_version="") -> None:
+    """
+    Restore OPTIONS from the app's settings file. `saved_version` is the app version that wrote
+    it; a file from before the tone map became opt-in keeps everything except that one switch.
+    """
+    old = _version_tuple(saved_version) < HDR_DEFAULT_OFF_SINCE
+    for k, v in (saved or {}).items():
+        if k == "hdr_tone_map" and old:
+            continue
+        if hasattr(OPTIONS, k):
+            setattr(OPTIONS, k, v)
 
 
 # --------------------------------------------------------------------------

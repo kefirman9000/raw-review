@@ -48,7 +48,8 @@ TARGET_KEY = 0.15          # target log-average scene brightness (linear, ~mid g
 # Same idea for DNGs that carry a local HDR tone map (Pixel). Google's own rendering of those
 # files lands at about 0.20-0.24, so aiming there treats the camera's exposure as the intent
 # and only corrects scenes it got clearly wrong. (Used whether or not the tone map is switched on
-# in the preview: with it off, Auto exposure and Shadows make up the difference.) Calibrated on Pixel 7 Pro files; nudge it with
+# in the preview. It is off by default, because Lightroom Classic 11 does not apply it; Auto exposure
+# and Shadows then make up the difference.) Calibrated on Pixel 7 Pro files; nudge it with
 # "Exposure bias" in the Auto menu if your photos come out consistently lighter or darker.
 TARGET_KEY_HDR = 0.21
 EXPOSURE_DAMPING = 0.75    # move only this far toward the target (keeps low/high-key scenes moody)

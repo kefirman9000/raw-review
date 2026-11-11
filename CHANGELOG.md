@@ -1,5 +1,19 @@
 # Changelog
 
+## v1.9.10
+
+- **Fixed: Pixel photos overexposed and washed out in the preview, then dark in Lightroom.** Pixel DNGs carry a
+  local HDR tone map (`ProfileGainTableMap`) that makes the phone's own picture 1.3-1.9 stops brighter than the plain
+  profile render. The preview applied it; Lightroom Classic 11.0.1 uses the DNG's embedded profile but does not
+  (its unedited exports of Pixel 7 Pro files sit where the preview does with the table off). So the preview was that
+  much brighter than Lightroom for the same settings: auto exposure centred a picture Lightroom never showed, pulled
+  Highlights to -100 on top of the tone map (pastel reds, flat whites), and the result came out dark in Lightroom.
+  The tone map is now **off by default**, so the preview shows what Lightroom shows and auto exposure sets the
+  brightness itself. Expect auto Exposure about 1 to 1.5 stops higher on Pixel photos than before; photos approved
+  with the old preview should be re-run through auto.
+- The switch is still there (*Auto ▾ → Camera profile → Pixel local HDR tone map*) for a Lightroom that does apply the
+  table. A setting saved by an older version is reset to off once; after that your choice is remembered.
+
 ## v1.9.9
 
 - **☐ Uncheck all** button next to *☑ Check all* in the toolbar (greyed out when nothing is ticked).

@@ -1533,14 +1533,15 @@ class MainWindow(QtWidgets.QMainWindow):
         a.setToolTip("Brightness the camera asks for (Pixel: +0.55 EV) instead of the app's fixed +0.5 EV")
         a.toggled.connect(lambda on: self._set_profile_opt("file_baseline_ev", bool(on)))
         pm.addSeparator()
-        a = pm.addAction("Pixel local HDR tone map (match the camera's look)")
+        a = pm.addAction("Pixel local HDR tone map (the phone's look, not Lightroom's)")
         a.setCheckable(True)
         a.setChecked(popt.hdr_tone_map)
         a.setToolTip("Applies the DNG's ProfileGainTableMap, the local tone map that lifts shadows and holds\n"
-                     "highlights, so the preview matches the camera's own preview / JPEG.\n"
-                     "Lightroom reads the same table from the DNG itself (the app never removes it). If a\n"
-                     "photo looks darker in Lightroom than here, turn this off: the auto tools then\n"
-                     "brighten with Exposure and Shadows instead.")
+                     "highlights, so the preview matches the phone's own preview / JPEG.\n"
+                     "Off by default: Lightroom Classic 11 does not apply this table, so with it on the\n"
+                     "preview is 1.3-1.9 stops brighter than Lightroom shows for the same settings, and the\n"
+                     "auto edits come out dark there. Turn it on only if your Lightroom shows Pixel photos\n"
+                     "as bright as the phone does with no edits.")
         a.toggled.connect(lambda on: self._set_profile_opt("hdr_tone_map", bool(on)))
         hm = pm.addMenu("HDR tone map strength")
         g6 = QtGui.QActionGroup(hm)
@@ -3861,9 +3862,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 setattr(self.opts, k, o[k])
         if self.opts.level_mode not in core.LEVEL_MODES:
             self.opts.level_mode = "Auto (best guess)"
-        for k, v in (st.get("dng_profile") or {}).items():
-            if hasattr(dng_profile.OPTIONS, k):
-                setattr(dng_profile.OPTIONS, k, v)
+        dng_profile.apply_saved_options(st.get("dng_profile"), st.get("version", ""))
         self.last_dir = st.get("last_dir", "") if os.path.isdir(st.get("last_dir", "") or "") else ""
 
     def _apply_saved_window(self, st):
