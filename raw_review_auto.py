@@ -67,6 +67,15 @@ CAMERA_LOOK_KEYS = {       # which sliders each auto tool owns
     "exposure": ("exposure",), "shhi": ("shadows", "highlights"),
     "contrast": ("contrast",), "levels": ("blacks", "whites"),
 }
+# Punch, on top of the match (the plain match is flatter than the phone's picture, which gets its
+# snap from local contrast the sliders can't make): Contrast goes up, Blacks come down and Whites
+# go up as far as the clipping allowances let them, and Exposure holds the brightness where the
+# match put it. Deeper shadows and brighter highlights, with only a sliver clipped.
+CAMERA_LOOK_PUNCH = True
+CAMERA_LOOK_CONTRAST = 10.0          # Contrast with Punch at 0 in My auto settings (Punch adds 0.4 per step)
+CAMERA_LOOK_BLACK_CLIP = 0.010       # share of the photo that may go pure black
+CAMERA_LOOK_WHITE_CLIP = 0.005       # share that may blow out (any channel)
+CAMERA_LOOK_PUNCH_RANGES = {"blacks": (15.0, -50.0), "whites": (-40.0, 40.0)}   # (gentlest, strongest)
 EXPOSURE_DAMPING = 0.75    # move only this far toward the target (keeps low/high-key scenes moody)
 HIGHLIGHT_ALLOWANCE = 1.0  # the 99th percentile may reach this (linear, i.e. just white) and no more
 TARGET_SPREAD = 0.72       # target p5..p95 tonal spread in display units
@@ -608,7 +617,21 @@ def _golden(f, lo: float, hi: float, steps: int = 10) -> float:
     return (a + b) / 2.0
 
 
-def match_camera_look(dec, edit, groups, strength=1.0, bias=0.0) -> dict:
+def _furthest(ok, gentle: float, strong: float, steps: int = 7) -> float:
+    """The value closest to `strong` for which ok(value) still holds (ok is assumed to hold at `gentle`)."""
+    if ok(strong):
+        return strong
+    a, b = gentle, strong
+    for _ in range(steps):
+        m = (a + b) / 2.0
+        if ok(m):
+            a = m
+        else:
+            b = m
+    return a
+
+
+def match_camera_look(dec, edit, groups, strength=1.0, bias=0.0, punch=0.0) -> dict:
     """
     Set Exposure, Shadows/Highlights, Contrast and Blacks/Whites so the photo's brightness
     matches the camera's own rendering of it: the DNG's local tone map, which the phone used
@@ -617,6 +640,10 @@ def match_camera_look(dec, edit, groups, strength=1.0, bias=0.0) -> dict:
 
     The tone map is local (it differs across the frame) and the sliders are global, so this is
     the closest global match: per-pixel brightness, least squares, on a small copy.
+
+    Then punch (CAMERA_LOOK_PUNCH; `punch` is the -50..50 setting from My auto settings): more
+    Contrast, Blacks down and Whites up until the clipping allowances are used, Exposure
+    re-set so the photo stays as bright as the match made it.
     """
     keys = [k for g in ("exposure", "shhi", "contrast", "levels") if g in groups for k in CAMERA_LOOK_KEYS[g]]
     model, color = dec.color.model, dec.color
@@ -632,7 +659,7 @@ def match_camera_look(dec, edit, groups, strength=1.0, bias=0.0) -> dict:
         trial.lights = 0                             # histogram centring's helper; not needed here
     linear = {}                                      # the profile render per exposure (the slow part)
 
-    def luma():
+    def toned():
         ev = round(float(trial.exposure), 3)
         lin = linear.get(ev)
         if lin is None:
@@ -640,7 +667,10 @@ def match_camera_look(dec, edit, groups, strength=1.0, bias=0.0) -> dict:
                 linear.clear()
             lin = linear[ev] = model.render_linear(cam, mul, ev, color.base_ev, tone_map=False)
         g = core._srgb_encode(core.recover_highlights(lin, trial.highlights)).astype(np.float32)
-        return np.clip(core.apply_tone(g, trial, None, base_c) @ LUMA, 0.0, 1.0)
+        return core.apply_tone(g, trial, None, base_c)
+
+    def luma():
+        return np.clip(toned() @ LUMA, 0.0, 1.0)
 
     def error():
         # a whisper of preference for small moves, so a slider that makes no difference stays put
@@ -657,6 +687,45 @@ def match_camera_look(dec, edit, groups, strength=1.0, bias=0.0) -> dict:
                 return error()
             setattr(trial, k, _golden(at, *CAMERA_LOOK_RANGES[k]))
 
+    punched = False
+    if CAMERA_LOOK_PUNCH and "contrast" in groups:
+        punched = True
+        brightness = float(np.median(luma()))
+
+        def brightest():                             # per pixel, as the preview's clipping warning sees it
+            g = core.apply_colour(toned(), trial)
+            return np.maximum(np.maximum(g[..., 0], g[..., 1]), g[..., 2])
+
+        def blown():
+            return float((brightest() >= (core.BLOWN_LEVEL - 0.5) / 255.0).mean())
+
+        def black():
+            return float((brightest() <= (core.BLACK_LEVEL + 0.5) / 255.0).mean())
+
+        def ok_with(key, limit, measure):
+            def ok(v):
+                setattr(trial, key, v)
+                return measure() <= limit
+            return ok
+
+        white_limit = max(CAMERA_LOOK_WHITE_CLIP, blown())      # never asks for less than the match clipped
+        black_limit = max(CAMERA_LOOK_BLACK_CLIP, black())
+        trial.contrast = min(max(max(trial.contrast, 0.0) + CAMERA_LOOK_CONTRAST + 0.4 * punch, -15.0), 60.0)
+        for _ in range(2):
+            if "levels" in groups:
+                trial.blacks = _furthest(ok_with("blacks", black_limit, black), *CAMERA_LOOK_PUNCH_RANGES["blacks"])
+                trial.whites = _furthest(ok_with("whites", white_limit, blown), *CAMERA_LOOK_PUNCH_RANGES["whites"])
+            if "exposure" in groups:                 # the stretch moved the midtones: put them back
+                def off(v):
+                    trial.exposure = v
+                    return abs(float(np.median(luma())) - brightness)
+                trial.exposure = _golden(off, trial.exposure - 0.8, trial.exposure + 0.8, 9)
+        if "levels" in groups:                       # the last word goes to the highlights
+            trial.whites = _furthest(ok_with("whites", white_limit, blown),
+                                     CAMERA_LOOK_PUNCH_RANGES["whites"][0], trial.whites)
+        elif "exposure" in groups and blown() > white_limit:
+            trial.exposure = _furthest(ok_with("exposure", white_limit, blown), trial.exposure - 1.0, trial.exposure)
+
     for k in keys:
         v = _scaled(getattr(trial, k), getattr(start, k), strength)
         if k == "exposure":
@@ -665,7 +734,7 @@ def match_camera_look(dec, edit, groups, strength=1.0, bias=0.0) -> dict:
     if "exposure" in groups and edit.lights:
         _set(edit, "lights", _scaled(0, start.lights, strength))
 
-    why = "matched to the camera's own rendering"
+    why = "matched to the camera's own rendering" + (", with punch" if punched else "")
     notes = {}
     if "exposure" in groups:
         notes["exposure"] = f"Auto exposure: {edit.exposure:+.2f} EV ({why})"
@@ -716,7 +785,7 @@ def run_auto(dec, edit, groups, opts: AutoOptions | None = None, user_rules: boo
             out["level"] = apply_level_mode(dec, edit, opts.level_mode, opts.allow_upright)
         elif g == "exposure":
             if camera_look:
-                look_notes = match_camera_look(dec, edit, groups, s, opts.exposure_bias)
+                look_notes = match_camera_look(dec, edit, groups, s, opts.exposure_bias, opts.punch)
                 replace_note(edit, "Auto exposure", look_notes["exposure"])
             else:
                 # first estimate; center_exposure() refines it and adds the bias
@@ -728,7 +797,7 @@ def run_auto(dec, edit, groups, opts: AutoOptions | None = None, user_rules: boo
                          look_notes["shhi"] if camera_look else auto_shadows_highlights(dec, edit, s))
         elif g == "contrast":
             replace_note(edit, "Auto contrast", look_notes["contrast"] if camera_look else auto_contrast(dec, edit, s))
-            if opts.punch:
+            if opts.punch and not (camera_look and CAMERA_LOOK_PUNCH):    # the camera look has it built in
                 _set(edit, "contrast", edit.contrast + 0.4 * opts.punch)
         elif g == "colour":
             if camera_look:

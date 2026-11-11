@@ -16,9 +16,9 @@ TONE = ("exposure", "levels", "shhi", "contrast", "colour")
 
 @pytest.fixture(autouse=True)
 def restore():
-    saved, look = dataclasses.asdict(dng_profile.OPTIONS), auto.CAMERA_LOOK
+    saved, look, punch = dataclasses.asdict(dng_profile.OPTIONS), auto.CAMERA_LOOK, auto.CAMERA_LOOK_PUNCH
     yield
-    auto.CAMERA_LOOK = look
+    auto.CAMERA_LOOK, auto.CAMERA_LOOK_PUNCH = look, punch
     for k, v in saved.items():
         setattr(dng_profile.OPTIONS, k, v)
 
@@ -54,6 +54,7 @@ def test_used_only_when_the_file_has_a_tone_map_the_preview_leaves_out():
 
 
 def test_sliders_reproduce_the_cameras_brightness():
+    auto.CAMERA_LOOK_PUNCH = False                         # the plain match
     dec = decoded()
     target = luma(dec, core.Edit(), tone_map=True)         # the camera's own rendering
     edit = core.as_shot_edit(dec)
@@ -67,6 +68,42 @@ def test_sliders_reproduce_the_cameras_brightness():
     assert any("camera's own rendering" in n for n in edit.notes)
     for key, (lo, hi) in auto.CAMERA_LOOK_RANGES.items():
         assert lo <= getattr(edit, key) <= hi
+
+
+def shares(dec, edit):
+    lin = dec.color.model.render_linear(dec.cam, dec.color.as_shot_mul, edit.exposure, dec.color.base_ev)
+    g = core._srgb_encode(core.recover_highlights(lin, edit.highlights)).astype(np.float32)
+    g = core.apply_colour(core.apply_tone(g, edit, None, dec.color.base_contrast), edit)
+    mx = g.max(axis=2)
+    return (float((mx >= (core.BLOWN_LEVEL - 0.5) / 255).mean()), float((mx <= (core.BLACK_LEVEL + 0.5) / 255).mean()))
+
+
+def test_punch_stretches_the_ends_within_the_clipping_allowance():
+    dec = decoded()
+    plain, punchy = core.as_shot_edit(dec), core.as_shot_edit(dec)
+    auto.CAMERA_LOOK_PUNCH = False
+    auto.run_auto(dec, plain, TONE)
+    auto.CAMERA_LOOK_PUNCH = True
+    auto.run_auto(dec, punchy, TONE)
+    assert punchy.contrast >= auto.CAMERA_LOOK_CONTRAST > plain.contrast
+    assert punchy.blacks < plain.blacks                    # darker shadows
+    lp, lq = luma(dec, plain), luma(dec, punchy)
+    spread = lambda L: float(np.percentile(L, 95) - np.percentile(L, 5))
+    assert spread(lq) > spread(lp) + 0.03                  # visibly more range used
+    assert abs(float(np.median(lq) - np.median(lp))) < 0.03   # same brightness
+    blown, black = shares(dec, punchy)
+    blown0, black0 = shares(dec, plain)                    # this noisy scene is blown before any punch
+    assert blown <= max(auto.CAMERA_LOOK_WHITE_CLIP, blown0) + 0.005    # never adds to it (slack: fit is on a copy)
+    assert black <= max(auto.CAMERA_LOOK_BLACK_CLIP, black0) + 0.005
+    assert any("with punch" in n for n in punchy.notes)
+
+
+def test_punch_setting_scales_it():
+    dec = decoded()
+    soft, hard = core.as_shot_edit(dec), core.as_shot_edit(dec)
+    auto.run_auto(dec, soft, TONE, auto.AutoOptions(punch=-25))
+    auto.run_auto(dec, hard, TONE, auto.AutoOptions(punch=25))
+    assert hard.contrast - soft.contrast == 20             # 0.4 per step, counted once
 
 
 def test_darker_than_centring_the_histogram():

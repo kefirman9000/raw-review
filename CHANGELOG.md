@@ -1,5 +1,14 @@
 # Changelog
 
+## v1.9.12
+
+- **Pixel photos: punchier.** The match to the phone's rendering (v1.9.11) came out flatter than the phone's own
+  picture, usually with Contrast at -15. Auto now adds punch on top of it: Contrast goes to +10, Blacks come down
+  until about 1% of the photo is pure black, Whites go up until about 0.5% is blown, and Exposure is re-set so the
+  photo stays as bright as before. Deeper shadows and brighter highlights with only a sliver clipped.
+- *Punch* in My auto settings makes it stronger or softer (0.4 Contrast per step, as before; the clipping limits
+  still apply). Pixel photos only; other cameras are unchanged.
+
 ## v1.9.11
 
 - **Pixel photos: auto now aims for the phone's own look.** With the tone map out of the preview (v1.9.10), auto
