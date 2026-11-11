@@ -1543,6 +1543,14 @@ class MainWindow(QtWidgets.QMainWindow):
                      "auto edits come out dark there. Turn it on only if your Lightroom shows Pixel photos\n"
                      "as bright as the phone does with no edits.")
         a.toggled.connect(lambda on: self._set_profile_opt("hdr_tone_map", bool(on)))
+        a = pm.addAction("Pixel: auto tone aims for the phone's own look")
+        a.setCheckable(True)
+        a.setChecked(auto.CAMERA_LOOK)
+        a.setToolTip("For DNGs that carry the phone's local tone map (Pixel): Auto sets Exposure, Shadows,\n"
+                     "Highlights, Contrast, Blacks and Whites to match the brightness of the phone's own\n"
+                     "rendering, using sliders Lightroom applies. Off: the same tools as every other camera\n"
+                     "(histogram centred). Takes effect the next time auto runs on a photo.")
+        a.toggled.connect(lambda on: setattr(auto, "CAMERA_LOOK", bool(on)))
         hm = pm.addMenu("HDR tone map strength")
         g6 = QtGui.QActionGroup(hm)
         for pct in (25, 50, 75, 100):
@@ -3863,6 +3871,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.opts.level_mode not in core.LEVEL_MODES:
             self.opts.level_mode = "Auto (best guess)"
         dng_profile.apply_saved_options(st.get("dng_profile"), st.get("version", ""))
+        auto.CAMERA_LOOK = bool(o.get("camera_look", auto.CAMERA_LOOK))
         self.last_dir = st.get("last_dir", "") if os.path.isdir(st.get("last_dir", "") or "") else ""
 
     def _apply_saved_window(self, st):
@@ -3895,7 +3904,8 @@ class MainWindow(QtWidgets.QMainWindow):
             "version": __version__,
             "auto": {"groups": sorted(o.groups), "known_groups": list(auto.GROUP_ORDER), "level_mode": o.level_mode, "allow_upright": o.allow_upright,
                      "strength": o.strength, "exposure_bias": o.exposure_bias, "use_existing": o.use_existing,
-                     "punch": o.punch, "colour": o.colour, "rules": o.rules, "subject_crop": o.subject_crop},
+                     "punch": o.punch, "colour": o.colour, "rules": o.rules, "subject_crop": o.subject_crop,
+                     "camera_look": auto.CAMERA_LOOK},
             "dng_profile": {k: getattr(dng_profile.OPTIONS, k) for k in dng_profile.OPTIONS.__dataclass_fields__},
             "geometry": base64.b64encode(bytes(self.saveGeometry())).decode("ascii"),
             "splitter": self.split.sizes(),

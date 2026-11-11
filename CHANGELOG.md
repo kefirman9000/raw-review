@@ -1,5 +1,21 @@
 # Changelog
 
+## v1.9.11
+
+- **Pixel photos: auto now aims for the phone's own look.** With the tone map out of the preview (v1.9.10), auto
+  centred the histogram like for any other camera, which pushed Exposure to about +2 and Highlights to -100 on shop
+  shelves and came out bright and washed. The DNG already says how the phone meant the photo to look (its local tone
+  map), so for these files Exposure, Shadows, Highlights, Contrast, Blacks and Whites are now fitted to match the
+  brightness of the phone's rendering, using only sliders Lightroom applies. Vibrance and Saturation are left at 0
+  (the profile's own colour). On eight Pixel 7 Pro test photos the result lands within 0.1-0.35 stops of the phone's
+  embedded preview (was 0.5-1.5 stops brighter) with nothing blown; typical values are Exposure +0.6 to +1.4,
+  Highlights -40 to -100, Shadows +12 to +25.
+- It runs when the Exposure tool runs, and only changes the tools that are switched on. *Brightness*, *Punch* and
+  *Colour* in My auto settings, auto strength and your rules still apply on top. Other cameras are unaffected.
+- Switch it off under *Auto ▾ → Camera profile → Pixel: auto tone aims for the phone's own look*.
+- Checked against Lightroom: with no edits, the preview of two Pixel 7 Pro photos now matches Lightroom Classic
+  11.0.1's export of the same files to within 0.02 stops and a colour difference of about 1 (ΔE), hue unchanged.
+
 ## v1.9.10
 
 - **Fixed: Pixel photos overexposed and washed out in the preview, then dark in Lightroom.** Pixel DNGs carry a

@@ -52,6 +52,21 @@ TARGET_KEY = 0.15          # target log-average scene brightness (linear, ~mid g
 # and Shadows then make up the difference.) Calibrated on Pixel 7 Pro files; nudge it with
 # "Exposure bias" in the Auto menu if your photos come out consistently lighter or darker.
 TARGET_KEY_HDR = 0.21
+# Camera look (see match_camera_look): for a DNG that carries the camera's own local tone map
+# (Pixel), the tone sliders are fitted to that rendering instead of centring the histogram. The
+# phone already decided how bright the photo should be and how far to lift the shadows; Lightroom
+# just doesn't apply the table, so the sliders rebuild it. False = the generic tools for every file
+# (Auto options -> Camera profile -> "Pixel: auto tone aims for the phone's own look").
+CAMERA_LOOK = True
+CAMERA_LOOK_EDGE = 300     # long edge of the copy the fit is measured on
+CAMERA_LOOK_RANGES = {     # how far the fit may move each slider
+    "exposure": (-1.0, 3.0), "shadows": (0.0, 70.0), "highlights": (-100.0, 0.0),
+    "contrast": (-15.0, 25.0), "blacks": (-40.0, 30.0), "whites": (-40.0, 30.0),
+}
+CAMERA_LOOK_KEYS = {       # which sliders each auto tool owns
+    "exposure": ("exposure",), "shhi": ("shadows", "highlights"),
+    "contrast": ("contrast",), "levels": ("blacks", "whites"),
+}
 EXPOSURE_DAMPING = 0.75    # move only this far toward the target (keeps low/high-key scenes moody)
 HIGHLIGHT_ALLOWANCE = 1.0  # the 99th percentile may reach this (linear, i.e. just white) and no more
 TARGET_SPREAD = 0.72       # target p5..p95 tonal spread in display units
@@ -563,6 +578,107 @@ def center_exposure(dec, edit, strength=1.0, bias=0.0) -> str:
     return note + ")"
 
 
+# --------------------------------------------------------------------------
+# Camera look: fit the tone sliders to the camera's own rendering (Pixel DNGs)
+# --------------------------------------------------------------------------
+
+def has_camera_look(dec) -> bool:
+    """True when the file carries the camera's local tone map and the preview is not applying it
+    (the default, because Lightroom doesn't): its rendering is then something to aim for."""
+    model = dec.color.model
+    return bool(CAMERA_LOOK and model is not None and model.p.gain_table is not None
+                and not model.has_hdr_tone_map)
+
+
+def _golden(f, lo: float, hi: float, steps: int = 10) -> float:
+    """Minimum of a one-humped f on lo..hi (golden-section search)."""
+    r = 0.6180339887
+    a, b = float(lo), float(hi)
+    c, d = b - r * (b - a), a + r * (b - a)
+    fc, fd = f(c), f(d)
+    for _ in range(steps):
+        if fc < fd:
+            b, d, fd = d, c, fc
+            c = b - r * (b - a)
+            fc = f(c)
+        else:
+            a, c, fc = c, d, fd
+            d = a + r * (b - a)
+            fd = f(d)
+    return (a + b) / 2.0
+
+
+def match_camera_look(dec, edit, groups, strength=1.0, bias=0.0) -> dict:
+    """
+    Set Exposure, Shadows/Highlights, Contrast and Blacks/Whites so the photo's brightness
+    matches the camera's own rendering of it: the DNG's local tone map, which the phone used
+    for its JPEG and Lightroom leaves out. Only the tools in `groups` are changed; the others
+    stay as they are and the fit works around them. Returns {group: note}.
+
+    The tone map is local (it differs across the frame) and the sliders are global, so this is
+    the closest global match: per-pixel brightness, least squares, on a small copy.
+    """
+    keys = [k for g in ("exposure", "shhi", "contrast", "levels") if g in groups for k in CAMERA_LOOK_KEYS[g]]
+    model, color = dec.color.model, dec.color
+    cam, mul = _small(dec, CAMERA_LOOK_EDGE), _mul(dec, edit)
+    base_c = color.base_contrast
+
+    target = core._srgb_encode(model.render_linear(cam, mul, 0.0, color.base_ev, tone_map=True))
+    target = np.clip(core.apply_tone(target.astype(np.float32), core.Edit(), None, base_c) @ LUMA, 0.0, 1.0)
+
+    start = edit.copy()
+    trial = edit.copy()
+    if "exposure" in groups:
+        trial.lights = 0                             # histogram centring's helper; not needed here
+    linear = {}                                      # the profile render per exposure (the slow part)
+
+    def luma():
+        ev = round(float(trial.exposure), 3)
+        lin = linear.get(ev)
+        if lin is None:
+            if len(linear) > 4:
+                linear.clear()
+            lin = linear[ev] = model.render_linear(cam, mul, ev, color.base_ev, tone_map=False)
+        g = core._srgb_encode(core.recover_highlights(lin, trial.highlights)).astype(np.float32)
+        return np.clip(core.apply_tone(g, trial, None, base_c) @ LUMA, 0.0, 1.0)
+
+    def error():
+        # a whisper of preference for small moves, so a slider that makes no difference stays put
+        nudge = sum((getattr(trial, k) / max(abs(lo), abs(hi))) ** 2 for k, (lo, hi) in CAMERA_LOOK_RANGES.items()
+                    if k in keys)
+        return float(np.mean((luma() - target) ** 2)) + 2e-5 * nudge
+
+    for k in keys:
+        setattr(trial, k, 0.0)
+    for _ in range(3):
+        for k in keys:
+            def at(v, k=k):
+                setattr(trial, k, v)
+                return error()
+            setattr(trial, k, _golden(at, *CAMERA_LOOK_RANGES[k]))
+
+    for k in keys:
+        v = _scaled(getattr(trial, k), getattr(start, k), strength)
+        if k == "exposure":
+            v = round(round((v + bias) / 0.05) * 0.05, 2)
+        _set(edit, k, v)
+    if "exposure" in groups and edit.lights:
+        _set(edit, "lights", _scaled(0, start.lights, strength))
+
+    why = "matched to the camera's own rendering"
+    notes = {}
+    if "exposure" in groups:
+        notes["exposure"] = f"Auto exposure: {edit.exposure:+.2f} EV ({why})"
+    if "levels" in groups:
+        notes["levels"] = f"Auto levels: blacks {edit.blacks:+d}, whites {edit.whites:+d} ({why})"
+    if "shhi" in groups:
+        notes["shhi"] = (f"Auto shadows/highlights: shadows {edit.shadows:+d}, "
+                         f"highlights {edit.highlights:+d} ({why})")
+    if "contrast" in groups:
+        notes["contrast"] = f"Auto contrast: {edit.contrast:+d} ({why})"
+    return notes
+
+
 def run_auto(dec, edit, groups, opts: AutoOptions | None = None, user_rules: bool = False) -> dict:
     """Run the chosen auto groups (in the right order) on `edit`. Returns {"wb": .., "level": ..}.
     user_rules=True also applies "My auto settings" (new photos, Auto-enhance, re-apply)."""
@@ -573,6 +689,12 @@ def run_auto(dec, edit, groups, opts: AutoOptions | None = None, user_rules: boo
     base = edit.copy()
     centre_at = GROUP_ORDER.index("colour")      # after tone and colour (vibrance can blow a channel)
     centred = "exposure" not in groups
+    # A file with the camera's own tone map (Pixel): fit the tone tools to that rendering in one go,
+    # at the point Exposure would run (after white balance), instead of centring the histogram.
+    look_notes = None
+    camera_look = "exposure" in groups and has_camera_look(dec)
+    if camera_look:
+        centred = True
 
     def centre():
         replace_note(edit, "Auto exposure",
@@ -593,18 +715,29 @@ def run_auto(dec, edit, groups, opts: AutoOptions | None = None, user_rules: boo
         elif g == "level":
             out["level"] = apply_level_mode(dec, edit, opts.level_mode, opts.allow_upright)
         elif g == "exposure":
-            # first estimate; center_exposure() refines it and adds the bias
-            replace_note(edit, "Auto exposure", auto_exposure(dec, edit, s, 0.0))
+            if camera_look:
+                look_notes = match_camera_look(dec, edit, groups, s, opts.exposure_bias)
+                replace_note(edit, "Auto exposure", look_notes["exposure"])
+            else:
+                # first estimate; center_exposure() refines it and adds the bias
+                replace_note(edit, "Auto exposure", auto_exposure(dec, edit, s, 0.0))
         elif g == "levels":
-            replace_note(edit, "Auto levels", auto_levels(dec, edit, s))
+            replace_note(edit, "Auto levels", look_notes["levels"] if camera_look else auto_levels(dec, edit, s))
         elif g == "shhi":
-            replace_note(edit, "Auto shadows", auto_shadows_highlights(dec, edit, s))
+            replace_note(edit, "Auto shadows",
+                         look_notes["shhi"] if camera_look else auto_shadows_highlights(dec, edit, s))
         elif g == "contrast":
-            replace_note(edit, "Auto contrast", auto_contrast(dec, edit, s))
+            replace_note(edit, "Auto contrast", look_notes["contrast"] if camera_look else auto_contrast(dec, edit, s))
             if opts.punch:
                 _set(edit, "contrast", edit.contrast + 0.4 * opts.punch)
         elif g == "colour":
-            replace_note(edit, "Auto colour", auto_colour(dec, edit, s))
+            if camera_look:
+                # the profile's own colour at the camera's brightness is already the camera's colour
+                _set(edit, "vibrance", _scaled(0, edit.vibrance, s))
+                _set(edit, "saturation", _scaled(0, edit.saturation, s))
+                replace_note(edit, "Auto colour", "Auto colour: the camera profile's colour, left as it is")
+            else:
+                replace_note(edit, "Auto colour", auto_colour(dec, edit, s))
             if opts.colour:
                 _set(edit, "vibrance", edit.vibrance + 0.5 * opts.colour)
         elif g == "masks":

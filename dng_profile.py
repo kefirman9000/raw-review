@@ -902,12 +902,16 @@ class DngColorModel:
         return 1.0 - (OPTIONS.tone_curve if self.p.tone_curve is not None else 0.0)
 
     # ---- the profile render ---------------------------------------------------
-    def render_linear(self, cam: np.ndarray, mul, exposure_ev: float, base_ev: float) -> np.ndarray:
+    def render_linear(self, cam: np.ndarray, mul, exposure_ev: float, base_ev: float,
+                      tone_map: bool | None = None) -> np.ndarray:
         """
         Camera RGB -> linear sRGB with the profile applied, in the order the DNG spec gives:
         matrix -> ProPhoto -> HueSatMap -> exposure -> LookTable -> local HDR tone map
         (ProfileGainTableMap, if the file has one) -> tone curve -> sRGB.
         `cam` is HxWx3 linear camera RGB (not white balanced).
+        tone_map: None follows the preview option; True applies the file's tone map at full
+        strength regardless (the camera's own rendering, used as the auto tools' reference);
+        False leaves it out.
         """
         h, w = cam.shape[:2]
         temp, _xy = self._solve(mul)
@@ -934,8 +938,10 @@ class DngColorModel:
         if self.p.tone_curve is not None and tone > 0.0:
             xs, ys = self.p.tone_curve
             curve = (xs, xs + (ys - xs) * np.float32(tone))
-        gtm = self._active_gain_table()
-        hdr = float(OPTIONS.hdr_strength)
+        if tone_map is None:
+            gtm, hdr = self._active_gain_table(), float(OPTIONS.hdr_strength)
+        else:
+            gtm, hdr = (self.p.gain_table if tone_map else None), 1.0
         if gtm is not None:
             gtm.prepare(h, w)
 
