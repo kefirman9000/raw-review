@@ -120,6 +120,10 @@ class Item:
         self.color: core.CameraColor | None = None
         self.src_size = (3, 2)
         self.flip = 0                 # orientation (Lightroom's crop / Upright use the recorded frame)
+        self.shot = core.ShotInfo()   # camera, lens, exposure settings, capture time
+        self.raw_key = None           # the scene's metered light level (for matching photos in the same light)
+        self.solo = None              # (exposure, temp, tint) auto chose for this photo on its own
+        self.light_matched = False    # its auto values were matched to photos taken in the same light
         self.guide_rejects = []       # Guided Upright: guides you clicked away
         self.error = ""
         self.list_item: QtWidgets.QListWidgetItem | None = None
@@ -161,14 +165,15 @@ class DecodeTask(QRunnable):
     def run(self):
         try:
             dec = core.decode_raw(self.path)          # read-only
-            res = {"dec": dec}
+            res = {"dec": dec, "shot": core.read_shot_info(self.path)}
             if self.analyze:
                 edit, wb, st = auto.propose_edit(dec, self.opts)
                 ex = core.read_existing(self.path, core.as_shot_edit(dec))      # read-only
                 chosen = edit
                 if ex["edit"] is not None and getattr(self.opts, "use_existing", True):
                     chosen = ex["edit"]
-                res.update(edit=chosen, auto_edit=edit, existing=ex, wb=wb, st=st, thumb=make_thumb(dec, chosen))
+                res.update(edit=chosen, auto_edit=edit, existing=ex, wb=wb, st=st, thumb=make_thumb(dec, chosen),
+                           raw_key=auto.raw_key(dec))
                 try:
                     res["cull"] = cull.measure(dec, edit)
                 except Exception:  # noqa: BLE001 - suggestions are a nicety, never block a photo
@@ -1414,6 +1419,10 @@ class MainWindow(QtWidgets.QMainWindow):
         # While a slider moves the preview is drawn at half size (~4x faster) so it follows the
         # slider; the full-size render replaces it once you pause.
         self._fast_next = False
+        self.match_timer = QTimer(self)                # match photos taken in the same light, once analysed
+        self.match_timer.setSingleShot(True)
+        self.match_timer.setInterval(700)
+        self.match_timer.timeout.connect(self.match_same_light)
         self.settle_timer = QTimer(self)
         self.settle_timer.setSingleShot(True)
         self.settle_timer.setInterval(220)
@@ -1663,6 +1672,14 @@ class MainWindow(QtWidgets.QMainWindow):
         tools = self._auto_tools_btn.menu()
         tools.setTitle("Tools that run on new photos")
         m_auto.addMenu(tools)
+        self.act_match_light = m_auto.addAction("Match photos taken in the same light")
+        self.act_match_light.setCheckable(True)
+        self.act_match_light.setChecked(True)
+        self.act_match_light.setToolTip(
+            "Photos from the same camera taken minutes apart in the same light get the same exposure\n"
+            "and white balance, so a series doesn't jump from frame to frame. Only photos still on\n"
+            "their auto proposal are changed.")
+        self.act_match_light.toggled.connect(lambda _on: self.match_same_light())
         m_auto.addSeparator()
         self.chk_autowrite = QtWidgets.QCheckBox("Auto-write Lightroom XMP")   # state lives here (saved setting)
         self.act_autowrite = m_auto.addAction("Auto-write Lightroom XMP")
@@ -2342,6 +2359,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._cache_put(path, dec)
         it.color, it.src_size = dec.color, (dec.cam.shape[1], dec.cam.shape[0])
         it.flip = dec.flip
+        if res.get("shot") is not None:
+            it.shot = res["shot"]
         if "edit" in res:
             it.edit, it.auto_edit, it.wb = res["edit"], res.get("auto_edit", res["edit"]).copy(), res["wb"]
             if res.get("cull") is not None:
@@ -2362,6 +2381,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 it.edited = bool(saved.get("edited", False))
             if it.status == "loading":
                 it.status = "ready"
+            it.raw_key = res.get("raw_key")
+            ae = it.auto_edit
+            it.solo = (ae.exposure, ae.temp, ae.tint) if ae.wb_mode == "custom" else (ae.exposure, None, None)
+            it.light_matched = False
+            if saved is not None:
+                it.solo = None                          # restored from last session: leave it alone
+            self.match_timer.start()
             self._set_thumb(it, res["thumb"])
             if saved is not None:
                 self._queue_thumb(it)
@@ -3218,6 +3244,74 @@ class MainWindow(QtWidgets.QMainWindow):
         for k, v in values.items():
             setattr(it.auto_edit, k, v)
 
+    # ---------------- photos taken in the same light ----------------
+    def match_same_light(self):
+        """Give photos taken in the same light (same camera, minutes apart, same scene brightness)
+        the same exposure and white balance. Only photos still on their untouched auto proposal."""
+        on = self.act_match_light.isChecked()
+        photos, info = [], {}
+        for it in self.items.values():
+            if it.solo is None or it.auto_edit is None or it.raw_key is None or it.raw_key <= 0:
+                continue
+            g = it.shot.gain_ev
+            if g is None or it.shot.time is None:
+                continue
+            photos.append({"key": it.path, "camera": it.shot.camera, "time": it.shot.time, "gain": g,
+                           "light": math.log2(it.raw_key) - g})
+            info[it.path] = it
+        groups = auto.same_light_groups(photos) if on else []
+        target = {}
+        for keys in groups:
+            members = [{"key": k, "gain": info[k].shot.gain_ev, "exposure": info[k].solo[0],
+                        "temp": info[k].solo[1] if info[k].solo[1] is not None else 0,
+                        "tint": info[k].solo[2] if info[k].solo[2] is not None else 0} for k in keys]
+            res = auto.match_same_light(members)
+            for k in keys:
+                target[k] = (res[k], len(keys))
+        changed = []
+        for path, it in info.items():
+            ev0, t0, ti0 = it.solo
+            if path in target:
+                (ev, t, ti), n = target[path]
+                if t0 is None:
+                    t, ti = None, None
+            else:
+                (ev, t, ti), n = (ev0, t0, ti0), 0
+            untouched = (not it.edited and it.lr_edit is None and it.status == "ready"
+                         and it.edit is not None and self._same_as_auto(it))
+            if not untouched:
+                continue
+            new = (ev, t if t is not None else it.auto_edit.temp, ti if ti is not None else it.auto_edit.tint)
+            cur = (it.auto_edit.exposure, it.auto_edit.temp, it.auto_edit.tint)
+            if new == cur:
+                continue
+            dec = self.cache.get(it.path)
+            brighter = new[0] > cur[0] + 0.05
+            for e in (it.edit, it.auto_edit):
+                e.exposure, e.temp, e.tint = new
+                if dec is not None and brighter:       # brighter now: keep the highlights in check
+                    auto.fit_highlights(dec, e)
+                note = (f"Matched to {n - 1} other photo(s) taken in the same light: exposure {ev0:+.2f} → {ev:+.2f}"
+                        + (f", WB {t0} K → {new[1]} K" if t0 is not None and new[1] != t0 else "")) if n else ""
+                e.notes = [x for x in e.notes if not x.startswith("Matched to ")] + ([note] if note else [])
+            it.light_matched = bool(n)
+            changed.append(it)
+        for it in changed:
+            self._queue_thumb(it)
+            self._update_list_item(it)
+            if self.chk_autowrite.isChecked():
+                self._write(it, quiet=True)
+        if changed and self.current in changed:
+            self.load_controls()
+            self.refresh_view()
+        if changed:
+            self.statusBar().showMessage(f"Matched exposure / white balance of {len(changed)} photo(s) "
+                                         "to others taken in the same light.", 5000)
+
+    def _same_as_auto(self, it) -> bool:
+        a, e = it.auto_edit, it.edit
+        return all(getattr(a, k) == getattr(e, k) for k in core.SETTINGS)
+
     # ---------------- reset several photos ----------------
     RESET_KINDS = {
         "auto": ("auto settings", "the automatic edit RAW Review proposed"),
@@ -3916,6 +4010,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chk_samples.setChecked(bool(st.get("show_wb_samples", False)))
         self.chk_masks.setChecked(bool(st.get("show_masks", False)))
         self.chk_clip.setChecked(bool(st.get("show_clipping", False)))
+        self.act_match_light.setChecked(bool(st.get("match_same_light", True)))
         try:
             self.thumb_size.setValue(int(st.get("thumb_size", 240)))
         except (TypeError, ValueError):
@@ -3944,6 +4039,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "show_wb_samples": self.chk_samples.isChecked(),
             "show_masks": self.chk_masks.isChecked(),
             "show_clipping": self.chk_clip.isChecked(),
+            "match_same_light": self.act_match_light.isChecked(),
             "apply_auto_last": self._settings.get("apply_auto_last"),
             "paste_groups": self._settings.get("paste_groups"),
             "mark_edited": self._settings.get("mark_edited", True),

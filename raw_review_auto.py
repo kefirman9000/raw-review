@@ -555,6 +555,86 @@ def metered(dec, edit) -> float:
     return _weighted_median(_finished_luma(dec, edit), meter_weights(dec))
 
 
+def raw_key(dec) -> float:
+    """The scene's light level as the camera recorded it (metered, before any edit), linear."""
+    L = np.maximum(_small(dec) @ core.LUMA, 1e-6)
+    return _weighted_median(L, meter_weights(dec))
+
+
+# --------------------------------------------------------------------------
+# Photos taken in the same light get the same exposure and white balance
+# --------------------------------------------------------------------------
+SAME_LIGHT_GAP = 180.0     # seconds between neighbouring shots
+SAME_LIGHT_LEVEL = 2.0     # stops: how far the metered scene level may differ (what's in the frame alone moves it
+                           # ~2 stops: dark trees vs bright runway; a real change of light is 4-5+ stops)
+SAME_LIGHT_MAX_SHIFT = 1.0 # stops: a photo further off than this keeps its own exposure
+SAME_LIGHT_MAX_WB = 2000   # K: ...and its own white balance
+
+
+def same_light_groups(photos: list[dict]) -> list[list]:
+    """
+    photos: [{"key", "camera", "time", "gain", "light"}] where light = log2(raw_key) - gain is
+    the scene's brightness in stops (independent of shutter / aperture / ISO). Shots from the same
+    camera, taken within SAME_LIGHT_GAP of the previous one, whose scene brightness is within
+    SAME_LIGHT_LEVEL of the group's, are one group. Returns groups of two or more keys.
+    """
+    ok = [p for p in photos if p.get("time") is not None and p.get("gain") is not None
+          and p.get("light") is not None]
+    ok.sort(key=lambda p: (p["camera"], p["time"]))
+    groups, cur = [], []
+    for p in ok:
+        if cur and (p["camera"] != cur[-1]["camera"] or p["time"] - cur[-1]["time"] > SAME_LIGHT_GAP
+                    or abs(p["light"] - float(np.median([q["light"] for q in cur]))) > SAME_LIGHT_LEVEL):
+            groups.append(cur)
+            cur = []
+        cur.append(p)
+    if cur:
+        groups.append(cur)
+    return [[p["key"] for p in g] for g in groups if len(g) >= 2]
+
+
+def fit_highlights(dec, edit):
+    """Highlights (and the tone curve's Lights) for the current exposure, as auto exposure sets them:
+    the least-negative Highlights that keeps no more than CENTER_MAX_CLIPPED blown."""
+    def clipped(e):
+        return _blown_share(dec, e)
+    if clipped(edit) > CENTER_MAX_CLIPPED:
+        trial = edit.copy()
+        trial.highlights = -100
+        if clipped(trial) > CENTER_MAX_CLIPPED:
+            edit.highlights = -100
+        else:
+            lo, hi = -100, min(edit.highlights, 0)
+            for _ in range(7):
+                trial.highlights = (lo + hi) / 2
+                lo, hi = (trial.highlights, hi) if clipped(trial) <= CENTER_MAX_CLIPPED else (lo, trial.highlights)
+            edit.highlights = int(math.floor(lo))
+    crush = max(-edit.highlights, 0)
+    if crush > 30:
+        edit.lights = int(min(round((crush - 30) * 0.5), 35))
+
+
+def match_same_light(members: list[dict]) -> dict:
+    """
+    members: [{"key", "gain", "exposure", "temp", "tint"}] with each photo's own auto values.
+    Same light means the same finished brightness: exposure + gain is made equal (the group's
+    median), and white balance is set to the group's median. A photo that would move by more than
+    SAME_LIGHT_MAX_SHIFT / SAME_LIGHT_MAX_WB keeps its own value (probably not the same scene).
+    Returns {key: (exposure, temp, tint)}.
+    """
+    c = float(np.median([m["exposure"] + m["gain"] for m in members]))
+    temp = float(np.median([m["temp"] for m in members]))
+    tint = float(np.median([m["tint"] for m in members]))
+    out = {}
+    for m in members:
+        ev = round(round((c - m["gain"]) / 0.05) * 0.05, 2)
+        if abs(ev - m["exposure"]) > SAME_LIGHT_MAX_SHIFT:
+            ev = m["exposure"]
+        t, ti = (round(temp), round(tint)) if abs(temp - m["temp"]) <= SAME_LIGHT_MAX_WB else (m["temp"], m["tint"])
+        out[m["key"]] = (ev, t, ti)
+    return out
+
+
 def _finished_luma(dec, edit) -> np.ndarray:
     """Luminance of the photo with exposure and every tone slider applied (what the histogram shows)."""
     return _stage(dec, edit, "final")[1]

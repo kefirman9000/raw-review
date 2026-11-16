@@ -1,5 +1,16 @@
 # Changelog
 
+## v1.9.15
+
+- **Photos taken in the same light now match:** auto judged every photo on its own, so a series shot in the same light
+  jumped around with the framing (on five framings of one airport scene: exposure from +0.65 to -0.90, white balance
+  5190-6600 K). RAW Review now reads each photo's shooting info (camera, lens, shutter, aperture, ISO, time) and
+  groups photos from the same camera taken minutes apart in the same light; they get one exposure (adjusted for any
+  difference in shutter / aperture / ISO) and one white balance. On that series: exposure -0.25 and 5223 K for all
+  five. Highlights are re-fitted where a photo gets brighter. Only photos still on their untouched auto proposal
+  change; a photo that would move by more than 1 stop or 2000 K keeps its own values. Toggle: *Auto ▾ → Match photos
+  taken in the same light* (on by default).
+
 ## v1.9.14
 
 - **Steadier auto exposure:** exposure went up and down from photo to photo because it set the brightness of the

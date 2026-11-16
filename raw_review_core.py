@@ -639,6 +639,70 @@ def change_setting(edit: Edit, key: str, action: str, amount: float = 0.0):
         edit.subj_on = True
 
 
+# --------------------------------------------------------------------------
+# Shooting info (EXIF): camera, lens, exposure settings, time
+# --------------------------------------------------------------------------
+@dataclass
+class ShotInfo:
+    make: str = ""
+    model: str = ""
+    lens: str = ""
+    exposure_time: float | None = None     # seconds
+    fnumber: float | None = None
+    iso: float | None = None
+    focal: float | None = None             # mm
+    time: float | None = None              # capture time, seconds since the epoch (local clock of the camera)
+
+    @property
+    def camera(self) -> str:
+        m = self.model.strip()
+        return m if not self.make or m.lower().startswith(self.make.split()[0].lower()) else f"{self.make.split()[0].title()} {m}"
+
+    @property
+    def gain_ev(self) -> float | None:
+        """How much light the camera let in, in stops: log2(time * ISO/100 / N²). Two photos of the same
+        light with gains differing by g come out 2^g brighter; 0 for 1 s at f/1, ISO 100."""
+        if not (self.exposure_time and self.fnumber and self.iso):
+            return None
+        return math.log2(self.exposure_time * (self.iso / 100.0) / (self.fnumber ** 2))
+
+
+def _ratio(v):
+    try:
+        x = v.values[0]
+        return float(x.num) / float(x.den) if hasattr(x, "num") else float(x)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def read_shot_info(path: str) -> ShotInfo:
+    """Camera, lens and exposure settings from the file's EXIF (read-only; never raises)."""
+    info = ShotInfo()
+    try:
+        import exifread
+        with open(path, "rb") as f:
+            t = exifread.process_file(f, details=False)
+    except Exception:  # noqa: BLE001 - shooting info is a nicety, never block a photo
+        return info
+    g = lambda k: str(t.get(k) or "").strip()
+    info.make, info.model = g("Image Make"), g("Image Model")
+    info.lens = g("EXIF LensModel") or g("MakerNote LensModel") or g("MakerNote LensType")
+    for attr, key in (("exposure_time", "EXIF ExposureTime"), ("fnumber", "EXIF FNumber"),
+                      ("iso", "EXIF ISOSpeedRatings"), ("focal", "EXIF FocalLength")):
+        if t.get(key) is not None:
+            setattr(info, attr, _ratio(t[key]))
+    when = g("EXIF DateTimeOriginal") or g("Image DateTime")
+    if when:
+        try:
+            import datetime as _dt
+            ts = _dt.datetime.strptime(when[:19], "%Y:%m:%d %H:%M:%S").timestamp()
+            sub = g("EXIF SubSecTimeOriginal")
+            info.time = ts + (float("0." + sub) if sub.isdigit() else 0.0)
+        except ValueError:
+            pass
+    return info
+
+
 def as_shot_edit(dec: Decoded) -> Edit:
     t, ti = dec.color.as_shot_temp_tint
     return Edit(temp=round(t), tint=round(ti))
