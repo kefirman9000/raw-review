@@ -1,5 +1,15 @@
 # Changelog
 
+## v1.9.18
+
+- **Calibrate preview to Lightroom, per camera:** if one camera's photos keep coming out brighter or darker in
+  Lightroom than in the preview, export 5–10 of them from Lightroom as JPEGs and choose that folder under *Auto ▾ →
+  Calibrate preview to Lightroom…*. RAW Review renders the same raws with the same settings (from their sidecars),
+  compares the tones (30/50/70% brightness points, so export size and sharpening don't matter) and works out per
+  camera how many stops Lightroom differs. Applying it shifts that camera's preview, and with it auto exposure, so
+  photos land where you'd expect in Lightroom. Offered when at least 2 photos agree to within 0.5 stops; *Clear
+  calibration* undoes it. Stored in settings, never in your photos.
+
 ## v1.9.17
 
 - **Learn from your Lightroom edits:** RAW Review now remembers what it wrote for each photo you approve. When the

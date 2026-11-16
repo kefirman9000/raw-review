@@ -222,6 +222,7 @@ class CameraColor:
             except Exception:  # noqa: BLE001 - fall back to the LibRaw matrix
                 self._dng = None
         self.profile = profile
+        self.camera = ""          # "SONY ILCE-7M3": picks the per-camera calibration (CAMERA_EV)
 
         m3 = np.asarray(cam_xyz, dtype=np.float64)[:3, :3]
         self._legacy_valid = bool(np.isfinite(m3).all() and abs(np.linalg.det(m3)) > 1e-9)
@@ -356,6 +357,7 @@ def decode_raw(path: str) -> Decoded:
 
     dec = make_decoded(rgb.astype(np.float32) / 65535.0, cam_xyz, as_shot, profile)
     dec.flip = flip
+    dec.color.camera = read_shot_info(path).camera
     return dec
 
 
@@ -790,6 +792,9 @@ def _srgb_encode(x):
 # than the preview showed. PREVIEW_ADOBE_EV was fitted on two Lightroom exports of RAW
 # Review's edits (with the curve, the preview matched Lightroom's tones to ~0.03).
 PREVIEW_ADOBE_EV = 0.23
+# Per-camera calibration on top of that: {camera: stops}, fitted by "Calibrate preview to Lightroom"
+# from your own Lightroom exports (see calibration_offset). The app fills this from its settings.
+CAMERA_EV: dict = {}
 _ACR3_LUT = np.interp(np.linspace(0.0, 1.0, 4096), np.linspace(0.0, 1.0, len(ACR3_CURVE)),
                       ACR3_CURVE).astype(np.float32)
 
@@ -837,6 +842,7 @@ def base_gamma(cam: np.ndarray, color: CameraColor, mul, exposure: float,
                highlights: float = 0.0) -> np.ndarray:
     """White balance + exposure + highlight recovery + shoulder + sRGB curve (no other tone sliders)."""
     model = color.model
+    exposure = exposure + float(CAMERA_EV.get(getattr(color, "camera", ""), 0.0))
     if model is not None:
         # DNG with its own profile: colour matrices + hue/sat map + look + tone curve
         lin = recover_highlights(model.render_linear(cam, mul, exposure, color.base_ev), highlights)
@@ -2438,6 +2444,43 @@ def _crs_props(root):
             if len(child) == 0 and child.text is not None and child.tag not in props:
                 props[child.tag] = child.text.strip()
     return props
+
+
+CALIB_QUANTILES = (0.3, 0.5, 0.7)    # tones compared between the preview and Lightroom's export
+
+
+def _luma_quantiles(rgb: np.ndarray) -> np.ndarray:
+    y = (np.asarray(rgb, np.float32) / 255.0) @ LUMA
+    return np.quantile(y, CALIB_QUANTILES)
+
+
+def calibration_offset(dec: Decoded, edit: Edit, lr_rgb: np.ndarray) -> float | None:
+    """
+    How many stops brighter Lightroom rendered this photo than the preview does, for the same
+    settings. lr_rgb is Lightroom's JPEG export (uint8 RGB, any size). Compares the tones
+    (30/50/70% points of brightness), so resizing or sharpening on export doesn't matter.
+    Returns None for photos that say little (nearly black or white).
+    """
+    target = _luma_quantiles(lr_rgb)
+    if not (0.06 < target[1] < 0.94):
+        return None
+
+    def err(d):
+        e = edit.copy()
+        e.exposure = edit.exposure + d
+        img, _ = render(dec, e)
+        return float(np.mean(_luma_quantiles(img) - target))
+
+    lo, hi = -3.0, 3.0
+    if err(lo) > 0 or err(hi) < 0:
+        return None
+    for _ in range(14):
+        mid = (lo + hi) / 2
+        if err(mid) < 0:
+            lo = mid
+        else:
+            hi = mid
+    return round((lo + hi) / 2, 3)
 
 
 def read_existing(raw_path: str, base: Edit):

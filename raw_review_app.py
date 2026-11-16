@@ -25,6 +25,7 @@ import traceback
 import types
 from collections import OrderedDict
 
+import cv2
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Qt, QTimer, Signal
@@ -33,6 +34,7 @@ import raw_review_auto as auto
 import dng_profile
 import raw_review_core as core
 import raw_review_cull as cull
+import raw_review_calibrate as calib
 import raw_review_learn as learn
 import updater
 from version import __version__
@@ -1116,6 +1118,106 @@ class LearnDialog(QtWidgets.QDialog):
         return {k for k, cb in self.checks.items() if cb.isChecked()}
 
 
+class CalibrateDialog(QtWidgets.QDialog):
+    """Per-camera brightness calibration from Lightroom JPEG exports."""
+
+    def __init__(self, parent, raw_paths):
+        super().__init__(parent)
+        self.setWindowTitle("Calibrate preview to Lightroom")
+        self.resize(640, 440)
+        self.raw_paths = raw_paths
+        self.rows = []
+        lay = QtWidgets.QVBoxLayout(self)
+        intro = QtWidgets.QLabel(
+            "If photos keep looking brighter or darker in Lightroom than here, calibrate:<br>"
+            "1. In Lightroom, pick 5–10 varied photos from this list (same camera is fine, more cameras too).<br>"
+            "2. Make sure Lightroom saved their settings to the sidecars (Lightroom Classic: select them, "
+            "<i>Metadata → Save Metadata to File</i>).<br>"
+            "3. Export them as JPEG (sRGB, any size) into one folder, keeping the file names.<br>"
+            "4. Choose that folder here. RAW Review renders the same photos with the same settings and works out, "
+            "per camera, how much brighter or darker Lightroom is. Nothing is written to your photos.")
+        intro.setWordWrap(True)
+        intro.setTextFormat(Qt.TextFormat.RichText)
+        lay.addWidget(intro)
+        row = QtWidgets.QHBoxLayout()
+        self.folder = QtWidgets.QLabel("<i>No folder chosen</i>")
+        pick = QtWidgets.QPushButton("Choose Lightroom export folder…")
+        pick.clicked.connect(self._pick)
+        row.addWidget(pick)
+        row.addWidget(self.folder, 1)
+        lay.addLayout(row)
+        self.table = QtWidgets.QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["Camera", "Photos", "Lightroom vs preview", "Spread", "New offset"])
+        self.table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.table.verticalHeader().setVisible(False)
+        lay.addWidget(self.table, 1)
+        cur = ", ".join(f"{k} {v:+.2f} EV" for k, v in sorted(core.CAMERA_EV.items())) or "none"
+        self.status = QtWidgets.QLabel(f"Current calibration: {cur}")
+        self.status.setWordWrap(True)
+        self.status.setStyleSheet("color:#999;font-size:11px;")
+        lay.addWidget(self.status)
+        bb = QtWidgets.QDialogButtonBox()
+        self.apply_btn = bb.addButton("Apply", QtWidgets.QDialogButtonBox.ButtonRole.AcceptRole)
+        self.apply_btn.setEnabled(False)
+        self.clear_btn = bb.addButton("Clear calibration", QtWidgets.QDialogButtonBox.ButtonRole.DestructiveRole)
+        self.clear_btn.setEnabled(bool(core.CAMERA_EV))
+        bb.addButton(QtWidgets.QDialogButtonBox.StandardButton.Close)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        self.clear_btn.clicked.connect(lambda: self.done(2))
+        lay.addWidget(bb)
+
+    def _pick(self):
+        start = os.path.dirname(self.raw_paths[0]) if self.raw_paths else ""
+        d = QtWidgets.QFileDialog.getExistingDirectory(self, "Lightroom JPEG exports", start)
+        if d:
+            self.measure(d)
+
+    def measure(self, export_dir):
+        self.folder.setText(export_dir)
+        pairs = calib.find_pairs(self.raw_paths, export_dir)
+        if not pairs:
+            self.status.setText("No exports in that folder match photos in the list (matched by file name).")
+            return
+        prog = QtWidgets.QProgressDialog("Comparing with Lightroom…", "Stop", 0, len(pairs), self)
+        prog.setWindowModality(Qt.WindowModality.WindowModal)
+        prog.setMinimumDuration(0)
+        results, skipped = [], 0
+        for i, (raw, jpg) in enumerate(pairs):
+            prog.setValue(i)
+            QtWidgets.QApplication.processEvents()
+            if prog.wasCanceled():
+                break
+            try:
+                dec = core.decode_raw(raw)
+                base = core.as_shot_edit(dec)
+                edit = core.read_existing(raw, base)["edit"] or base
+                bgr = cv2.imdecode(np.fromfile(jpg, np.uint8), cv2.IMREAD_COLOR)
+                off = None if bgr is None else core.calibration_offset(dec, edit, bgr[..., ::-1])
+            except Exception:  # noqa: BLE001 - one bad file shouldn't stop the rest
+                off = None
+            if off is None:
+                skipped += 1
+            else:
+                results.append({"camera": dec.color.camera, "offset": off})
+        prog.setValue(len(pairs))
+        self.rows = calib.summarize(results, core.CAMERA_EV)
+        self.table.setRowCount(len(self.rows))
+        for i, r in enumerate(self.rows):
+            cells = [r["camera"] or "(unknown camera)", str(r["photos"]), f"{r['change']:+.2f} EV brighter"
+                     if r["change"] >= 0 else f"{-r['change']:.2f} EV darker", f"{r['spread']:.2f} EV",
+                     f"{r['new']:+.2f} EV" if r["ok"] else "not enough agreement" if r["photos"] >= calib.MIN_PAIRS
+                     else f"needs {calib.MIN_PAIRS}+ photos"]
+            for j, t in enumerate(cells):
+                item = QtWidgets.QTableWidgetItem(t)
+                item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                self.table.setItem(i, j, item)
+        self.status.setText(f"Compared {len(results)} photo(s)" + (f", skipped {skipped} (nearly black/white or "
+                            "unreadable)" if skipped else "") + ". Apply sets the offset for the cameras marked "
+                            "with a new value.")
+        self.apply_btn.setEnabled(any(r["ok"] for r in self.rows))
+
+
 class BatchDialog(QtWidgets.QDialog):
     """Pick which photos, which auto tools, and which settings to raise / lower / set."""
 
@@ -1747,6 +1849,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.act_myauto = m_auto.addAction("★ My auto settings…", self.open_my_auto)
         self.act_learn = m_auto.addAction("Learn from my Lightroom edits…", self.open_learn)
         self.act_learn.setToolTip("What you keep changing in Lightroom after RAW Review, built into My auto settings")
+        self.act_calib = m_auto.addAction("Calibrate preview to Lightroom…", self.open_calibrate)
+        self.act_calib.setToolTip("Compare a few Lightroom JPEG exports with the preview and correct each camera's brightness")
         self.act_myauto.setToolTip("Your own recipe for auto edits: brightness, punch, colour, and a rule per setting")
         self._auto_tools_btn = self._build_auto_menu()          # keep a reference: it owns the menu
         tools = self._auto_tools_btn.menu()
@@ -3330,6 +3434,35 @@ class MainWindow(QtWidgets.QMainWindow):
         for k, v in values.items():
             setattr(it.auto_edit, k, v)
 
+    # ---------------- per-camera calibration ----------------
+    def open_calibrate(self):
+        paths = [p for p in self.items if os.path.splitext(p)[1].lower() in core.RAW_EXTS]
+        if not paths:
+            QtWidgets.QMessageBox.information(self, "Calibrate preview to Lightroom",
+                                              "Add the raws you exported from Lightroom first (Add ▾).")
+            return
+        dlg = CalibrateDialog(self, paths)
+        r = dlg.exec()
+        if r == 2:
+            core.CAMERA_EV.clear()
+            msg = "Calibration cleared."
+        elif r == QtWidgets.QDialog.DialogCode.Accepted:
+            done = [x for x in dlg.rows if x["ok"]]
+            for x in done:
+                core.CAMERA_EV[x["camera"]] = x["new"]
+            msg = "Calibrated: " + ", ".join(f"{x['camera']} {x['new']:+.2f} EV" for x in done)
+        else:
+            return
+        self.save_state()
+        for it in self.items.values():                       # previews and thumbnails with the new brightness
+            if it.edit is not None:
+                self._queue_thumb(it)
+        self.render_timer.start()
+        QtWidgets.QMessageBox.information(
+            self, "Calibrate preview to Lightroom",
+            msg + "\n\nPreviews use it now. Photos already auto-edited keep their exposure; to redo it, "
+            "select them and use Apply auto settings to selected. New photos are auto-edited with it.")
+
     # ---------------- learning from your Lightroom corrections ----------------
     def _learn_data(self) -> dict:
         if not hasattr(self, "_learn"):
@@ -4168,6 +4301,11 @@ class MainWindow(QtWidgets.QMainWindow):
         dng_profile.apply_saved_options(st.get("dng_profile"), st.get("version", ""))
         auto.CAMERA_LOOK = bool(o.get("camera_look", auto.CAMERA_LOOK))
         core.NO_AI_MASKS = bool(st.get("no_ai_masks", False))
+        try:
+            core.CAMERA_EV.clear()
+            core.CAMERA_EV.update({str(k): float(v) for k, v in (st.get("camera_ev") or {}).items()})
+        except (TypeError, ValueError, AttributeError):
+            pass
         self.last_dir = st.get("last_dir", "") if os.path.isdir(st.get("last_dir", "") or "") else ""
 
     def _apply_saved_window(self, st):
@@ -4204,6 +4342,7 @@ class MainWindow(QtWidgets.QMainWindow):
                      "punch": o.punch, "colour": o.colour, "rules": o.rules, "subject_crop": o.subject_crop,
                      "camera_look": auto.CAMERA_LOOK},
             "no_ai_masks": core.NO_AI_MASKS,
+            "camera_ev": dict(core.CAMERA_EV),
             "dng_profile": {k: getattr(dng_profile.OPTIONS, k) for k in dng_profile.OPTIONS.__dataclass_fields__},
             "geometry": base64.b64encode(bytes(self.saveGeometry())).decode("ascii"),
             "splitter": self.split.sizes(),
