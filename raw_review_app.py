@@ -124,6 +124,7 @@ class Item:
         self.raw_key = None           # the scene's metered light level (for matching photos in the same light)
         self.solo = None              # (exposure, temp, tint) auto chose for this photo on its own
         self.light_matched = False    # its auto values were matched to photos taken in the same light
+        self.unsure = []              # why auto may be off for this photo (look at these first)
         self.guide_rejects = []       # Guided Upright: guides you clicked away
         self.error = ""
         self.list_item: QtWidgets.QListWidgetItem | None = None
@@ -174,6 +175,10 @@ class DecodeTask(QRunnable):
                     chosen = ex["edit"]
                 res.update(edit=chosen, auto_edit=edit, existing=ex, wb=wb, st=st, thumb=make_thumb(dec, chosen),
                            raw_key=auto.raw_key(dec))
+                try:
+                    res["unsure"] = auto.unsure_reasons(dec, edit, wb)
+                except Exception:  # noqa: BLE001 - a nicety, never block a photo
+                    traceback.print_exc()
                 try:
                     res["cull"] = cull.measure(dec, edit)
                 except Exception:  # noqa: BLE001 - suggestions are a nicety, never block a photo
@@ -1758,6 +1763,7 @@ class MainWindow(QtWidgets.QMainWindow):
         cm.addAction("Not yet reviewed", lambda: self.check_where(lambda it: it.status in ("ready", "modified")))
         cm.addAction("Low-confidence WB", lambda: self.check_where(
             lambda it: bool(it.wb and it.wb.applied and it.wb.confidence < 0.5)))
+        cm.addAction("Auto unsure ⚠ (night, backlit, blown, WB…)", lambda: self.check_where(lambda it: bool(it.unsure)))
         cm.addAction("Suggested rejects (soft, bursts…)", lambda: self.check_where(
             lambda it: it.path in self._cull_why and it.status in ("ready", "modified")))
         lm = cm.addMenu("By colour label")
@@ -1839,7 +1845,7 @@ class MainWindow(QtWidgets.QMainWindow):
         bar.addWidget(self.search, 1)
         self.show_combo = QtWidgets.QComboBox()
         self.show_combo.addItems(["Show all", "Show not edited", "Show edited ✎", "Show to review",
-                                  "Show approved", "Show rejected"])
+                                  "Show approved", "Show rejected", "Show auto unsure ⚠"])
         self.show_combo.setToolTip("Only show photos in this state (in the list and the grid)")
         self.show_combo.currentIndexChanged.connect(lambda _i: self._refilter())
         bar.addWidget(self.show_combo)
@@ -2382,6 +2388,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if it.status == "loading":
                 it.status = "ready"
             it.raw_key = res.get("raw_key")
+            it.unsure = res.get("unsure") or []
             ae = it.auto_edit
             it.solo = (ae.exposure, ae.temp, ae.tint) if ae.wb_mode == "custom" else (ae.exposure, None, None)
             it.light_matched = False
@@ -2425,8 +2432,8 @@ class MainWindow(QtWidgets.QMainWindow):
         sidecar = " · has XMP" if has and it.status != "approved" else ""
         extra_meta = self._meta_text(it)
         extra = ""
-        if it.wb is not None and it.wb.applied and it.wb.confidence < 0.5 and it.status == "ready":
-            extra = " · check WB"
+        if it.unsure and it.status == "ready" and not it.edited:
+            extra = " · ⚠ check"
         extra += self._cull_text(it)
         if it.edited:
             extra = " · ✎ Edited" + extra
@@ -2437,6 +2444,10 @@ class MainWindow(QtWidgets.QMainWindow):
         it.list_item.setForeground(QtGui.QBrush(QtGui.QColor("white")) if col else QtGui.QBrush())
         if it.error:
             it.list_item.setToolTip(f"{it.path}\n{it.error}")
+        elif it.unsure:
+            it.list_item.setToolTip("Auto may be off here – worth a look:\n• " + "\n• ".join(it.unsure))
+        else:
+            it.list_item.setToolTip(it.path)
         self._update_grid_item(it)
         if hasattr(self, "show_combo"):                      # keep the "Show …" filter right for this photo
             q = self.search.text().strip().lower()
@@ -2535,8 +2546,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         label, col = STATUS_STYLE[it.status]
         mark = "☑ " if it.list_item.checkState() == Qt.CheckState.Checked else ""
-        low = " · check WB" if (it.wb is not None and it.wb.applied and it.wb.confidence < 0.5
-                                and it.status == "ready") else ""
+        low = " · ⚠ check" if (it.unsure and it.status == "ready" and not it.edited) else ""
         low += self._cull_text(it)
         if it.edited:
             low = " · ✎ Edited" + low
@@ -3717,7 +3727,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if it is None or mode == 0:
             return True
         return [True, not it.edited, it.edited, it.status in ("ready", "modified", "loading"),
-                it.status == "approved", it.status == "rejected"][mode]
+                it.status == "approved", it.status == "rejected", bool(it.unsure)][mode]
 
     def _refilter(self):
         if hasattr(self, "search"):
@@ -4228,10 +4238,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._approve_many(todo)
 
     def _approve_many(self, todo):
-        low = sum(1 for it in todo if it.wb and it.wb.applied and it.wb.confidence < 0.5)
+        low = sum(1 for it in todo if it.unsure and not it.edited)
         msg = f"Write XMP sidecars for {len(todo)} photo(s) with their current settings?"
         if low:
-            msg += f"\n\n{low} of them have low-confidence auto WB (marked 'check WB')."
+            msg += (f"\n\n{low} of them are marked ⚠ check (auto may be off: white balance, night, backlit, "
+                    "blown…) and you haven't edited them.")
         if QtWidgets.QMessageBox.question(self, "Approve", msg) != QtWidgets.QMessageBox.StandardButton.Yes:
             return
         done = 0

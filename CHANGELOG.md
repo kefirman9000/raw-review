@@ -1,5 +1,14 @@
 # Changelog
 
+## v1.9.16
+
+- **⚠ check: the photos auto may have got wrong.** Photos where auto is likely to be off are marked *⚠ check* in the
+  list and grid; hover for the reasons: white balance unsure (few neutral greys to go on, e.g. a frame full of yellow
+  or colourful packaging), a very dark or very bright scene (night: exposure pushed nearly 2 stops), bright areas still
+  blown after Highlights -100, a backlit subject (the middle much darker than a bright surround), or a mostly plain
+  frame (little for metering to go on). *Show ▾ → Show auto unsure ⚠* and *Check ▾ → Auto unsure* pick them out,
+  and Approve mentions how many unedited ones you're about to approve. Replaces the old "check WB" mark.
+
 ## v1.9.15
 
 - **Photos taken in the same light now match:** auto judged every photo on its own, so a series shot in the same light

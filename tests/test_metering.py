@@ -58,3 +58,27 @@ def test_metering_ignores_how_the_photo_is_exposed():
     w1 = auto.meter_weights(_dec(cam))
     w2 = auto.meter_weights(_dec(cam * 4))
     assert np.allclose(w1, w2, atol=1e-3)
+
+
+def test_unsure_flags():
+    # a plain, featureless frame: little for metering to go on
+    flat = np.full((200, 300, 3), 0.05, np.float32) * (1 + 0.01 * np.random.default_rng(3)
+                                                       .standard_normal((200, 300, 1))).astype(np.float32)
+    dec = _dec(flat)
+    e = core.as_shot_edit(dec)
+    assert any("plain" in r for r in auto.unsure_reasons(dec, e))
+    # backlit: dark middle, bright surround
+    cam = np.full((300, 450, 3), 0.5, np.float32)
+    cam[90:210, 135:315] = _scene()[90:210, 135:315] * 0.15
+    dec = _dec(cam)
+    e = core.as_shot_edit(dec)
+    auto.run_auto(dec, e, ["exposure", "levels", "shhi", "contrast"])
+    assert any("backlit" in r for r in auto.unsure_reasons(dec, e))
+    # an ordinary scene: nothing to flag
+    dec = _dec(_scene())
+    e = core.as_shot_edit(dec)
+    auto.run_auto(dec, e, ["exposure", "levels", "shhi", "contrast"])
+    assert auto.unsure_reasons(dec, e) == []
+    # night: auto had to push a lot
+    e.exposure = 2.2
+    assert any("very dark" in r for r in auto.unsure_reasons(dec, e))

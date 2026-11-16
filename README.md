@@ -33,7 +33,8 @@ Space Station (public domain). A tungsten-light cast was simulated, then removed
   - Looks for the surfaces most likely to be truly neutral: the brightest unclipped *near-whites* and the darkest *near-blacks*.
   - Skips clipped highlights and textured areas, and cross-checks the whites against the blacks.
   - Rejects physically implausible light, so a blue shirt under tungsten won't fool it.
-  - Low-confidence results are flagged **"check WB"**, and you can show exactly which spots it used.
+  - Low-confidence results are flagged **⚠ check**, and you can show exactly which spots it used.
+- **⚠ check:** photos where auto may be off (white balance unsure, very dark or bright scene, highlights still blown, backlit subject, mostly plain frame) are marked in the list; hover for the reasons. *Show ▾ → Show auto unsure* and *Check ▾ → Auto unsure* pick them out.
 - **Eyedropper** WB: click anything that should be white, grey or black.
 - **Straighten modes:** Off · Auto (best guess) · Horizon (rotate) · Verticals (rotate) · Lightroom **Upright: Level / Vertical / Auto / Full** (Full = architecture).
 - **✎ Edited mark:** photos you change are marked ✎ Edited. Use *Select ▾ → Not edited* or the *Show* filter to find the ones you haven't touched yet.

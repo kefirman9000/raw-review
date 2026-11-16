@@ -532,7 +532,9 @@ def meter_weights(dec) -> np.ndarray:
     g = np.hypot(gx, gy)
     k = max(3, int(max(L.shape) / 40)) | 1
     detail = cv2.blur(g, (k, k))                                               # detail in each neighbourhood
-    ref = float(np.percentile(detail, 90)) + 1e-6
+    # scaled to the photo's own detail, but with a floor: real photos sit at 1-4 here, a plain frame's
+    # pixel noise below 0.1, which must not count as detail
+    ref = max(float(np.percentile(detail, 90)), 0.3)
     detail = np.clip(detail / ref, 0.0, 1.0)
     h, wd = L.shape
     yy, xx = np.mgrid[0:h, 0:wd]
@@ -540,6 +542,7 @@ def meter_weights(dec) -> np.ndarray:
     centre = METER_CENTRE + (1 - METER_CENTRE) * np.exp(-r2 / (2 * 0.3 ** 2))
     w = ((METER_PLAIN + (1 - METER_PLAIN) * detail) * centre).astype(np.float32)
     dec.masks["_meter"] = w
+    dec.masks["_detail_share"] = float((detail > 0.3).mean())     # how much of the frame has detail
     return w
 
 
@@ -553,6 +556,41 @@ def _weighted_median(v: np.ndarray, w: np.ndarray) -> float:
 def metered(dec, edit) -> float:
     """The finished photo's brightness as metered (detail- and centre-weighted median luminance)."""
     return _weighted_median(_finished_luma(dec, edit), meter_weights(dec))
+
+
+# --------------------------------------------------------------------------
+# When auto is likely to be off: flag the photo so you look at it first
+# --------------------------------------------------------------------------
+UNSURE_WB = 0.5            # auto white balance confidence below this (the list's old "check WB")
+UNSURE_PUSH = 1.8          # |exposure| at or beyond this: a very dark (night) or very bright scene
+UNSURE_BLOWN = 0.02        # still blown after Highlights -100
+UNSURE_PLAIN = 0.12        # share of the frame with detail below this: little for metering to go on
+
+
+def unsure_reasons(dec, edit, wb=None) -> list:
+    """Short reasons why auto may be off for this photo (empty = nothing special)."""
+    out = []
+    if wb is not None and getattr(wb, "applied", False) and wb.confidence < UNSURE_WB:
+        out.append(f"white balance unsure ({wb.confidence:.0%} confident)")
+    if edit.exposure >= UNSURE_PUSH:
+        out.append(f"very dark scene (exposure {edit.exposure:+.1f})")
+    elif edit.exposure <= -UNSURE_PUSH:
+        out.append(f"very bright scene (exposure {edit.exposure:+.1f})")
+    if _blown_share(dec, edit) > UNSURE_BLOWN:
+        out.append("bright areas still blown")
+    L = _finished_luma(dec, edit)
+    h, w = L.shape
+    cy, cx = slice(int(h * 0.3), int(h * 0.7)), slice(int(w * 0.3), int(w * 0.7))
+    centre = float(np.median(L[cy, cx]))
+    ring = np.ones_like(L, bool)
+    ring[cy, cx] = False
+    outer = float(np.percentile(L[ring], 75))
+    if outer > 0.75 and centre < 0.55 * outer:
+        out.append("backlit: the middle is much darker than its surroundings")
+    meter_weights(dec)
+    if dec.masks.get("_detail_share", 1.0) < UNSURE_PLAIN:
+        out.append("mostly plain areas: little for metering to go on")
+    return out
 
 
 def raw_key(dec) -> float:
