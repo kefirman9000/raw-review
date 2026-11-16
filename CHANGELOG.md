@@ -1,5 +1,16 @@
 # Changelog
 
+## v1.9.17
+
+- **Learn from your Lightroom edits:** RAW Review now remembers what it wrote for each photo you approve. When the
+  folder is opened again and Lightroom's settings differ, that difference is your correction. *Auto ▾ → Learn from my
+  Lightroom edits…* lists what you keep changing (per setting: how many photos, the typical change, how consistently
+  you changed it the same way), optionally per camera, and builds the ticked ones into *My auto settings*: Exposure
+  becomes Brightness, Contrast becomes Punch, Vibrance becomes Colour, other settings become an "add" rule. Suggested
+  when at least 3 photos were changed, 70% the same way, by a meaningful amount. Used corrections are set aside so
+  they aren't counted twice; *Forget these corrections* clears them. Kept in your settings folder (learn.json), never
+  in your photos.
+
 ## v1.9.16
 
 - **⚠ check: the photos auto may have got wrong.** Photos where auto is likely to be off are marked *⚠ check* in the

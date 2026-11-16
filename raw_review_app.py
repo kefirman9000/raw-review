@@ -33,12 +33,14 @@ import raw_review_auto as auto
 import dng_profile
 import raw_review_core as core
 import raw_review_cull as cull
+import raw_review_learn as learn
 import updater
 from version import __version__
 
 CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".raw_review")   # settings + last session (never your photos)
 SETTINGS_FILE = os.path.join(CONFIG_DIR, "settings.json")
 SESSION_FILE = os.path.join(CONFIG_DIR, "session.json")
+LEARN_FILE = os.path.join(CONFIG_DIR, "learn.json")      # what RAW Review wrote, and what you changed in Lightroom
 LABEL_COLOURS = {"Red": "#d9534f", "Yellow": "#e6c229", "Green": "#4caf50", "Blue": "#3f7fd9", "Purple": "#9c5bd6"}
 HELP_HTML = """
 <h3>Keyboard</h3>
@@ -1043,6 +1045,77 @@ class PasteDialog(QtWidgets.QDialog):
         return {k for k, c in self.checks.items() if c.isChecked()}
 
 
+class LearnDialog(QtWidgets.QDialog):
+    """What you keep changing in Lightroom after RAW Review, and folding it into My auto settings."""
+
+    def __init__(self, parent, records):
+        super().__init__(parent)
+        self.setWindowTitle("Learn from my Lightroom edits")
+        self.resize(640, 420)
+        self.records = records
+        lay = QtWidgets.QVBoxLayout(self)
+        intro = QtWidgets.QLabel(
+            f"RAW Review compared what it wrote with what <b>{len(records)}</b> photo(s) have in Lightroom now. "
+            "These are the changes you made there. Tick the ones to build into <b>My auto settings</b>, so new "
+            "photos come out that way from the start (suggested = at least "
+            f"{learn.MIN_PHOTOS} photos, {learn.MIN_AGREE:.0%} the same way).")
+        intro.setWordWrap(True)
+        lay.addWidget(intro)
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(QtWidgets.QLabel("Camera:"))
+        self.camera = QtWidgets.QComboBox()
+        cams = sorted({r.get("camera") or "" for r in records} - {""})
+        self.camera.addItems(["All cameras"] + cams)
+        self.camera.currentIndexChanged.connect(lambda _i: self._fill())
+        row.addWidget(self.camera, 1)
+        lay.addLayout(row)
+        self.table = QtWidgets.QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["Setting", "Photos you changed", "Typical change", "Same way", "Use"])
+        self.table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.table.verticalHeader().setVisible(False)
+        lay.addWidget(self.table, 1)
+        note = QtWidgets.QLabel("Exposure becomes Brightness, Contrast becomes Punch, Vibrance becomes Colour; the "
+                                "others become an 'add' rule. The corrections used are then set aside, so they "
+                                "aren't counted twice.")
+        note.setWordWrap(True)
+        note.setStyleSheet("color:#999;font-size:11px;")
+        lay.addWidget(note)
+        bb = QtWidgets.QDialogButtonBox()
+        self.apply_btn = bb.addButton("Apply to My auto settings", QtWidgets.QDialogButtonBox.ButtonRole.AcceptRole)
+        self.forget_btn = bb.addButton("Forget these corrections", QtWidgets.QDialogButtonBox.ButtonRole.DestructiveRole)
+        bb.addButton(QtWidgets.QDialogButtonBox.StandardButton.Close)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        self.forget_btn.clicked.connect(lambda: self.done(2))
+        lay.addWidget(bb)
+        self._fill()
+
+    def _cam(self):
+        return None if self.camera.currentIndex() == 0 else self.camera.currentText()
+
+    def _fill(self):
+        self.rows = learn.summarize(self.records, self._cam())
+        self.checks = {}
+        self.table.setRowCount(len(self.rows))
+        for i, r in enumerate(self.rows):
+            fmt = (lambda v: f"{v:+.2f} EV") if r["key"] == "exposure" else \
+                  (lambda v: f"{v:+.0f} K") if r["key"] == "temp" else (lambda v: f"{v:+.0f}")
+            cells = [r["label"], f"{r['changed']} of {r['photos']}", fmt(r["mean"]), f"{r['agree']:.0%}"]
+            for j, t in enumerate(cells):
+                item = QtWidgets.QTableWidgetItem(t)
+                item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                self.table.setItem(i, j, item)
+            cb = QtWidgets.QCheckBox("suggested" if r["suggest"] else "")
+            cb.setChecked(r["suggest"])
+            cb.setEnabled(r["changed"] >= 2)
+            self.checks[r["key"]] = cb
+            self.table.setCellWidget(i, 4, cb)
+        self.apply_btn.setEnabled(bool(self.rows))
+
+    def chosen(self):
+        return {k for k, cb in self.checks.items() if cb.isChecked()}
+
+
 class BatchDialog(QtWidgets.QDialog):
     """Pick which photos, which auto tools, and which settings to raise / lower / set."""
 
@@ -1672,6 +1745,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.act_undo_batch.setEnabled(False)
         m_auto.addSeparator()
         self.act_myauto = m_auto.addAction("★ My auto settings…", self.open_my_auto)
+        self.act_learn = m_auto.addAction("Learn from my Lightroom edits…", self.open_learn)
+        self.act_learn.setToolTip("What you keep changing in Lightroom after RAW Review, built into My auto settings")
         self.act_myauto.setToolTip("Your own recipe for auto edits: brightness, punch, colour, and a rule per setting")
         self._auto_tools_btn = self._build_auto_menu()          # keep a reference: it owns the menu
         tools = self._auto_tools_btn.menu()
@@ -2374,6 +2449,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.cull_timer.start()
             ex = res.get("existing") or {}
             it.lr_edit = ex.get("edit").copy() if ex.get("edit") is not None else None
+            self._learn_check(it, ex.get("edit"))
             if it.rating is None and ex.get("rating") is not None:
                 it.rating = ex["rating"]
             if it.label is None and ex.get("label"):
@@ -3253,6 +3329,94 @@ class MainWindow(QtWidgets.QMainWindow):
             it.auto_edit = it.edit.copy()
         for k, v in values.items():
             setattr(it.auto_edit, k, v)
+
+    # ---------------- learning from your Lightroom corrections ----------------
+    def _learn_data(self) -> dict:
+        if not hasattr(self, "_learn"):
+            d = self._load_json(LEARN_FILE) or {}
+            self._learn = {"written": d.get("written", {}), "corrections": d.get("corrections", {})}
+            self._learn_timer = QTimer(self)
+            self._learn_timer.setSingleShot(True)
+            self._learn_timer.setInterval(1500)
+            self._learn_timer.timeout.connect(self._learn_save)
+            self._learn_offered = False
+        return self._learn
+
+    def _learn_save(self):
+        d = self._learn_data()
+        w = d["written"]
+        if len(w) > 20000:                                   # keep the file small: newest 20000 photos
+            for k in sorted(w, key=lambda k: w[k].get("time", 0))[:len(w) - 20000]:
+                w.pop(k, None)
+        self._save_json(LEARN_FILE, d)
+
+    def _learn_wrote(self, it):
+        """Remember what we just wrote to Lightroom for this photo."""
+        d = self._learn_data()
+        d["written"][it.path] = {"settings": learn.snapshot(it.edit), "camera": it.shot.camera, "time": time.time()}
+        d["corrections"].pop(it.path, None)                  # a new write: earlier corrections are history
+        self._learn_timer.start()
+
+    def _learn_check(self, it, lr_edit):
+        """A photo came back: anything changed in Lightroom since we wrote it is your correction."""
+        d = self._learn_data()
+        w = d["written"].get(it.path)
+        if w is None or lr_edit is None:
+            return
+        diffs = learn.correction(w["settings"], lr_edit)
+        if diffs:
+            d["corrections"][it.path] = {"camera": w.get("camera") or it.shot.camera, "diffs": diffs,
+                                         "seen": time.time()}
+        else:
+            d["corrections"].pop(it.path, None)
+        self._learn_timer.start()
+        self._learn_update_action()
+
+    def _learn_records(self):
+        return list(self._learn_data()["corrections"].values())
+
+    def _learn_update_action(self):
+        recs = self._learn_records()
+        rows = learn.summarize(recs)
+        n_sug = sum(r["suggest"] for r in rows)
+        self.act_learn.setText(f"Learn from my Lightroom edits ({n_sug} suggestion{'s' if n_sug != 1 else ''})…"
+                               if n_sug else "Learn from my Lightroom edits…")
+        if n_sug and not self._learn_offered:
+            self._learn_offered = True
+            self.statusBar().showMessage(
+                f"You've corrected {len(recs)} photo(s) in Lightroom in a consistent way – "
+                "Auto ▾ → Learn from my Lightroom edits can build that into your auto settings.", 12000)
+
+    def open_learn(self):
+        recs = self._learn_records()
+        if not recs:
+            QtWidgets.QMessageBox.information(
+                self, "Learn from my Lightroom edits",
+                "Nothing to learn from yet.\n\nApprove photos here, finish them in Lightroom, then open the same "
+                "folder in RAW Review again: whatever you changed in Lightroom shows up here.")
+            return
+        dlg = LearnDialog(self, recs)
+        r = dlg.exec()
+        d = self._learn_data()
+        if r == 2:                                           # forget
+            d["corrections"].clear()
+            self._learn_timer.start()
+            self._learn_update_action()
+            self.statusBar().showMessage("Forgot those corrections.", 4000)
+            return
+        if r != QtWidgets.QDialog.DialogCode.Accepted or not dlg.chosen():
+            return
+        done = learn.apply_to_options(self.opts, dlg.rows, dlg.chosen())
+        cam = dlg._cam()
+        for path in [p for p, c in d["corrections"].items() if cam is None or c.get("camera") == cam]:
+            d["corrections"].pop(path)                       # used: don't count them twice
+        self._learn_timer.start()
+        self.save_state()
+        self._learn_update_action()
+        QtWidgets.QMessageBox.information(
+            self, "My auto settings updated",
+            "Built into My auto settings:\n• " + "\n• ".join(done) +
+            "\n\nNew photos and Auto-enhance use them. You can see or change them under Auto ▾ → My auto settings.")
 
     # ---------------- photos taken in the same light ----------------
     def match_same_light(self):
@@ -4177,6 +4341,7 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "Could not write the edit", f"{it.path}\n\n{ex}")
             return False
         it.status = "approved"
+        self._learn_wrote(it)
         self._update_list_item(it)
         self._update_count()
         if it.path.lower().endswith(".dng"):

@@ -82,3 +82,17 @@ def test_unsure_flags():
     # night: auto had to push a lot
     e.exposure = 2.2
     assert any("very dark" in r for r in auto.unsure_reasons(dec, e))
+
+
+def test_backlit_subject_is_exposed_for():
+    """A textured subject in front of a bright plain window: metering on the detail exposes for the
+    subject (the window may blow, and the photo is flagged), instead of leaving the subject black."""
+    cam = np.full((300, 450, 3), 0.6, np.float32) * (1 + 0.01 * np.random.default_rng(5)
+                                                     .standard_normal((300, 450, 1))).astype(np.float32)
+    cam[80:240, 130:320] = _scene()[80:240, 130:320] * 0.12
+    dec = _dec(cam)
+    e = core.as_shot_edit(dec)
+    auto.run_auto(dec, e, ["exposure", "levels", "shhi", "contrast"])
+    L = (core.render(dec, e, look=False)[0] / 255.0) @ core.LUMA
+    assert float(np.median(L[80:240, 130:320])) > 0.25
+    assert any("backlit" in r for r in auto.unsure_reasons(dec, e))
