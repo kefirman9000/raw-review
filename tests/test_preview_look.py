@@ -78,7 +78,7 @@ def test_auto_exposure_centres_the_histogram():
     e = core.as_shot_edit(dec)
     auto.run_auto(dec, e, ["exposure", "levels", "shhi", "contrast"])
     L = auto._finished_luma(dec, e)
-    assert abs(float(np.median(L)) - auto.TARGET_MEDIAN) < 0.05
+    assert abs(auto.metered(dec, e) - auto.TARGET_MEDIAN) < 0.05
     assert float((L > 0.985).mean()) <= auto.CENTER_MAX_CLIPPED + 0.01
 
 

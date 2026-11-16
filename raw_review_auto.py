@@ -87,7 +87,7 @@ NOISE_FLOOR = 0.005        # luminance noise below this needs no reduction
 # until the finished photo's median brightness sits in the middle of the histogram.
 BLACKS_PULL = 0.6          # Auto levels moves the black point this share of the way to true black
 BLACKS_FLOOR = -40.0       # ...and never further than this
-TARGET_MEDIAN = 0.50       # median luminance of the finished photo (display units, 0..1): the middle
+TARGET_MEDIAN = 0.43       # metered brightness (see metered()): lands typical photos with the histogram's middle ~0.5
 CENTER_MAX_CLIPPED = 0.005 # Highlights is pulled down until no more than this share is blown
 # ---------------------------------------------------------------------------
 
@@ -510,6 +510,51 @@ def active_rules(rules) -> dict:
     return {k: r for k, r in (rules or {}).items() if r and r[0] not in ("auto",)}
 
 
+# Metering for auto exposure. A plain median of the whole frame let big plain areas decide:
+# lots of white wall / sky / floor came out dark, lots of dark background came out bright.
+# This meters like a photographer: areas with detail (edges, texture: usually the subject) count
+# fully, plain areas count METER_PLAIN as much, and the centre a little more than the edges.
+METER_PLAIN = 0.12         # weight of a perfectly plain area (detail areas = 1)
+METER_CENTRE = 0.5         # the frame's edges count this much of the centre
+
+
+def meter_weights(dec) -> np.ndarray:
+    """Per-pixel metering weights on the analysis image (cached on the photo: they only depend on
+    what's in the frame, not on the edit)."""
+    w = dec.masks.get("_meter")
+    if w is not None:
+        return w
+    cam = _small(dec)
+    L = np.maximum(cam @ core.LUMA, 1e-5)
+    logL = cv2.GaussianBlur(np.log2(L).astype(np.float32), (0, 0), 1.5)       # ignore pixel noise
+    gx = cv2.Sobel(logL, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(logL, cv2.CV_32F, 0, 1, ksize=3)
+    g = np.hypot(gx, gy)
+    k = max(3, int(max(L.shape) / 40)) | 1
+    detail = cv2.blur(g, (k, k))                                               # detail in each neighbourhood
+    ref = float(np.percentile(detail, 90)) + 1e-6
+    detail = np.clip(detail / ref, 0.0, 1.0)
+    h, wd = L.shape
+    yy, xx = np.mgrid[0:h, 0:wd]
+    r2 = ((xx + 0.5) / wd - 0.5) ** 2 + ((yy + 0.5) / h - 0.5) ** 2
+    centre = METER_CENTRE + (1 - METER_CENTRE) * np.exp(-r2 / (2 * 0.3 ** 2))
+    w = ((METER_PLAIN + (1 - METER_PLAIN) * detail) * centre).astype(np.float32)
+    dec.masks["_meter"] = w
+    return w
+
+
+def _weighted_median(v: np.ndarray, w: np.ndarray) -> float:
+    v, w = v.ravel(), w.ravel()
+    o = np.argsort(v)
+    c = np.cumsum(w[o])
+    return float(v[o][np.searchsorted(c, c[-1] / 2)])
+
+
+def metered(dec, edit) -> float:
+    """The finished photo's brightness as metered (detail- and centre-weighted median luminance)."""
+    return _weighted_median(_finished_luma(dec, edit), meter_weights(dec))
+
+
 def _finished_luma(dec, edit) -> np.ndarray:
     """Luminance of the photo with exposure and every tone slider applied (what the histogram shows)."""
     return _stage(dec, edit, "final")[1]
@@ -542,7 +587,7 @@ def center_exposure(dec, edit, strength=1.0, bias=0.0) -> str:
 
     def seek():
         for _ in range(8):
-            med = float(np.median(_finished_luma(dec, edit)))
+            med = metered(dec, edit)
             err = math.log2(TARGET_MEDIAN / max(med, 1e-3))
             if abs(err) < 0.03:
                 break
@@ -582,7 +627,7 @@ def center_exposure(dec, edit, strength=1.0, bias=0.0) -> str:
     _set(edit, "highlights", blend(s_hl, edit.highlights))
     if edit.lights != s_lights:
         _set(edit, "lights", blend(s_lights, edit.lights))
-    note = f"Auto exposure: {edit.exposure:+.2f} EV (histogram centred"
+    note = f"Auto exposure: {edit.exposure:+.2f} EV (histogram centred, metered on the detailed parts"
     if edit.highlights < 0:
         note += f"; highlights {edit.highlights:+d} to recover bright areas"
     if edit.lights != s_lights:

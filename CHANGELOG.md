@@ -1,5 +1,17 @@
 # Changelog
 
+## v1.9.14
+
+- **Steadier auto exposure:** exposure went up and down from photo to photo because it set the brightness of the
+  median pixel of the whole frame, so big plain areas decided it: lots of white wall, ceiling, floor or sky came out
+  dark, and lots of dark background came out bright. It now meters like a photographer: areas with detail (edges,
+  texture: usually the subject) count fully, plain areas count about an eighth as much, and the centre a little more
+  than the edges. Adding a plain area covering 30% of the frame used to swing the rest of the photo by 0.75 stops on
+  average (up to 1.2); now it's about 0.2. Typical photos still land with the histogram's middle around 0.5, and on
+  the photos you edited by hand the result is closer to your own brightness (0.14 stops off on average, was 0.32).
+  Night and very dark scenes are pushed up a little less. Pixel DNGs (which aim for the phone's own look) are
+  unaffected.
+
 ## v1.9.13
 
 - **Never use Lightroom AI masks:** a new choice under **Auto options**. With it ticked, no *Select Subject* or *Select

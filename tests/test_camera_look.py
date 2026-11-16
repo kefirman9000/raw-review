@@ -106,11 +106,15 @@ def test_punch_setting_scales_it():
     assert hard.contrast - soft.contrast == 20             # 0.4 per step, counted once
 
 
-def test_darker_than_centring_the_histogram():
+def test_darker_than_centring_the_histogram(monkeypatch):
     dec = decoded()
     look, centred = core.as_shot_edit(dec), core.as_shot_edit(dec)
     auto.run_auto(dec, look, TONE)
     auto.CAMERA_LOOK = False
+    # the reference: the frame's median put at the middle of the histogram (this test scene is plain
+    # noise, so the default detail-weighted metering would not be a meaningful reference here)
+    monkeypatch.setattr(auto, "metered", lambda d, e: float(np.median(auto._finished_luma(d, e))))
+    monkeypatch.setattr(auto, "TARGET_MEDIAN", 0.50)
     auto.run_auto(dec, centred, TONE)
     assert not any("camera's own rendering" in n for n in centred.notes)
     assert look.exposure < centred.exposure
