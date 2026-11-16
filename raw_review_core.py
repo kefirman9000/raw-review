@@ -334,6 +334,7 @@ class Decoded:
     quality: ImageQuality = field(default_factory=ImageQuality)
     masks: dict = field(default_factory=dict)      # preview mask estimates, computed on demand
     flip: int = 0            # LibRaw orientation: 0 none, 3 = 180°, 5 = 90° CCW, 6 = 90° CW (cam is shown upright)
+    lens_corrected: str | None = None   # lens whose vignetting the preview removed (Lightroom's lens profile)
 
 
 def decode_raw(path: str) -> Decoded:
@@ -355,10 +356,65 @@ def decode_raw(path: str) -> Decoded:
         cam_xyz = np.array(raw.rgb_xyz_matrix, dtype=np.float64)
         as_shot = np.array(raw.camera_whitebalance, dtype=np.float64)
 
-    dec = make_decoded(rgb.astype(np.float32) / 65535.0, cam_xyz, as_shot, profile)
+    shot = read_shot_info(path)
+    cam_full = rgb.astype(np.float32) / 65535.0
+    lens = None
+    if profile is None:                       # DNGs bring their own lens shading
+        cam_full, lens = _apply_lens_vignetting(cam_full, shot)
+    dec = make_decoded(cam_full, cam_xyz, as_shot, profile)
     dec.flip = flip
-    dec.color.camera = read_shot_info(path).camera
+    dec.color.camera = shot.camera
+    dec.lens_corrected = lens
     return dec
+
+
+# Lightroom's lens profile correction (on by default, and RAW Review writes it on) brightens the
+# corners by removing the lens's vignetting. The preview does the same from the open-source Lensfun
+# database (lensfunpy), when it knows the camera and lens; otherwise the preview is left as it is.
+LENS_VIGNETTE = True
+_LENSFUN_DB = None
+
+
+def _lens_vignette_gain(shot, w: int, h: int):
+    """(gain map HxW float32, lens name) for this camera + lens at the shot's focal length and
+    aperture, or (None, None). Only an exact Lensfun match is used: a wrong profile is worse than none."""
+    global _LENSFUN_DB
+    if not (LENS_VIGNETTE and shot.lens and shot.model and shot.focal and shot.fnumber):
+        return None, None
+    try:
+        import lensfunpy
+        if _LENSFUN_DB is None:
+            _LENSFUN_DB = lensfunpy.Database()
+        db = _LENSFUN_DB
+        cams = db.find_cameras(shot.make.split()[0] if shot.make else None, shot.model)
+        if not cams:
+            return None, None
+        cam = cams[0]
+        lenses = [l for l in db.find_lenses(cam, None, shot.lens)
+                  if l.min_focal and l.max_focal and l.min_focal - 0.5 <= shot.focal <= l.max_focal + 0.5]
+        if not lenses or lenses[0].score < 50:
+            return None, None
+        lens = lenses[0]
+        sw, sh = (240, max(1, round(240 * h / w))) if w >= h else (max(1, round(240 * w / h)), 240)
+        mod = lensfunpy.Modifier(lens, cam.crop_factor, sw, sh)
+        mod.initialize(float(shot.focal), float(shot.fnumber), 1000.0, pixel_format=np.float32)
+        ones = np.ones((sh, sw, 3), np.float32)
+        if not mod.apply_color_modification(ones):
+            return None, None
+        gain = np.clip(ones[..., 1], 1.0, 8.0)
+        if float(gain.max()) < 1.02:                     # nothing to correct
+            return None, None
+        return cv2.resize(gain, (w, h), interpolation=cv2.INTER_LINEAR), f"{lens.maker} {lens.model}"
+    except Exception:  # noqa: BLE001 - lens data is a nicety; never block loading
+        return None, None
+
+
+def _apply_lens_vignetting(cam_full: np.ndarray, shot):
+    h, w = cam_full.shape[:2]
+    gain, name = _lens_vignette_gain(shot, w, h)
+    if gain is None:
+        return cam_full, None
+    return np.minimum(cam_full * gain[..., None], 1.0).astype(np.float32), name
 
 
 def _apply_lens_shading(cam_full: np.ndarray, profile) -> np.ndarray:

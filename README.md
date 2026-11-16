@@ -28,6 +28,7 @@ Space Station (public domain). A tungsten-light cast was simulated, then removed
 - **Remembers your settings and the photos you had open**, even across updates.
 - **My auto settings** (*Auto ▾*): make auto edits brighter or moodier, punchier or softer, and set rules like *Sharpening always 60* or *never touch white balance*. Every new photo follows them.
 - **Calibrate preview to Lightroom** (*Auto ▾*): export a few photos from Lightroom as JPEGs and RAW Review measures, per camera, how much brighter or darker Lightroom renders them than the preview, then corrects the preview and auto exposure to match.
+- **Lens vignetting** is removed in the preview like Lightroom's lens profile does, for lenses in the Lensfun database.
 - **Learn from my Lightroom edits** (*Auto ▾*): RAW Review remembers what it wrote; when you reopen a folder, whatever you changed in Lightroom afterwards is listed (what you keep changing, how much, how consistently, per camera) and can be built into My auto settings with one click.
 - **Hold-to-compare and split view**, finer sliders, **undo approval**, find by name, analysis progress with pause, foldable panels and interface sizing.
 - **Drag and drop** photos or whole folders (subfolders included).

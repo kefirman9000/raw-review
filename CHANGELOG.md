@@ -1,5 +1,15 @@
 # Changelog
 
+## v1.9.19
+
+- **Lens vignetting in the preview:** Lightroom's lens profile correction (on by default, and RAW Review writes it
+  on) brightens the corners; the preview didn't, so corners looked darker here than in Lightroom and auto exposure
+  saw a slightly darker photo. The preview now removes the vignetting too, from the open-source Lensfun database,
+  using the camera, lens, focal length and aperture from the photo (e.g. Sony FE 28-70 at 28 mm f/3.5: corners
+  +0.8 stops, centre unchanged). Only an exact match is used: lenses Lensfun doesn't know (such as the Tamron
+  70-300 A047) are left as they were. Toggle: *Camera profile ▾ → Other raws: remove lens vignetting*. Pixel and
+  other DNGs keep using the shading map inside the file.
+
 ## v1.9.18
 
 - **Calibrate preview to Lightroom, per camera:** if one camera's photos keep coming out brighter or darker in

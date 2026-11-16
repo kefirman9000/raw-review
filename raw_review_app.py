@@ -1776,8 +1776,24 @@ class MainWindow(QtWidgets.QMainWindow):
             a.triggered.connect(lambda _c=False, p=pct: self._set_profile_opt("hdr_strength", p / 100.0))
         note = pm.addAction("Lens shading (vignette) from the DNG is always corrected")
         note.setEnabled(False)
+        pm.addSeparator()
+        a = pm.addAction("Other raws: remove lens vignetting, like Lightroom's lens profile")
+        a.setCheckable(True)
+        a.setChecked(core.LENS_VIGNETTE)
+        a.setToolTip("Lightroom's lens profile correction brightens the corners. With this on the preview\n"
+                     "does the same for lenses in the Lensfun database (camera + lens + focal length +\n"
+                     "aperture from the photo), so the preview and auto exposure match Lightroom.\n"
+                     "Lenses Lensfun doesn't know are left as they are.")
+        a.toggled.connect(self._set_lens_vignette)
         btn.setMenu(menu)
         return btn
+
+    def _set_lens_vignette(self, on):
+        core.LENS_VIGNETTE = bool(on)
+        self._settings["lens_vignette"] = core.LENS_VIGNETTE
+        self.cache.clear()                                   # decoded with/without it: decode again
+        self.save_state()
+        self.refresh_view()
 
     def _set_profile_opt(self, name, value):
         setattr(dng_profile.OPTIONS, name, value)
@@ -4301,6 +4317,7 @@ class MainWindow(QtWidgets.QMainWindow):
         dng_profile.apply_saved_options(st.get("dng_profile"), st.get("version", ""))
         auto.CAMERA_LOOK = bool(o.get("camera_look", auto.CAMERA_LOOK))
         core.NO_AI_MASKS = bool(st.get("no_ai_masks", False))
+        core.LENS_VIGNETTE = bool(st.get("lens_vignette", True))
         try:
             core.CAMERA_EV.clear()
             core.CAMERA_EV.update({str(k): float(v) for k, v in (st.get("camera_ev") or {}).items()})
@@ -4343,6 +4360,7 @@ class MainWindow(QtWidgets.QMainWindow):
                      "camera_look": auto.CAMERA_LOOK},
             "no_ai_masks": core.NO_AI_MASKS,
             "camera_ev": dict(core.CAMERA_EV),
+            "lens_vignette": core.LENS_VIGNETTE,
             "dng_profile": {k: getattr(dng_profile.OPTIONS, k) for k in dng_profile.OPTIONS.__dataclass_fields__},
             "geometry": base64.b64encode(bytes(self.saveGeometry())).decode("ascii"),
             "splitter": self.split.sizes(),

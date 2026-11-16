@@ -3,3 +3,4 @@ numpy>=1.24
 opencv-python-headless>=4.8
 PySide6>=6.5
 ExifRead>=3.0
+lensfunpy>=1.13

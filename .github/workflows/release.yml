@@ -43,7 +43,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install
-        run: python -m pip install rawpy numpy opencv-python-headless pytest ExifRead
+        run: python -m pip install rawpy numpy opencv-python-headless pytest ExifRead lensfunpy
       - name: Safety tests
         run: python -m pytest -q tests
 
@@ -61,7 +61,7 @@ jobs:
         shell: pwsh
         run: |
           python -m PyInstaller --noconfirm --windowed --name "RAW Review" `
-            --collect-all rawpy --add-data "CHANGELOG.md;." `
+            --collect-all rawpy --collect-all lensfunpy --add-data "CHANGELOG.md;." `
             --exclude-module tkinter --distpath build-output raw_review_app.py
       - name: Check that the program starts
         shell: pwsh
