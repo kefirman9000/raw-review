@@ -1,5 +1,20 @@
 # Changelog
 
+## v1.9.20
+
+- **Bright photos no longer come out of Lightroom dark and grey:** auto wrote Highlights -75 to -90 on
+  ordinary bright scenes (white packaging, book covers, snow) because the preview showed Highlights as
+  nearly free: it only brought back what was over white. Lightroom also pulls down the bright tones
+  that were never clipped, so those photos landed with their whites around 150-160 out of 255 (Sony
+  A7 III shelf shots: Highlights -76 and -90, nothing clipped). Now:
+  - the preview shows negative Highlights darkening bright tones like Lightroom (at -100, a tone at
+    85% drops to about 60%; midtones and shadows don't move), so what you see is what Lightroom gives;
+  - Auto shadows/highlights gives bright-but-not-blown areas only a gentle pull (at most -60, was
+    -100), and auto exposure still pulls Highlights further only where something is actually blown.
+  On a test scene with a large white label: Highlights -29 instead of -80, label 213/255 instead of 179.
+  Photos you already approved keep their settings; select them and *Apply auto settings to selected*
+  (or lower Highlights by hand) to redo them.
+
 ## v1.9.19
 
 - **Lens vignetting in the preview:** Lightroom's lens profile correction (on by default, and RAW Review writes it

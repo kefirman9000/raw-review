@@ -89,6 +89,9 @@ BLACKS_PULL = 0.6          # Auto levels moves the black point this share of the
 BLACKS_FLOOR = -40.0       # ...and never further than this
 TARGET_MEDIAN = 0.43       # metered brightness (see metered()): lands typical photos with the histogram's middle ~0.5
 CENTER_MAX_CLIPPED = 0.005 # Highlights is pulled down until no more than this share is blown
+HL_FROM = 0.75             # Auto shadows/highlights: the 92nd percentile above this gets some Highlights...
+HL_BRIGHT_MAX = 40.0       # ...up to this much for brightness alone
+HL_NEAR_WHITE_MAX = 20.0   # ...plus up to this much for a lot of near-white
 # ---------------------------------------------------------------------------
 
 
@@ -217,9 +220,13 @@ def auto_shadows_highlights(dec, edit, strength=1.0) -> str:
     shadows = min(max((0.16 - p15) / 0.16 * 60.0, 0.0), 60.0)
     if p50 < 0.25:                       # a genuinely dark scene (night): keep it moody
         shadows *= 0.5
-    highlights = -min(max((p92 - 0.68) / 0.25 * 80.0, 0.0), 80.0)
+    # A bright scene isn't a blown one: white packaging or snow filling the top of the histogram
+    # used to get -80..-100 here, which Lightroom turns into grey whites. Bright areas get a
+    # gentle pull; anything actually blown is recovered by center_exposure, which pulls Highlights
+    # only as far as needed to bring it back under white.
+    highlights = -min(max((p92 - HL_FROM) / 0.25 * 40.0, 0.0), HL_BRIGHT_MAX)
     clipped = float((L > 0.97).mean())           # share of near-white pixels
-    highlights -= min(clipped * 500.0, 30.0)
+    highlights -= min(clipped * 250.0, HL_NEAR_WHITE_MAX)
     highlights = max(highlights, -100.0)
     _set(edit, "shadows", _scaled(shadows, 0, strength))
     _set(edit, "highlights", _scaled(highlights, 0, strength))

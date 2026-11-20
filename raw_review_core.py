@@ -894,6 +894,35 @@ def recover_highlights(lin: np.ndarray, highlights: float) -> np.ndarray:
     return lin * (fY / Y)[..., None]
 
 
+# Lightroom's negative Highlights doesn't only bring back what is over white: it also pulls down
+# the bright tones that were never clipped (white walls, labels, snow), the brighter the more.
+# The preview only modelled the first part, so Highlights -90 looked almost free here (a white
+# showing 248 stayed at 242) while Lightroom took it down by about a stop. Auto, which judged
+# Highlights on the preview, then wrote -75..-90 on ordinary bright scenes and those photos came
+# out of Lightroom with their whites at 150-160 out of 255 (Sony A7 III shelf shots, Nov 2026).
+# At -100 a tone at 0.85 on screen drops to ~0.6 and white itself to ~0.82; below DARKEN_FROM
+# nothing moves. Fitted by eye to those Lightroom exports (Lightroom's version is local, so this
+# global stand-in is approximate; Calibrate preview to Lightroom still corrects exposure).
+DARKEN_FROM = 0.35
+DARKEN_WIDTH = 0.55
+HIGHLIGHT_DARKEN = 0.25        # display units taken off the bright tones at Highlights -100
+DARKEN_WHITE_KEEP = 0.3        # share of the pull that white itself is spared (recovered detail stays bright)
+
+
+def _smooth(x):
+    x = np.clip(x, 0.0, 1.0)
+    return x * x * (3 - 2 * x)
+
+
+def highlights_darken(L: np.ndarray, highlights: float) -> np.ndarray:
+    """Display luminance after negative Highlights' pull on the unclipped bright tones (monotone)."""
+    amount = min(max(-float(highlights) / 100.0, 0.0), 1.0)
+    if amount <= 0.0:
+        return L
+    m = _smooth((L - DARKEN_FROM) / DARKEN_WIDTH) * (1 - DARKEN_WHITE_KEEP * _smooth((L - 0.9) / 0.1))
+    return np.clip(L - np.float32(HIGHLIGHT_DARKEN * amount) * m, 0, 1).astype(np.float32)
+
+
 def base_gamma(cam: np.ndarray, color: CameraColor, mul, exposure: float,
                highlights: float = 0.0) -> np.ndarray:
     """White balance + exposure + highlight recovery + shoulder + sRGB curve (no other tone sliders)."""
@@ -925,8 +954,11 @@ def apply_tone(g: np.ndarray, e: Edit, stop: str | None = None, base_c: float = 
     if stop != "levels":
         ms = 6.75 * L1 * (1 - L1) ** 2           # shadow mask, peaks at L=1/3
         mh = 6.75 * L1 ** 2 * (1 - L1)           # highlight mask, peaks at L=2/3
-        # negative Highlights is applied before this, in base_gamma (recover_highlights)
+        # negative Highlights: what's over white is brought back in base_gamma (recover_highlights);
+        # here the bright tones that were never clipped are pulled down, like Lightroom does
         L1 = np.clip(L1 + 0.25 * (e.shadows / 100.0 * ms + max(e.highlights, 0) / 100.0 * mh), 0, 1)
+        if e.highlights < 0:
+            L1 = highlights_darken(L1, e.highlights)
         if stop != "shhi":
             c = base_c + e.contrast / 100.0      # small base S-curve, like a raw default
             S = L1 * L1 * (3 - 2 * L1)
