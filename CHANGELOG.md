@@ -1,5 +1,19 @@
 # Changelog
 
+## v1.9.24
+
+- **More colour from auto:** the saturation target was set for ordinary scenes (0.30), so
+  colourful product and shelf photos measured above it and got Vibrance 0. Auto colour now always
+  adds some: Vibrance at least +15 (up to +40 on dull photos, aiming at 0.55) and Saturation +8,
+  still toned down when colours are already over-cooked. On five A7 III shelf photos: Vibrance
+  +21 to +40 and Saturation +8 (was Vibrance 0, except +27 on one). *Colour* in My auto settings
+  still shifts it up or down.
+- **Saturated colours no longer pull Highlights down:** exposure centring counted a pixel as blown
+  when any channel hit 255 after the colour sliders, so a vivid red label (red channel at 255) made
+  it pull Highlights to -100 and darken the whole photo. Highlights and the Whites stretch now
+  judge clipping on the tones before Vibrance / Saturation. The histogram's warning still shows
+  colour clipping.
+
 ## v1.9.23
 
 - **Auto white balance trusts white spots that agree:** when the near-whites and near-blacks

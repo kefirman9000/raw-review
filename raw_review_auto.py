@@ -79,7 +79,10 @@ CAMERA_LOOK_PUNCH_RANGES = {"blacks": (15.0, -50.0), "whites": (-40.0, 40.0)}   
 EXPOSURE_DAMPING = 0.75    # move only this far toward the target (keeps low/high-key scenes moody)
 HIGHLIGHT_ALLOWANCE = 1.0  # the 99th percentile may reach this (linear, i.e. just white) and no more
 TARGET_SPREAD = 0.72       # target p5..p95 tonal spread in display units
-TARGET_SATURATION = 0.30   # target average saturation of coloured pixels
+TARGET_SATURATION = 0.55   # target average saturation of coloured pixels (product / shelf photos read best vivid)
+VIBRANCE_BASE = 15.0       # auto Vibrance never goes below this on a colour photo...
+VIBRANCE_MAX = 40.0        # ...nor above this
+SATURATION_BASE = 8.0      # auto Saturation, unless colours are already over-cooked
 SHARP_RATIO_CRISP = 2.8    # edge-acuity ratio of a crisp photo (see core.measure_quality)
 SHARP_RATIO_SOFT = 1.6     # ... and of a very soft one
 NOISE_FLOOR = 0.005        # luminance noise below this needs no reduction
@@ -268,10 +271,12 @@ def auto_colour(dec, edit, strength=1.0) -> str:
         _set(edit, "saturation", 0)
         return "Auto colour: scene is nearly neutral, left alone"
     mean_sat = float(s.mean())
-    # never below 0: colourful scenes (shop shelves, toys) got -10..-20 and looked washed out;
-    # truly over-cooked colour is handled by Saturation below
-    vib = min(max((TARGET_SATURATION - mean_sat) / TARGET_SATURATION * 50.0, 0.0), 35.0)
-    sat_adj = -min(max((mean_sat - 0.50) * 60.0, 0.0), 20.0)
+    # Always some extra colour: at the old target (0.30) colourful scenes (shop shelves, toys) got
+    # no Vibrance at all and looked flat next to Lightroom's own rendering. Truly over-cooked colour
+    # is handled by Saturation below.
+    vib = min(max(VIBRANCE_BASE + (TARGET_SATURATION - mean_sat) / TARGET_SATURATION * 50.0, VIBRANCE_BASE),
+              VIBRANCE_MAX)
+    sat_adj = SATURATION_BASE - min(max((mean_sat - 0.62) * 60.0, 0.0), 20.0 + SATURATION_BASE)
     _set(edit, "vibrance", _scaled(vib, 0, strength))
     _set(edit, "saturation", _scaled(sat_adj, 0, strength))
     return f"Auto colour: vibrance {edit.vibrance:+d}, saturation {edit.saturation:+d}"
@@ -652,7 +657,7 @@ def fit_highlights(dec, edit):
     """Highlights (and the tone curve's Lights) for the current exposure, as auto exposure sets them:
     the least-negative Highlights that keeps no more than CENTER_MAX_CLIPPED blown."""
     def clipped(e):
-        return _blown_share(dec, e)
+        return _blown_share(dec, e, colour=False)
     if clipped(edit) > CENTER_MAX_CLIPPED:
         trial = edit.copy()
         trial.highlights = -100
@@ -695,13 +700,17 @@ def _finished_luma(dec, edit) -> np.ndarray:
     return _stage(dec, edit, "final")[1]
 
 
-def _blown_share(dec, edit) -> float:
+def _blown_share(dec, edit, colour: bool = True) -> float:
     """
     Share of the photo the preview shows as blown (the histogram's red warning): any channel,
-    after tone and colour, with the preview's rounding. On a white subject in warm light one
-    channel blows well before overall brightness does, and Vibrance can push it over too.
+    after tone (and colour, unless colour=False), with the preview's rounding. On a white subject
+    in warm light one channel blows well before overall brightness does, and Vibrance can push it
+    over too. Highlights / Whites decisions use colour=False: a saturated red label hitting 255 in
+    its red channel isn't something Highlights should fix (it went to -100 and darkened the photo).
     """
-    g = core.apply_colour(_stage(dec, edit, "final")[0], edit)
+    g = _stage(dec, edit, "final")[0]
+    if colour:
+        g = core.apply_colour(g, edit)
     mx = np.maximum(np.maximum(g[..., 0], g[..., 1]), g[..., 2])
     return float((mx >= (core.BLOWN_LEVEL - 0.5) / 255.0).mean())
 
@@ -721,7 +730,8 @@ def stretch_levels(dec, edit, strength=1.0, punch=0.0) -> str:
     """
     s_wh, s_bl, s_exp = edit.whites, edit.blacks, edit.exposure
     k = min(max(1.0 + punch / 50.0, 0.25), 2.0)          # Punch: more / less of the range clipped
-    white_lim = max(STRETCH_WHITE_CLIP * k, _blown_share(dec, edit))
+    tone_blown = lambda d, e: _blown_share(d, e, colour=False)
+    white_lim = max(STRETCH_WHITE_CLIP * k, tone_blown(dec, edit))
     black_lim = max(STRETCH_BLACK_CLIP * k, _black_share(dec, edit))
     trial = edit.copy()
     target = metered(dec, edit)                          # the brightness centring (and your bias) chose
@@ -733,14 +743,14 @@ def stretch_levels(dec, edit, strength=1.0, punch=0.0) -> str:
         return ok
 
     for _ in range(2):
-        trial.whites = _furthest(ok_with("whites", white_lim, _blown_share), *STRETCH_WHITES)
+        trial.whites = _furthest(ok_with("whites", white_lim, tone_blown), *STRETCH_WHITES)
         trial.blacks = _furthest(ok_with("blacks", black_lim, _black_share), *STRETCH_BLACKS)
         for _ in range(6):                               # the stretch moved the midtones: put them back
             err = math.log2(target / max(metered(dec, trial), 1e-3))
             if abs(err) < 0.03:
                 break
             trial.exposure = min(max(trial.exposure + min(max(1.8 * err, -1.0), 1.0), -5.0), 5.0)
-    trial.whites = _furthest(ok_with("whites", white_lim, _blown_share), STRETCH_WHITES[0], trial.whites)
+    trial.whites = _furthest(ok_with("whites", white_lim, tone_blown), STRETCH_WHITES[0], trial.whites)
 
     _set(edit, "whites", _scaled(trial.whites, s_wh, strength))
     _set(edit, "blacks", _scaled(trial.blacks, s_bl, strength))
@@ -760,7 +770,7 @@ def center_exposure(dec, edit, strength=1.0, bias=0.0) -> str:
     s_exp, s_hl, s_lights = edit.exposure, edit.highlights, edit.lights
 
     def clipped(e):
-        return _blown_share(dec, e)
+        return _blown_share(dec, e, colour=False)
 
     def seek():
         for _ in range(8):

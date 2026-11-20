@@ -47,3 +47,15 @@ def test_auto_vibrance_never_negative_on_colourful_scene():
     e = core.as_shot_edit(dec)
     auto.auto_colour(dec, e)
     assert e.vibrance >= 0
+
+
+def test_auto_colour_adds_colour_and_saturated_reds_do_not_pull_highlights():
+    rng = np.random.default_rng(2)
+    cam = rng.uniform(0.02, 0.12, (160, 240, 3)).astype(np.float32)
+    cam[40:120, 60:180] = [0.30, 0.02, 0.02]                 # a big vivid red label
+    dec = core.Decoded(cam=cam, color=core.CameraColor(np.linalg.inv(core.XYZ_FROM_SRGB), [1, 1, 1]),
+                       baseline=1.0, source_size=(240, 160))
+    e = core.as_shot_edit(dec)
+    auto.run_auto(dec, e, ["exposure", "levels", "shhi", "contrast", "colour"])
+    assert e.vibrance >= auto.VIBRANCE_BASE
+    assert e.highlights > -60                                # not crushed because the red channel clips
