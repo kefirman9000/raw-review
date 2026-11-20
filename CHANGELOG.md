@@ -1,5 +1,25 @@
 # Changelog
 
+## v1.9.23
+
+- **Auto white balance trusts white spots that agree:** when the near-whites and near-blacks
+  disagreed, confidence was cut and the result was blended back toward the camera's As Shot, even
+  when a dozen separate white spots agreed closely. Under shop lighting As Shot can be far off: on
+  a Care Bears display, 12 white spots (the bears' muzzles, the shelf) agreed on 3229 K, the shadows
+  (lit purple by the display) said 5658 K, As Shot was 4093 K, and the photo got 3534 K: too warm.
+  Now 3 or more separate spots agreeing tightly count as corroboration: the other band
+  disagreeing isn't held against them, and they may move further from As Shot. That photo now gets
+  3229 K, and the white muzzles come out neutral. The other test photos are unchanged.
+- **Lightroom's colour in the preview (Sony A7 III):** the preview's colour was plain colorimetric, while
+  Lightroom's Adobe Standard makes greens, cyans and blues ~30-40% more saturated and blues ~50%
+  brighter, so the preview looked washed out (a bright sky-blue toy showed as greyish navy), and
+  auto colour judged a duller photo than Lightroom shows. A per-hue map (12 hues: saturation, hue,
+  brightness; greys untouched), fitted on five raws and their Lightroom exports, now gives the A7 III
+  Lightroom's colour: at the same settings the toy's blue is hue 201 / sat 1.0 / value 0.47 here
+  vs 204 / 0.99 / 0.50 in Lightroom (was 211 / 0.63 / 0.27).
+- **Levels stretch: Blacks limited to -45** (was -70): in a scene with no true black it went all
+  the way and turned dark colours (a blue toy) navy.
+
 ## v1.9.22
 
 - **Contrast from the levels, not the Contrast slider:** after exposure is set, auto now raises

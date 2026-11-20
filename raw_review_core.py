@@ -858,6 +858,61 @@ CAMERA_EV: dict = {}
 CAMERA_EV_DEFAULT: dict = {"Sony ILCE-7M3": -0.5}
 
 
+# Lightroom's colour for cameras measured here, like a DNG profile's HueSatMap: per hue (evenly
+# spaced bins around the colour wheel, interpolated), a saturation scale and a hue shift in degrees,
+# applied to the plain colorimetric render, plus a value scale. Greys (and so white balance) are
+# untouched. {camera: (scales, shifts, values)}. Fitted on raws and their Lightroom
+# exports (Adobe Standard), see CAMERA_EV_DEFAULT.
+CAMERA_COLOR: dict = {
+    # Sony A7 III, 12 hue bins from red (0, 30, 60 ... 330 degrees): saturation scales, hue shifts,
+    # value scales. Lightroom's Adobe Standard makes greens, cyans and blues ~30-40% more saturated
+    # and blues ~50% brighter. Fitted on five raws + exports (preview vs Lightroom error, all five:
+    # 0.029-0.035, was 0.029-0.058); held out, the Care Bears and book photos improve 17% and 36%.
+    "Sony ILCE-7M3": ([0.97, 1.02, 1.18, 1.03, 1.32, 1.41, 1.4, 1.32, 1.33, 1.04, 1.09, 1.04],
+                      [-1.7, -4.8, 1.1, 12.5, 6.4, 9.2, 2.8, 2.3, -11.1, -17.8, -10.3, -17.1],
+                      [0.91, 0.99, 0.92, 1.0, 1.01, 1.05, 1.13, 1.46, 1.52, 1.52, 1.35, 1.22]),
+}
+
+
+def hue_sat_map(lin: np.ndarray, scales, shifts, values=None) -> np.ndarray:
+    """Per-hue saturation scale, hue shift (degrees) and value scale in HSV on linear RGB. The value
+    scale acts in proportion to saturation, so greys are untouched."""
+    scales = np.asarray(scales, np.float32)
+    shifts = np.asarray(shifts, np.float32)
+    nb = len(scales)
+    lin = np.maximum(lin, 0.0).astype(np.float32)
+    r, g, b = lin[..., 0], lin[..., 1], lin[..., 2]
+    v = np.maximum(np.maximum(r, g), b)
+    mn = np.minimum(np.minimum(r, g), b)
+    c = v - mn
+    safe = np.maximum(c, 1e-8)
+    h = np.where(v == r, ((g - b) / safe) % 6.0, np.where(v == g, (b - r) / safe + 2.0, (r - g) / safe + 4.0))
+    h = np.where(c > 1e-8, h, 0.0) * np.float32(60.0)            # 0..360
+    pos = h / np.float32(360.0 / nb)
+    i0 = np.floor(pos).astype(np.int32) % nb
+    t = pos - np.floor(pos)
+    i1 = (i0 + 1) % nb
+    k = scales[i0] * (1 - t) + scales[i1] * t
+    dh = shifts[i0] * (1 - t) + shifts[i1] * t
+    s = np.where(v > 1e-8, c / np.maximum(v, 1e-8), 0.0)
+    s2 = np.clip(s * k, 0.0, 1.0)
+    h2 = ((h + dh) % 360.0) / np.float32(60.0)
+    if values is not None:
+        vals = np.asarray(values, np.float32)
+        vk = vals[i0] * (1 - t) + vals[i1] * t
+        v = v * (1 + (vk - 1) * s2)
+    # HSV -> RGB
+    c2 = v * s2
+    x = c2 * (1 - np.abs(h2 % 2.0 - 1))
+    m = v - c2
+    z = np.zeros_like(v)
+    seg = np.floor(h2).astype(np.int32) % 6
+    rr = np.choose(seg, [c2, x, z, z, x, c2])
+    gg = np.choose(seg, [x, c2, c2, x, z, z])
+    bb = np.choose(seg, [z, z, x, c2, c2, x])
+    return np.stack([rr + m, gg + m, bb + m], axis=-1).astype(np.float32)
+
+
 def camera_ev(camera: str) -> float:
     """The preview's offset for this camera: your calibration, else the built-in one, else 0."""
     return float(CAMERA_EV.get(camera, CAMERA_EV_DEFAULT.get(camera, 0.0)))
@@ -947,6 +1002,9 @@ def base_gamma(cam: np.ndarray, color: CameraColor, mul, exposure: float,
         lin = recover_highlights(model.render_linear(cam, mul, exposure, color.base_ev), highlights)
     else:
         lin = _cam_to_linear_srgb(cam, mul, color)
+        look = CAMERA_COLOR.get(getattr(color, "camera", ""))
+        if look is not None:                         # Lightroom's profile colour for this camera
+            lin = hue_sat_map(lin, *look)
         lin *= np.float32(2.0 ** (exposure + PREVIEW_BASE_EV + PREVIEW_ADOBE_EV))
         lin = recover_highlights(lin, highlights)
         lin = adobe_tone(lin)                        # what Lightroom does by default
@@ -1381,6 +1439,9 @@ def _lowest_chroma(mask, chroma, frac, max_chroma):
 SPOT_MAX = 12
 SPOT_OUTLIER = 0.08
 SPOT_MIN_KEEP = 2
+SPOT_AGREE_MIN = 3          # this many separate spots...
+SPOT_AGREE_SPREAD = 0.03    # ...agreeing this tightly (rms log chroma) corroborate each other
+SPOT_AGREE_MIRED = 120      # ...and may move this far from As Shot without losing confidence
 
 
 def _spot_neutral(sel, logc, Y, weight_by_y):
@@ -1549,10 +1610,20 @@ def auto_white_balance(dec: Decoded) -> WBResult:
         # Only one kind of evidence: a big jump away from the camera's own
         # As Shot needs corroboration (an orange wall in daylight looks exactly
         # like a white wall under tungsten).
+        # Several separate spots that agree tightly ARE corroboration: different objects agreeing
+        # on the light (one orange wall is one spot). Then a disagreeing other band (e.g. shadows
+        # lit by a coloured display) isn't held against it, and As Shot isn't trusted over it;
+        # under shop lighting As Shot can be ~900 K off (Care Bears display: As Shot 4093 K,
+        # 12 white spots agreeing on 3229 K, blended to 3534 K because the shadows disagreed).
+        used = est_b if sel_b.any() else est_d
+        agreeing = used is not None and used["spots"] >= SPOT_AGREE_MIN and used["spread"] <= SPOT_AGREE_SPREAD
         t_new, _ = color.mul_to_temp_tint(mul)
         d_mired = abs(1e6 / max(t_new, 1000) - 1e6 / max(t0, 1000))
-        conf *= (0.6 if "disagreed" in agree_msg else 0.8)
-        conf *= math.exp(-max(0.0, d_mired - 30) / 80.0)
+        if not agreeing:
+            conf *= (0.6 if "disagreed" in agree_msg else 0.8)
+        conf *= math.exp(-max(0.0, d_mired - (SPOT_AGREE_MIRED if agreeing else 30)) / 80.0)
+        if agreeing:
+            agree_msg += ", the spots agree"
 
     # Weak evidence -> blend toward As Shot.
     if conf < 0.5:

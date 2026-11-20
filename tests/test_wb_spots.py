@@ -44,3 +44,12 @@ def test_spot_neutral_drops_the_odd_one_out():
     n_log, used, spots = core._spot_neutral(sel, logc, Y, True)
     assert spots == 3 and not used[30, 30]
     assert np.allclose(n_log, 0.0, atol=1e-6)
+
+
+def test_hue_sat_map_keeps_greys_and_identity():
+    rng = np.random.default_rng(0)
+    x = rng.uniform(0, 1, (40, 3)).astype(np.float32)
+    assert np.allclose(core.hue_sat_map(x, np.ones(12), np.zeros(12), np.ones(12)), x, atol=1e-5)
+    grey = np.full((3, 3), 0.4, np.float32)
+    sc, sh, va = core.CAMERA_COLOR["Sony ILCE-7M3"]
+    assert np.allclose(core.hue_sat_map(grey, sc, sh, va), grey, atol=1e-6)   # white balance untouched
