@@ -1,5 +1,20 @@
 # Changelog
 
+## v1.9.22
+
+- **Contrast from the levels, not the Contrast slider:** after exposure is set, auto now raises
+  Whites until about 0.2% of the photo is at white and lowers Blacks until about 0.4% is pure black,
+  then re-centres exposure so the midtones stay where they were. Auto Contrast stays at 0. Before, Whites
+  was capped at +10 and Blacks often stopped short, so the brightest parts stayed around 207-221/255
+  and the darkest around 12-17, and Contrast (sometimes negative) was left to make up the difference:
+  flat, grey-looking results. On five A7 III shelf photos, the brightest 1% now reaches 207-249 and
+  the darkest 1% is 1-9. Limits: Whites -20..+60, Blacks +10..-70 (a truly foggy scene isn't forced
+  to look harsh). *Punch* in My auto settings now widens or narrows how much is allowed to clip,
+  instead of moving Contrast. Pixel DNGs (camera look) are unchanged.
+- **Auto colour no longer desaturates:** colourful scenes (toys, packaging, shop shelves) measured
+  above the saturation target and got Vibrance -10 to -20. Auto Vibrance is now never below 0;
+  genuinely over-saturated photos are still toned down with Saturation.
+
 ## v1.9.21
 
 - **Sony A7 III photos: preview matched to Lightroom.** Measured on five raws and their Lightroom

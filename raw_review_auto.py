@@ -89,6 +89,14 @@ BLACKS_PULL = 0.6          # Auto levels moves the black point this share of the
 BLACKS_FLOOR = -40.0       # ...and never further than this
 TARGET_MEDIAN = 0.43       # metered brightness (see metered()): lands typical photos with the histogram's middle ~0.5
 CENTER_MAX_CLIPPED = 0.005 # Highlights is pulled down until no more than this share is blown
+# Contrast from the levels (see stretch_levels): after exposure is centred, Whites goes up until
+# this share of the photo is at white and Blacks down until this share is pure black, then
+# exposure is re-centred. Auto Contrast stays at 0; Punch in My auto settings widens or narrows these.
+LEVELS_CONTRAST = True
+STRETCH_WHITE_CLIP = 0.002
+STRETCH_BLACK_CLIP = 0.004
+STRETCH_WHITES = (-20.0, 60.0)       # (gentlest, strongest)
+STRETCH_BLACKS = (10.0, -70.0)
 HL_FROM = 0.75             # Auto shadows/highlights: the 92nd percentile above this gets some Highlights...
 HL_BRIGHT_MAX = 40.0       # ...up to this much for brightness alone
 HL_NEAR_WHITE_MAX = 20.0   # ...plus up to this much for a lot of near-white
@@ -260,7 +268,9 @@ def auto_colour(dec, edit, strength=1.0) -> str:
         _set(edit, "saturation", 0)
         return "Auto colour: scene is nearly neutral, left alone"
     mean_sat = float(s.mean())
-    vib = min(max((TARGET_SATURATION - mean_sat) / TARGET_SATURATION * 50.0, -20.0), 35.0)
+    # never below 0: colourful scenes (shop shelves, toys) got -10..-20 and looked washed out;
+    # truly over-cooked colour is handled by Saturation below
+    vib = min(max((TARGET_SATURATION - mean_sat) / TARGET_SATURATION * 50.0, 0.0), 35.0)
     sat_adj = -min(max((mean_sat - 0.50) * 60.0, 0.0), 20.0)
     _set(edit, "vibrance", _scaled(vib, 0, strength))
     _set(edit, "saturation", _scaled(sat_adj, 0, strength))
@@ -696,6 +706,48 @@ def _blown_share(dec, edit) -> float:
     return float((mx >= (core.BLOWN_LEVEL - 0.5) / 255.0).mean())
 
 
+def _black_share(dec, edit) -> float:
+    """Share of the photo the preview shows as pure black (every channel)."""
+    g = core.apply_colour(_stage(dec, edit, "final")[0], edit)
+    mx = np.maximum(np.maximum(g[..., 0], g[..., 1]), g[..., 2])
+    return float((mx <= (core.BLACK_LEVEL + 0.5) / 255.0).mean())
+
+
+def stretch_levels(dec, edit, strength=1.0, punch=0.0) -> str:
+    """
+    Contrast the way you'd do it with levels: Whites up until a sliver of the photo is at white,
+    Blacks down until a sliver is pure black, exposure re-centred so the midtones stay put.
+    Fills the whole range instead of bending the midtones with Contrast. Run after center_exposure.
+    """
+    s_wh, s_bl, s_exp = edit.whites, edit.blacks, edit.exposure
+    k = min(max(1.0 + punch / 50.0, 0.25), 2.0)          # Punch: more / less of the range clipped
+    white_lim = max(STRETCH_WHITE_CLIP * k, _blown_share(dec, edit))
+    black_lim = max(STRETCH_BLACK_CLIP * k, _black_share(dec, edit))
+    trial = edit.copy()
+    target = metered(dec, edit)                          # the brightness centring (and your bias) chose
+
+    def ok_with(key, limit, measure):
+        def ok(v):
+            setattr(trial, key, v)
+            return measure(dec, trial) <= limit
+        return ok
+
+    for _ in range(2):
+        trial.whites = _furthest(ok_with("whites", white_lim, _blown_share), *STRETCH_WHITES)
+        trial.blacks = _furthest(ok_with("blacks", black_lim, _black_share), *STRETCH_BLACKS)
+        for _ in range(6):                               # the stretch moved the midtones: put them back
+            err = math.log2(target / max(metered(dec, trial), 1e-3))
+            if abs(err) < 0.03:
+                break
+            trial.exposure = min(max(trial.exposure + min(max(1.8 * err, -1.0), 1.0), -5.0), 5.0)
+    trial.whites = _furthest(ok_with("whites", white_lim, _blown_share), STRETCH_WHITES[0], trial.whites)
+
+    _set(edit, "whites", _scaled(trial.whites, s_wh, strength))
+    _set(edit, "blacks", _scaled(trial.blacks, s_bl, strength))
+    edit.exposure = float(round(round(_scaled(trial.exposure, s_exp, strength) / 0.05) * 0.05, 2))
+    return f"Auto levels: blacks {edit.blacks:+d}, whites {edit.whites:+d} (stretched to fill the range)"
+
+
 def center_exposure(dec, edit, strength=1.0, bias=0.0) -> str:
     """
     Put the finished photo's histogram in the middle, the way you'd do it by hand:
@@ -938,9 +990,15 @@ def run_auto(dec, edit, groups, opts: AutoOptions | None = None, user_rules: boo
     if camera_look:
         centred = True
 
+    # contrast from the levels (stretch_levels) when both are being set, except for the camera look
+    levels_contrast = (LEVELS_CONTRAST and not camera_look and "levels" in groups
+                       and "contrast" in groups and "exposure" in groups)
+
     def centre():
         replace_note(edit, "Auto exposure",
                      center_exposure(dec, edit, s, opts.exposure_bias))
+        if levels_contrast:
+            replace_note(edit, "Auto levels", stretch_levels(dec, edit, s, opts.punch))
 
     for i, g in enumerate(GROUP_ORDER):
         if not centred and i > centre_at:            # tone tools done: centre the histogram
@@ -969,6 +1027,10 @@ def run_auto(dec, edit, groups, opts: AutoOptions | None = None, user_rules: boo
             replace_note(edit, "Auto shadows",
                          look_notes["shhi"] if camera_look else auto_shadows_highlights(dec, edit, s))
         elif g == "contrast":
+            if levels_contrast:
+                _set(edit, "contrast", _scaled(0, edit.contrast, s))
+                replace_note(edit, "Auto contrast", "Auto contrast: 0 (contrast comes from Whites / Blacks)")
+                continue
             replace_note(edit, "Auto contrast", look_notes["contrast"] if camera_look else auto_contrast(dec, edit, s))
             if opts.punch and not (camera_look and CAMERA_LOOK_PUNCH):    # the camera look has it built in
                 _set(edit, "contrast", edit.contrast + 0.4 * opts.punch)
