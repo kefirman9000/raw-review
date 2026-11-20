@@ -851,6 +851,20 @@ PREVIEW_ADOBE_EV = 0.23
 # Per-camera calibration on top of that: {camera: stops}, fitted by "Calibrate preview to Lightroom"
 # from your own Lightroom exports (see calibration_offset). The app fills this from its settings.
 CAMERA_EV: dict = {}
+# Built-in offsets for cameras measured here, used until you calibrate that camera yourself
+# ("Clear calibration" goes back to these). Sony A7 III: fitted on five Lightroom Classic exports
+# (Adobe Standard, FE 50mm F1.8, Highlights -30..-90): the preview was ~0.5 stops brighter than
+# Lightroom at every Highlights setting, so auto exposure undershot and photos came out dark.
+CAMERA_EV_DEFAULT: dict = {"Sony ILCE-7M3": -0.5}
+
+
+def camera_ev(camera: str) -> float:
+    """The preview's offset for this camera: your calibration, else the built-in one, else 0."""
+    return float(CAMERA_EV.get(camera, CAMERA_EV_DEFAULT.get(camera, 0.0)))
+
+
+def camera_ev_all() -> dict:
+    return {**CAMERA_EV_DEFAULT, **CAMERA_EV}
 _ACR3_LUT = np.interp(np.linspace(0.0, 1.0, 4096), np.linspace(0.0, 1.0, len(ACR3_CURVE)),
                       ACR3_CURVE).astype(np.float32)
 
@@ -900,12 +914,12 @@ def recover_highlights(lin: np.ndarray, highlights: float) -> np.ndarray:
 # showing 248 stayed at 242) while Lightroom took it down by about a stop. Auto, which judged
 # Highlights on the preview, then wrote -75..-90 on ordinary bright scenes and those photos came
 # out of Lightroom with their whites at 150-160 out of 255 (Sony A7 III shelf shots, Nov 2026).
-# At -100 a tone at 0.85 on screen drops to ~0.6 and white itself to ~0.82; below DARKEN_FROM
-# nothing moves. Fitted by eye to those Lightroom exports (Lightroom's version is local, so this
-# global stand-in is approximate; Calibrate preview to Lightroom still corrects exposure).
+# At -100 a tone at 0.85 on screen drops to ~0.71 and white itself to ~0.9; below DARKEN_FROM
+# nothing moves. Fitted together with the camera offset (CAMERA_EV_DEFAULT) on five raws and their
+# Lightroom exports, Highlights -30..-90: preview vs Lightroom error 0.12 -> 0.023 (0..1 brightness).
 DARKEN_FROM = 0.35
 DARKEN_WIDTH = 0.55
-HIGHLIGHT_DARKEN = 0.25        # display units taken off the bright tones at Highlights -100
+HIGHLIGHT_DARKEN = 0.15        # display units taken off the bright tones at Highlights -100
 DARKEN_WHITE_KEEP = 0.3        # share of the pull that white itself is spared (recovered detail stays bright)
 
 
@@ -927,7 +941,7 @@ def base_gamma(cam: np.ndarray, color: CameraColor, mul, exposure: float,
                highlights: float = 0.0) -> np.ndarray:
     """White balance + exposure + highlight recovery + shoulder + sRGB curve (no other tone sliders)."""
     model = color.model
-    exposure = exposure + float(CAMERA_EV.get(getattr(color, "camera", ""), 0.0))
+    exposure = exposure + camera_ev(getattr(color, "camera", ""))
     if model is not None:
         # DNG with its own profile: colour matrices + hue/sat map + look + tone curve
         lin = recover_highlights(model.render_linear(cam, mul, exposure, color.base_ev), highlights)
@@ -1359,6 +1373,50 @@ def _lowest_chroma(mask, chroma, frac, max_chroma):
     return mask & (chroma <= thr)
 
 
+# Auto WB averages separate spots, not patches: the candidate patches are grouped into spots
+# (touching patches = one surface), each spot gives its own neutral, and the spots are averaged
+# with a weight that grows only with the square root of their size, so one big off-white label or
+# a snowy cover can't outvote everything else. A spot whose colour disagrees with the rest by more
+# than SPOT_OUTLIER (log chroma) is dropped, as long as SPOT_MIN_KEEP spots remain.
+SPOT_MAX = 12
+SPOT_OUTLIER = 0.08
+SPOT_MIN_KEEP = 2
+
+
+def _spot_neutral(sel, logc, Y, weight_by_y):
+    """(log neutral, patches of the spots used, number of spots) for the selected patches."""
+    n, lab = cv2.connectedComponents(sel.astype(np.uint8), connectivity=8)
+    spots = []
+    for k in range(1, n):
+        m = lab == k
+        w = Y[m] if weight_by_y else np.ones(int(m.sum()), np.float32)
+        spots.append((m, (logc[m] * w[:, None]).sum(axis=0) / w.sum(),
+                      math.sqrt(m.sum()) * (float(Y[m].mean()) if weight_by_y else 1.0)))
+    if not spots:
+        return logc[sel].mean(axis=0), sel, 0
+    spots.sort(key=lambda s: -s[0].sum())
+    spots = spots[:SPOT_MAX]
+
+    def mean(ss):
+        w = np.array([s[2] for s in ss])
+        return (np.stack([s[1] for s in ss]) * w[:, None]).sum(axis=0) / w.sum()
+
+    keep = spots
+    for _ in range(3):                                  # drop the spot furthest off, while it is an outlier
+        if len(keep) <= SPOT_MIN_KEEP:
+            break
+        c = mean(keep)
+        off = [np.hypot(*((s[1] - c)[[0, 2]] - (s[1] - c)[1])) for s in keep]
+        i = int(np.argmax(off))
+        if off[i] <= SPOT_OUTLIER:
+            break
+        keep = keep[:i] + keep[i + 1:]
+    used = np.zeros_like(sel)
+    for s in keep:
+        used |= s[0]
+    return mean(keep), used, len(keep)
+
+
 def auto_white_balance(dec: Decoded) -> WBResult:
     """
     Find surfaces that are most likely truly neutral - near-white highlights
@@ -1431,8 +1489,7 @@ def auto_white_balance(dec: Decoded) -> WBResult:
                 sel = _lowest_chroma(band, chroma, 0.20, 0.35)
             if sel.sum() < 3:
                 return None
-            w = Y[sel] if weight_by_y else np.ones(int(sel.sum()), np.float32)
-            n_log = (logc[sel] * w[:, None]).sum(axis=0) / w.sum()
+            n_log, sel, spots = _spot_neutral(sel, logc, Y, weight_by_y)
             new_mul = color.neutral_to_mul(np.exp(n_log))
             done = np.abs(np.log(new_mul / mul)).max() < 0.002
             mul = new_mul
@@ -1440,7 +1497,7 @@ def auto_white_balance(dec: Decoded) -> WBResult:
                 break
         spread = float(np.sqrt(np.mean(chroma_of(mul)[sel] ** 2)))
         _t, tint = color.mul_to_temp_tint(mul)
-        return {"mul": mul, "sel": sel, "n": int(sel.sum()), "spread": spread, "tint": tint}
+        return {"mul": mul, "sel": sel, "n": int(sel.sum()), "spread": spread, "tint": tint, "spots": spots}
 
     est_b = estimate(bright, True)
     est_d = estimate(dark, False)
@@ -1476,11 +1533,15 @@ def auto_white_balance(dec: Decoded) -> WBResult:
         agree_msg = "whites only" if pick is est_b else "blacks only"
 
     n_sel = int(sel_b.sum() + sel_d.sum())
+    n_spots = sum(e["spots"] for e in (est_b, est_d)
+                  if e is not None and (e["sel"] & sel_b).any() | (e["sel"] & sel_d).any())
     sel = sel_b | sel_d
     # Brightness-weighted: dark patches are noisier, so they shouldn't dominate.
     spread = float(np.sqrt(np.average(chroma_of(mul)[sel] ** 2, weights=Y[sel])))
     _t, tint_now = color.mul_to_temp_tint(mul)
-    conf = float(min(1.0, n_sel / 40.0) * math.exp(-spread / 0.08)
+    # one big surface is one piece of evidence however many patches it covers: confidence also
+    # needs a few separate spots that agree
+    conf = float(min(1.0, n_sel / 40.0) * min(1.0, 0.55 + 0.15 * n_spots) * math.exp(-spread / 0.08)
                  * locus_score({"tint": tint_now}))
     if agree_msg == "white+black agree":
         conf = min(1.0, conf * 1.2)
@@ -1508,7 +1569,7 @@ def auto_white_balance(dec: Decoded) -> WBResult:
         return np.stack([(xs + 0.5) * W / sw, (ys + 0.5) * H / sh], axis=1)
 
     note = (f"Auto WB: {round(temp)}K / tint {round(tint):+d} - {agree_msg}, "
-            f"{int(sel_b.sum())} light + {int(sel_d.sum())} dark patches "
+            f"{n_spots} spots ({int(sel_b.sum())} light + {int(sel_d.sum())} dark patches) "
             f"(confidence {conf:.0%}{', clamped' if clamped else ''})")
     return WBResult(True, temp, tint, conf, note, pts(sel_b), pts(sel_d))
 

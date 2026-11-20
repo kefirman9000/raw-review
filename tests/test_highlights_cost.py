@@ -14,7 +14,7 @@ def test_negative_highlights_pulls_bright_tones_and_keeps_midtones():
     out = core.highlights_darken(L, -100)
     assert np.all(np.diff(out) >= 0)                     # never reverses tones
     assert np.allclose(out[:300], L[:300])               # shadows and midtones untouched
-    assert out[850] < 0.85 - 0.2                          # a bright white goes clearly darker
+    assert out[850] < 0.85 - 0.12                         # a bright white goes clearly darker
     assert out[1000] > out[850]                           # white still the brightest
     assert np.array_equal(core.highlights_darken(L, 0), L)
     assert np.array_equal(core.highlights_darken(L, 30), L)
@@ -38,3 +38,15 @@ def test_auto_keeps_highlights_gentle_on_bright_unclipped_scene():
     assert auto._blown_share(dec, e) <= auto.CENTER_MAX_CLIPPED + 0.005
     L = auto._finished_luma(dec, e)
     assert float(np.median(L[45:58, 45:255])) > 0.78     # the white label still looks white
+
+
+def test_camera_offset_default_and_calibration_override():
+    core.CAMERA_EV.clear()
+    assert core.camera_ev("Sony ILCE-7M3") == -0.5        # built-in, measured on Lightroom exports
+    assert core.camera_ev("Some Other Camera") == 0.0
+    core.CAMERA_EV["Sony ILCE-7M3"] = -0.2                 # your own calibration wins
+    try:
+        assert core.camera_ev("Sony ILCE-7M3") == -0.2
+        assert core.camera_ev_all()["Sony ILCE-7M3"] == -0.2
+    finally:
+        core.CAMERA_EV.clear()

@@ -1,5 +1,25 @@
 # Changelog
 
+## v1.9.21
+
+- **Sony A7 III photos: preview matched to Lightroom.** Measured on five raws and their Lightroom
+  Classic exports, the preview showed A7 III files about 0.5 stops brighter than Lightroom at every
+  Highlights setting (even at -30), so auto exposure undershot and photos came out dark. The A7 III
+  now has a built-in -0.5 EV preview offset; your own *Calibrate preview to Lightroom* still
+  overrides it, and *Clear calibration* goes back to the built-in value. After this, four of the five
+  photos match Lightroom to within 0.1 stops (the fifth, with a Subject mask, 0.3).
+- **Highlights cost re-fitted** on the same five photos (Highlights -30 to -90): the pull on bright
+  unclipped tones is 0.15 at -100 (v1.9.20 guessed 0.25). Preview vs Lightroom brightness error:
+  0.12 before v1.9.20, 0.023 now (0..1 scale).
+- On those five photos, auto now proposes exposure +0.45 to +1.0 with Highlights -27 to 0 (was
+  0 to -0.35 and -30 to -90); median brightness goes from ~70-90 to ~110-120 out of 255.
+- **Auto white balance averages separate spots:** the near-white and near-black patches are grouped
+  into spots (touching patches = one surface), each spot gives its own neutral, and the spots are
+  averaged with weight growing only with the square root of their size, so one big off-white surface
+  can't outvote the rest; a spot that disagrees with the others is dropped. Confidence now also
+  needs several separate spots that agree. The note says how many spots were used. On the five test
+  photos the result moved by at most 40 K.
+
 ## v1.9.20
 
 - **Bright photos no longer come out of Lightroom dark and grey:** auto wrote Highlights -75 to -90 on

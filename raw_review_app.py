@@ -1151,7 +1151,7 @@ class CalibrateDialog(QtWidgets.QDialog):
         self.table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
         self.table.verticalHeader().setVisible(False)
         lay.addWidget(self.table, 1)
-        cur = ", ".join(f"{k} {v:+.2f} EV" for k, v in sorted(core.CAMERA_EV.items())) or "none"
+        cur = ", ".join(f"{k} {v:+.2f} EV" for k, v in sorted(core.camera_ev_all().items())) or "none"
         self.status = QtWidgets.QLabel(f"Current calibration: {cur}")
         self.status.setWordWrap(True)
         self.status.setStyleSheet("color:#999;font-size:11px;")
@@ -1201,7 +1201,7 @@ class CalibrateDialog(QtWidgets.QDialog):
             else:
                 results.append({"camera": dec.color.camera, "offset": off})
         prog.setValue(len(pairs))
-        self.rows = calib.summarize(results, core.CAMERA_EV)
+        self.rows = calib.summarize(results, core.camera_ev_all())
         self.table.setRowCount(len(self.rows))
         for i, r in enumerate(self.rows):
             cells = [r["camera"] or "(unknown camera)", str(r["photos"]), f"{r['change']:+.2f} EV brighter"
