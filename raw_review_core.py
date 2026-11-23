@@ -856,6 +856,11 @@ CAMERA_EV: dict = {}
 # (Adobe Standard, FE 50mm F1.8, Highlights -30..-90): the preview was ~0.5 stops brighter than
 # Lightroom at every Highlights setting, so auto exposure undershot and photos came out dark.
 CAMERA_EV_DEFAULT: dict = {"Sony ILCE-7M3": -0.5}
+# How that offset changes with the Exposure slider: {camera: stops of offset per stop of Exposure}.
+# Lightroom's Exposure isn't a plain multiply (positive Exposure rolls the highlights off), so a single
+# offset measured at Exposure 0 drifts when auto writes +1. Fitted by the calibration when the exports
+# cover a range of Exposure values; 0 (no slope) otherwise.
+CAMERA_EV_SLOPE: dict = {}
 
 
 # Lightroom's colour for cameras measured here, like a DNG profile's HueSatMap: per hue (evenly
@@ -913,9 +918,11 @@ def hue_sat_map(lin: np.ndarray, scales, shifts, values=None) -> np.ndarray:
     return np.stack([rr + m, gg + m, bb + m], axis=-1).astype(np.float32)
 
 
-def camera_ev(camera: str) -> float:
-    """The preview's offset for this camera: your calibration, else the built-in one, else 0."""
-    return float(CAMERA_EV.get(camera, CAMERA_EV_DEFAULT.get(camera, 0.0)))
+def camera_ev(camera: str, exposure: float = 0.0) -> float:
+    """The preview's offset for this camera at this Exposure: your calibration, else the built-in one,
+    else 0 (plus the calibrated slope with Exposure, if any)."""
+    base = float(CAMERA_EV.get(camera, CAMERA_EV_DEFAULT.get(camera, 0.0)))
+    return base + float(CAMERA_EV_SLOPE.get(camera, 0.0)) * float(exposure)
 
 
 def camera_ev_all() -> dict:
@@ -996,7 +1003,7 @@ def base_gamma(cam: np.ndarray, color: CameraColor, mul, exposure: float,
                highlights: float = 0.0) -> np.ndarray:
     """White balance + exposure + highlight recovery + shoulder + sRGB curve (no other tone sliders)."""
     model = color.model
-    exposure = exposure + camera_ev(getattr(color, "camera", ""))
+    exposure = exposure + camera_ev(getattr(color, "camera", ""), exposure)
     if model is not None:
         # DNG with its own profile: colour matrices + hue/sat map + look + tone curve
         lin = recover_highlights(model.render_linear(cam, mul, exposure, color.base_ev), highlights)

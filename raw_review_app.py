@@ -126,6 +126,7 @@ class Item:
         self.flip = 0                 # orientation (Lightroom's crop / Upright use the recorded frame)
         self.shot = core.ShotInfo()   # camera, lens, exposure settings, capture time
         self.raw_key = None           # the scene's metered light level (for matching photos in the same light)
+        self.scene_key = None         # how high- / low-key the scene is (for learning from your corrections)
         self.solo = None              # (exposure, temp, tint) auto chose for this photo on its own
         self.light_matched = False    # its auto values were matched to photos taken in the same light
         self.unsure = []              # why auto may be off for this photo (look at these first)
@@ -178,7 +179,7 @@ class DecodeTask(QRunnable):
                 if ex["edit"] is not None and getattr(self.opts, "use_existing", True):
                     chosen = ex["edit"]
                 res.update(edit=chosen, auto_edit=edit, existing=ex, wb=wb, st=st, thumb=make_thumb(dec, chosen),
-                           raw_key=auto.raw_key(dec))
+                           raw_key=auto.raw_key(dec), scene_key=auto.scene_key(dec))
                 try:
                     res["unsure"] = auto.unsure_reasons(dec, edit, wb)
                 except Exception:  # noqa: BLE001 - a nicety, never block a photo
@@ -1076,8 +1077,9 @@ class LearnDialog(QtWidgets.QDialog):
         self.table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
         self.table.verticalHeader().setVisible(False)
         lay.addWidget(self.table, 1)
-        note = QtWidgets.QLabel("Exposure becomes Brightness, Contrast becomes Punch, Vibrance becomes Colour; the "
-                                "others become an 'add' rule. The corrections used are then set aside, so they "
+        note = QtWidgets.QLabel("Exposure becomes Brightness (for the chosen camera only, when one is picked "
+                                "above), Contrast becomes Punch, Vibrance becomes Colour; 'bright / dark scenes' "
+                                "changes how much exposure follows the scene's key; the others become an 'add' rule. The corrections used are then set aside, so they "
                                 "aren't counted twice.")
         note.setWordWrap(True)
         note.setStyleSheet("color:#999;font-size:11px;")
@@ -1100,7 +1102,8 @@ class LearnDialog(QtWidgets.QDialog):
         self.checks = {}
         self.table.setRowCount(len(self.rows))
         for i, r in enumerate(self.rows):
-            fmt = (lambda v: f"{v:+.2f} EV") if r["key"] == "exposure" else \
+            fmt = (lambda v: f"{v:+.2f} EV per stop brighter scene") if r["key"] == "key_follow" else \
+                  (lambda v: f"{v:+.2f} EV") if r["key"] == "exposure" else \
                   (lambda v: f"{v:+.0f} K") if r["key"] == "temp" else (lambda v: f"{v:+.0f}")
             cells = [r["label"], f"{r['changed']} of {r['photos']}", fmt(r["mean"]), f"{r['agree']:.0%}"]
             for j, t in enumerate(cells):
@@ -1199,14 +1202,15 @@ class CalibrateDialog(QtWidgets.QDialog):
             if off is None:
                 skipped += 1
             else:
-                results.append({"camera": dec.color.camera, "offset": off})
+                results.append({"camera": dec.color.camera, "offset": off, "exposure": float(edit.exposure)})
         prog.setValue(len(pairs))
-        self.rows = calib.summarize(results, core.camera_ev_all())
+        self.rows = calib.summarize(results, core.camera_ev_all(), core.CAMERA_EV_SLOPE)
         self.table.setRowCount(len(self.rows))
         for i, r in enumerate(self.rows):
             cells = [r["camera"] or "(unknown camera)", str(r["photos"]), f"{r['change']:+.2f} EV brighter"
                      if r["change"] >= 0 else f"{-r['change']:.2f} EV darker", f"{r['spread']:.2f} EV",
-                     f"{r['new']:+.2f} EV" if r["ok"] else "not enough agreement" if r["photos"] >= calib.MIN_PAIRS
+                     (f"{r['new']:+.2f} EV" + (f" {r['new_slope']:+.2f}/EV" if r["new_slope"] else ""))
+                     if r["ok"] else "not enough agreement" if r["photos"] >= calib.MIN_PAIRS
                      else f"needs {calib.MIN_PAIRS}+ photos"]
             for j, t in enumerate(cells):
                 item = QtWidgets.QTableWidgetItem(t)
@@ -1214,7 +1218,8 @@ class CalibrateDialog(QtWidgets.QDialog):
                 self.table.setItem(i, j, item)
         self.status.setText(f"Compared {len(results)} photo(s)" + (f", skipped {skipped} (nearly black/white or "
                             "unreadable)" if skipped else "") + ". Apply sets the offset for the cameras marked "
-                            "with a new value.")
+                            "with a new value. Tip: include exports at Exposure 0, +1 and +2 and the offset "
+                            "is fitted per Exposure (/EV), which keeps auto accurate when it raises Exposure.")
         self.apply_btn.setEnabled(any(r["ok"] for r in self.rows))
 
 
@@ -2584,6 +2589,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if it.status == "loading":
                 it.status = "ready"
             it.raw_key = res.get("raw_key")
+            it.scene_key = res.get("scene_key")
             it.unsure = res.get("unsure") or []
             ae = it.auto_edit
             it.solo = (ae.exposure, ae.temp, ae.tint) if ae.wb_mode == "custom" else (ae.exposure, None, None)
@@ -3461,11 +3467,16 @@ class MainWindow(QtWidgets.QMainWindow):
         r = dlg.exec()
         if r == 2:
             core.CAMERA_EV.clear()
+            core.CAMERA_EV_SLOPE.clear()
             msg = "Calibration cleared."
         elif r == QtWidgets.QDialog.DialogCode.Accepted:
             done = [x for x in dlg.rows if x["ok"]]
             for x in done:
                 core.CAMERA_EV[x["camera"]] = x["new"]
+                if x.get("new_slope"):
+                    core.CAMERA_EV_SLOPE[x["camera"]] = x["new_slope"]
+                else:
+                    core.CAMERA_EV_SLOPE.pop(x["camera"], None)
             msg = "Calibrated: " + ", ".join(f"{x['camera']} {x['new']:+.2f} EV" for x in done)
         else:
             return
@@ -3502,7 +3513,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def _learn_wrote(self, it):
         """Remember what we just wrote to Lightroom for this photo."""
         d = self._learn_data()
-        d["written"][it.path] = {"settings": learn.snapshot(it.edit), "camera": it.shot.camera, "time": time.time()}
+        d["written"][it.path] = {"settings": learn.snapshot(it.edit), "camera": it.shot.camera, "time": time.time(),
+                                 "key": it.scene_key}
         d["corrections"].pop(it.path, None)                  # a new write: earlier corrections are history
         self._learn_timer.start()
 
@@ -3515,7 +3527,7 @@ class MainWindow(QtWidgets.QMainWindow):
         diffs = learn.correction(w["settings"], lr_edit)
         if diffs:
             d["corrections"][it.path] = {"camera": w.get("camera") or it.shot.camera, "diffs": diffs,
-                                         "seen": time.time()}
+                                         "seen": time.time(), "key": w.get("key")}
         else:
             d["corrections"].pop(it.path, None)
         self._learn_timer.start()
@@ -3555,8 +3567,10 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         if r != QtWidgets.QDialog.DialogCode.Accepted or not dlg.chosen():
             return
-        done = learn.apply_to_options(self.opts, dlg.rows, dlg.chosen())
         cam = dlg._cam()
+        tuning = {"camera_bias": auto.CAMERA_BIAS, "key_follow": auto.KEY_FOLLOW}
+        done = learn.apply_to_options(self.opts, dlg.rows, dlg.chosen(), camera=cam, tuning=tuning)
+        auto.KEY_FOLLOW = float(tuning.get("key_follow", auto.KEY_FOLLOW))
         for path in [p for p, c in d["corrections"].items() if cam is None or c.get("camera") == cam]:
             d["corrections"].pop(path)                       # used: don't count them twice
         self._learn_timer.start()
@@ -4321,6 +4335,11 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             core.CAMERA_EV.clear()
             core.CAMERA_EV.update({str(k): float(v) for k, v in (st.get("camera_ev") or {}).items()})
+            core.CAMERA_EV_SLOPE.clear()
+            core.CAMERA_EV_SLOPE.update({str(k): float(v) for k, v in (st.get("camera_ev_slope") or {}).items()})
+            auto.CAMERA_BIAS.clear()
+            auto.CAMERA_BIAS.update({str(k): float(v) for k, v in (st.get("camera_bias") or {}).items()})
+            auto.KEY_FOLLOW = float(st.get("key_follow", auto.KEY_FOLLOW))
         except (TypeError, ValueError, AttributeError):
             pass
         self.last_dir = st.get("last_dir", "") if os.path.isdir(st.get("last_dir", "") or "") else ""
@@ -4360,6 +4379,9 @@ class MainWindow(QtWidgets.QMainWindow):
                      "camera_look": auto.CAMERA_LOOK},
             "no_ai_masks": core.NO_AI_MASKS,
             "camera_ev": dict(core.CAMERA_EV),
+            "camera_ev_slope": dict(core.CAMERA_EV_SLOPE),
+            "camera_bias": dict(auto.CAMERA_BIAS),
+            "key_follow": auto.KEY_FOLLOW,
             "lens_vignette": core.LENS_VIGNETTE,
             "dng_profile": {k: getattr(dng_profile.OPTIONS, k) for k in dng_profile.OPTIONS.__dataclass_fields__},
             "geometry": base64.b64encode(bytes(self.saveGeometry())).decode("ascii"),

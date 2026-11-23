@@ -92,6 +92,17 @@ BLACKS_PULL = 0.6          # Auto levels moves the black point this share of the
 BLACKS_FLOOR = -40.0       # ...and never further than this
 TARGET_MEDIAN = 0.43       # metered brightness (see metered()): lands typical photos with the histogram's middle ~0.5
 CENTER_MAX_CLIPPED = 0.005 # Highlights is pulled down until no more than this share is blown
+# Scene key (see scene_key / exposure_target): TARGET_MEDIAN alone put every photo at the same
+# brightness, so white products and snow were pulled toward grey and dark scenes pushed up. The
+# scene's own key (how close its metered middle sits to its bright end, compared with an ordinary
+# scene) moves the target: a high-key scene is allowed to stay bright, a low-key one darker.
+SCENE_RANGE_TYPICAL = 2.3  # stops from the metered middle up to the bright end (98th pct) in an ordinary scene
+KEY_FOLLOW = 0.35          # stops of exposure per stop of scene key ("Learn from my Lightroom edits" tunes it)
+KEY_SHIFT = (-0.4, 0.6)    # how far the key may move exposure (darker, brighter); backlit subjects limit the first
+STOPS_PER_DISPLAY = 1.8    # one stop of metered display brightness ~ this many stops of Exposure
+# Your Lightroom corrections per camera ("Learn from my Lightroom edits"), stops added to auto exposure
+# on top of Brightness in My auto settings: {camera: EV}.
+CAMERA_BIAS: dict = {}
 # Contrast from the levels (see stretch_levels): after exposure is centred, Whites goes up until
 # this share of the photo is at white and Blacks down until this share is pure black, then
 # exposure is re-centred. Auto Contrast stays at 0; Punch in My auto settings widens or narrows these.
@@ -538,6 +549,8 @@ def active_rules(rules) -> dict:
 # fully, plain areas count METER_PLAIN as much, and the centre a little more than the edges.
 METER_PLAIN = 0.12         # weight of a perfectly plain area (detail areas = 1)
 METER_CENTRE = 0.5         # the frame's edges count this much of the centre
+METER_SUBJECT = 2.5        # a confidently found subject counts up to this many times more (subject metering)
+METER_SUBJECT_SPAN = 5.0   # stops: a "subject" spanning more than this sits on a hard light/dark edge (a window frame), not a subject
 
 
 def meter_weights(dec) -> np.ndarray:
@@ -562,7 +575,27 @@ def meter_weights(dec) -> np.ndarray:
     yy, xx = np.mgrid[0:h, 0:wd]
     r2 = ((xx + 0.5) / wd - 0.5) ** 2 + ((yy + 0.5) / h - 0.5) ** 2
     centre = METER_CENTRE + (1 - METER_CENTRE) * np.exp(-r2 / (2 * 0.3 ** 2))
-    w = ((METER_PLAIN + (1 - METER_PLAIN) * detail) * centre).astype(np.float32)
+    w = (METER_PLAIN + (1 - METER_PLAIN) * detail) * centre
+    # Subject metering: when the subject is small, the detail-weighted middle could still land on
+    # the background. A clear subject (the same one Select Subject / subject crop use) counts more.
+    try:
+        mm, mf, mc = core.estimate_subject(dec)
+        if mc > 0.3 and 0.03 < mf < 0.6:
+            sm = np.clip(cv2.resize(np.asarray(mm, np.float32), (wd, h), interpolation=cv2.INTER_AREA), 0.0, 1.0)
+            # the guess must be a textured thing, not the sharp edge of a window or a skyline: its
+            # inside (away from its own outline) has to carry detail, and it can't straddle a hard
+            # light/dark boundary
+            core_m = cv2.erode((sm > 0.5).astype(np.uint8), np.ones((k, k), np.uint8)) > 0
+            inside = L[core_m]
+            span = (math.log2(float(np.percentile(inside, 95)) / max(float(np.percentile(inside, 5)), 1e-5))
+                    if inside.size > 50 else 99.0)
+            textured = inside.size > 50 and float((detail[core_m] > 0.3).mean()) >= 0.5
+            if textured and span <= METER_SUBJECT_SPAN:
+                w = w * (1.0 + (METER_SUBJECT - 1.0) * min(mc, 1.0) * sm)
+                dec.masks["_meter_subject"] = True
+    except Exception:  # noqa: BLE001 - metering must never fail on the subject guess
+        pass
+    w = w.astype(np.float32)
     dec.masks["_meter"] = w
     dec.masks["_detail_share"] = float((detail > 0.3).mean())     # how much of the frame has detail
     return w
@@ -576,8 +609,42 @@ def _weighted_median(v: np.ndarray, w: np.ndarray) -> float:
 
 
 def metered(dec, edit) -> float:
-    """The finished photo's brightness as metered (detail- and centre-weighted median luminance)."""
+    """The finished photo's brightness as metered (detail-, centre- and subject-weighted median luminance).
+    A median, not a trimmed mean: with a textured subject against a bright plain window the weight
+    splits about evenly, and any averaging pulls in the window and leaves the subject dark."""
     return _weighted_median(_finished_luma(dec, edit), meter_weights(dec))
+
+
+def scene_key(dec) -> float:
+    """
+    How high-key (+) or low-key (-) the scene is, in stops: an ordinary scene's metered middle sits
+    about SCENE_RANGE_TYPICAL stops under its bright end; snow or white packaging much closer, a dark
+    room with a lamp much further. Measured on the raw data (before any edit), cached on the photo.
+    """
+    k = dec.masks.get("_scene_key")
+    if k is not None:
+        return k
+    L = np.maximum(_small(dec) @ core.LUMA, 1e-6)
+    mid = _weighted_median(L, meter_weights(dec))
+    top = float(np.percentile(L, 98))
+    k = float(np.clip(SCENE_RANGE_TYPICAL - math.log2(max(top, 1e-6) / max(mid, 1e-6)), -3.0, 3.0))
+    dec.masks["_scene_key"] = k
+    return k
+
+
+def key_shift(dec) -> float:
+    """Stops the scene's key moves the exposure target (see KEY_FOLLOW)."""
+    return float(np.clip(KEY_FOLLOW * scene_key(dec), *KEY_SHIFT))
+
+
+def exposure_target(dec, bias: float = 0.0) -> float:
+    """Metered brightness auto aims for: TARGET_MEDIAN, moved by the scene's key and your bias (stops)."""
+    return float(np.clip(TARGET_MEDIAN * 2.0 ** ((key_shift(dec) + bias) / STOPS_PER_DISPLAY), 0.22, 0.68))
+
+
+def camera_bias(dec) -> float:
+    """Your learned per-camera exposure correction (stops)."""
+    return float(CAMERA_BIAS.get(getattr(dec.color, "camera", ""), 0.0))
 
 
 # --------------------------------------------------------------------------
@@ -722,104 +789,128 @@ def _black_share(dec, edit) -> float:
     return float((mx <= (core.BLACK_LEVEL + 0.5) / 255.0).mean())
 
 
-def stretch_levels(dec, edit, strength=1.0, punch=0.0) -> str:
+def center_exposure(dec, edit, strength=1.0, bias=0.0) -> str:
+    """Exposure (and Highlights / Lights) only; see fit_tone."""
+    return fit_tone(dec, edit, strength, bias, stretch=False)[0]
+
+
+def fit_tone(dec, edit, strength=1.0, bias=0.0, punch=0.0, stretch=True) -> tuple:
     """
-    Contrast the way you'd do it with levels: Whites up until a sliver of the photo is at white,
-    Blacks down until a sliver is pure black, exposure re-centred so the midtones stay put.
-    Fills the whole range instead of bending the midtones with Contrast. Run after center_exposure.
+    Exposure, Highlights (+ tone curve Lights) and, with stretch, Whites / Blacks fitted together:
+    seek the exposure target, recover what's blown, stretch the levels, and go round again until
+    nothing moves. Exposure centring and the levels stretch used to run one after the other, each
+    re-centring Exposure, blending with strength and rounding to 0.05 on its own, so small errors
+    piled up. Here the strength blend and the rounding happen once, at the end.
+    The target follows the scene's key (exposure_target) plus your bias and the camera's learned bias.
+    Returns (exposure note, levels note or None).
     """
-    s_wh, s_bl, s_exp = edit.whites, edit.blacks, edit.exposure
-    k = min(max(1.0 + punch / 50.0, 0.25), 2.0)          # Punch: more / less of the range clipped
+    start = edit.copy()
+    t = edit.copy()
+    target = exposure_target(dec)                            # the scene's key; your bias is added below as exact EV
+    bias = bias + camera_bias(dec)
     tone_blown = lambda d, e: _blown_share(d, e, colour=False)
-    white_lim = max(STRETCH_WHITE_CLIP * k, tone_blown(dec, edit))
-    black_lim = max(STRETCH_BLACK_CLIP * k, _black_share(dec, edit))
-    trial = edit.copy()
-    target = metered(dec, edit)                          # the brightness centring (and your bias) chose
+
+    def seek():
+        for _ in range(8):
+            err = math.log2(target / max(metered(dec, t), 1e-3))
+            if abs(err) < 0.02:
+                break
+            new = min(max(t.exposure + min(max(STOPS_PER_DISPLAY * err, -1.5), 1.5), -2.5), 3.5)
+            if abs(new - t.exposure) < 0.01:
+                break
+            t.exposure = new
+
+    def recover():
+        """Least-negative Highlights that keeps no more than CENTER_MAX_CLIPPED blown."""
+        if tone_blown(dec, t) <= CENTER_MAX_CLIPPED:
+            if t.highlights < start.highlights:       # an earlier round pulled harder than now needed
+                t.highlights = min(start.highlights, 0)
+            return
+        trial = t.copy()
+        trial.highlights = -100
+        if tone_blown(dec, trial) > CENTER_MAX_CLIPPED:
+            t.highlights = -100
+            return
+        lo, hi = -100.0, float(min(t.highlights, 0))
+        for _ in range(7):
+            trial.highlights = (lo + hi) / 2
+            lo, hi = (trial.highlights, hi) if tone_blown(dec, trial) <= CENTER_MAX_CLIPPED else (lo, trial.highlights)
+        t.highlights = int(math.floor(lo))
+
+    def lights():
+        crush = max(-t.highlights, 0)
+        t.lights = int(min(round((crush - 30) * 0.5), 35)) if crush > 30 else start.lights
+
+    k = min(max(1.0 + punch / 50.0, 0.25), 2.0)              # Punch: more / less of the range clipped
+    white_lim = black_lim = None
 
     def ok_with(key, limit, measure):
         def ok(v):
+            trial = t.copy()
             setattr(trial, key, v)
             return measure(dec, trial) <= limit
         return ok
 
-    for _ in range(2):
-        trial.whites = _furthest(ok_with("whites", white_lim, tone_blown), *STRETCH_WHITES)
-        trial.blacks = _furthest(ok_with("blacks", black_lim, _black_share), *STRETCH_BLACKS)
-        for _ in range(6):                               # the stretch moved the midtones: put them back
-            err = math.log2(target / max(metered(dec, trial), 1e-3))
-            if abs(err) < 0.03:
+    def rounds(n):
+        nonlocal white_lim, black_lim
+        for _ in range(n):
+            before = (t.exposure, t.highlights, t.whites, t.blacks)
+            seek()
+            recover()
+            lights()
+            seek()
+            if stretch:
+                if white_lim is None:                        # what the photo clips anyway is allowed
+                    white_lim = max(STRETCH_WHITE_CLIP * k, tone_blown(dec, t))
+                    black_lim = max(STRETCH_BLACK_CLIP * k, _black_share(dec, t))
+                t.whites = _furthest(ok_with("whites", white_lim, tone_blown), *STRETCH_WHITES)
+                t.blacks = _furthest(ok_with("blacks", black_lim, _black_share), *STRETCH_BLACKS)
+                seek()
+                # re-centring may have pushed the brightest parts over again: back Whites off if so
+                t.whites = _furthest(ok_with("whites", white_lim, tone_blown), STRETCH_WHITES[0], t.whites)
+            after = (t.exposure, t.highlights, t.whites, t.blacks)
+            if (abs(after[0] - before[0]) < 0.03 and abs(after[1] - before[1]) < 2
+                    and abs(after[2] - before[2]) < 2 and abs(after[3] - before[3]) < 2):
                 break
-            trial.exposure = min(max(trial.exposure + min(max(1.8 * err, -1.0), 1.0), -5.0), 5.0)
-    trial.whites = _furthest(ok_with("whites", white_lim, tone_blown), STRETCH_WHITES[0], trial.whites)
 
-    _set(edit, "whites", _scaled(trial.whites, s_wh, strength))
-    _set(edit, "blacks", _scaled(trial.blacks, s_bl, strength))
-    edit.exposure = float(round(round(_scaled(trial.exposure, s_exp, strength) / 0.05) * 0.05, 2))
-    return f"Auto levels: blacks {edit.blacks:+d}, whites {edit.whites:+d} (stretched to fill the range)"
-
-
-def center_exposure(dec, edit, strength=1.0, bias=0.0) -> str:
-    """
-    Put the finished photo's histogram in the middle, the way you'd do it by hand:
-    expose for the midtones, then crush Highlights as far as needed to bring the bright
-    areas back under white, and lift the tone curve's Lights a little when Highlights had
-    to go hard, so the upper midtones don't go flat. Auto exposure alone judged the raw
-    data before the tone tools and held back for bright spots, so photos came out dark.
-    Tone tools are not re-run here (they would fight the change).
-    """
-    s_exp, s_hl, s_lights = edit.exposure, edit.highlights, edit.lights
-
-    def clipped(e):
-        return _blown_share(dec, e, colour=False)
-
-    def seek():
-        for _ in range(8):
-            med = metered(dec, edit)
-            err = math.log2(TARGET_MEDIAN / max(med, 1e-3))
-            if abs(err) < 0.03:
-                break
-            step = min(max(1.8 * err, -1.5), 1.5)    # display brightness ~ exposure^(1/2.2)
-            new = min(max(edit.exposure + step, -2.5), 3.5)
-            if abs(new - edit.exposure) < 0.02:
-                break
-            edit.exposure = new
-
-    def recover():
-        """Least-negative Highlights that keeps no more than CENTER_MAX_CLIPPED blown."""
-        if clipped(edit) <= CENTER_MAX_CLIPPED:
-            return
-        trial = edit.copy()
-        trial.highlights = -100
-        if clipped(trial) > CENTER_MAX_CLIPPED:      # truly blown (lights, sun): crush fully
-            edit.highlights = -100
-            return
-        lo, hi = -100, min(edit.highlights, 0)
-        for _ in range(7):
-            trial.highlights = (lo + hi) / 2
-            lo, hi = (trial.highlights, hi) if clipped(trial) <= CENTER_MAX_CLIPPED else (lo, trial.highlights)
-        edit.highlights = int(math.floor(lo))
-
-    for _ in range(3):
-        seek()
+    rounds(4)
+    if bias:
+        # Brightness / camera correction: exactly that many stops on top, then the brightness that
+        # gives is what the levels and Highlights are fitted around
+        t.exposure = min(max(t.exposure + bias, -5.0), 5.0)
+        target = metered(dec, t)
         recover()
-        crush = max(-edit.highlights, 0)                # how hard Highlights is pulled down
-        if crush > 30:
-            edit.lights = int(min(round((crush - 30) * 0.5), 35))
-    seek()
+        lights()
+        if stretch:
+            rounds(2)
+        elif abs(math.log2(target / max(metered(dec, t), 1e-3))) > 0.02:
+            seek()
 
     def blend(v0, v1):
         return v0 + (v1 - v0) * strength
-    ev = blend(s_exp, edit.exposure) + bias
+    ev = blend(start.exposure, t.exposure)
     edit.exposure = float(min(max(round(round(ev / 0.05) * 0.05, 2), -5.0), 5.0))
-    _set(edit, "highlights", blend(s_hl, edit.highlights))
-    if edit.lights != s_lights:
-        _set(edit, "lights", blend(s_lights, edit.lights))
+    _set(edit, "highlights", blend(start.highlights, t.highlights))
+    if t.lights != start.lights:
+        _set(edit, "lights", blend(start.lights, t.lights))
+    levels_note = None
+    if stretch:
+        _set(edit, "whites", blend(start.whites, t.whites))
+        _set(edit, "blacks", blend(start.blacks, t.blacks))
+        levels_note = f"Auto levels: blacks {edit.blacks:+d}, whites {edit.whites:+d} (stretched to fill the range)"
+    shift = key_shift(dec)
     note = f"Auto exposure: {edit.exposure:+.2f} EV (histogram centred, metered on the detailed parts"
+    if dec.masks.get("_meter_subject"):
+        note += " and the subject"
+    if abs(shift) >= 0.05:
+        note += f"; {'bright' if shift > 0 else 'dark'} scene kept {'brighter' if shift > 0 else 'darker'} {shift:+.2f}"
+    if camera_bias(dec):
+        note += f"; camera correction {camera_bias(dec):+.2f}"
     if edit.highlights < 0:
         note += f"; highlights {edit.highlights:+d} to recover bright areas"
-    if edit.lights != s_lights:
+    if edit.lights != start.lights:
         note += f", tone curve lights {edit.lights:+d}"
-    return note + ")"
+    return note + ")", levels_note
 
 
 # --------------------------------------------------------------------------
@@ -1005,10 +1096,10 @@ def run_auto(dec, edit, groups, opts: AutoOptions | None = None, user_rules: boo
                        and "contrast" in groups and "exposure" in groups)
 
     def centre():
-        replace_note(edit, "Auto exposure",
-                     center_exposure(dec, edit, s, opts.exposure_bias))
-        if levels_contrast:
-            replace_note(edit, "Auto levels", stretch_levels(dec, edit, s, opts.punch))
+        exp_note, lev_note = fit_tone(dec, edit, s, opts.exposure_bias, opts.punch, stretch=levels_contrast)
+        replace_note(edit, "Auto exposure", exp_note)
+        if lev_note:
+            replace_note(edit, "Auto levels", lev_note)
 
     for i, g in enumerate(GROUP_ORDER):
         if not centred and i > centre_at:            # tone tools done: centre the histogram
@@ -1026,7 +1117,8 @@ def run_auto(dec, edit, groups, opts: AutoOptions | None = None, user_rules: boo
             out["level"] = apply_level_mode(dec, edit, opts.level_mode, opts.allow_upright)
         elif g == "exposure":
             if camera_look:
-                look_notes = match_camera_look(dec, edit, groups, s, opts.exposure_bias, opts.punch)
+                look_notes = match_camera_look(dec, edit, groups, s, opts.exposure_bias + camera_bias(dec),
+                                               opts.punch)
                 replace_note(edit, "Auto exposure", look_notes["exposure"])
             else:
                 # first estimate; center_exposure() refines it and adds the bias

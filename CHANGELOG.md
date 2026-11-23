@@ -1,5 +1,28 @@
 # Changelog
 
+## v1.9.25
+
+- **Bright and dark scenes keep their character:** auto exposure put every photo at the same
+  metered brightness, so white products, snow and light walls were pulled toward grey, and dark
+  scenes were pushed up. Auto now measures the scene's key (how close its metered middle sits to its
+  bright end, compared with an ordinary scene) and lets a high-key scene stay up to 0.6 EV brighter and
+  a low-key one up to 0.4 EV darker. The exposure note says when this happened.
+- **Exposure, Highlights and Whites / Blacks fitted together:** centring the exposure and stretching
+  the levels ran one after the other, each re-centring Exposure, blending with Strength and rounding
+  on its own, so small errors piled up. They now go round together until nothing moves, and Strength
+  and rounding are applied once. Brightness (and the per-camera correction below) is still exact EV.
+- **Subject metering:** when there's a clear, textured subject (the same one Select Subject uses), it
+  counts up to 2.5x more in the metering, so a small subject isn't exposed for its background. A guess
+  that sits on a hard light/dark edge (a window frame, a skyline) is ignored.
+- **Calibration follows Exposure:** *Calibrate preview to Lightroom* now fits the offset as a line in
+  Exposure when your exports cover a range (export a few at Exposure 0, +1 and +2). Lightroom's
+  Exposure rolls the highlights off as it goes up, so an offset measured at 0 drifted at the +0.5..+1
+  auto writes. Shown as e.g. "-0.50 EV +0.10/EV".
+- **Learn from my Lightroom edits, per camera and per scene:** with a camera picked, an Exposure
+  correction now becomes that camera's own correction instead of Brightness for every camera. A new
+  row, *Exposure in bright / dark scenes*, appears when your Exposure corrections line up with how
+  bright the scene was, and tunes how much auto exposure follows the scene's key.
+
 ## v1.9.24
 
 - **More colour from auto:** the saturation target was set for ordinary scenes (0.30), so

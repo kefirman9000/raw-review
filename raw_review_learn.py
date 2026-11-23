@@ -18,6 +18,13 @@ LEARN_KEYS = {
 }
 MIN_PHOTOS = 3             # corrected photos needed before suggesting anything
 MIN_AGREE = 0.7            # share of them that must change the setting in the same direction
+# Bright / dark scenes: if your Exposure corrections line up with how high- or low-key the scene was
+# (auto.scene_key), the exposure target follows the scene's key too much or too little. Fitted as
+# correction = a + b * key; b is added to auto.KEY_FOLLOW, a becomes the plain Brightness.
+KEY_MIN_PHOTOS = 5
+KEY_MIN_SPAN = 1.0         # stops of scene key the photos must cover
+KEY_MIN_SLOPE = 0.08       # EV per stop of key worth changing
+KEY_MIN_CORR = 0.5         # how well the line must explain the corrections
 LABELS = {"exposure": "Exposure", "contrast": "Contrast", "highlights": "Highlights", "shadows": "Shadows",
           "whites": "Whites", "blacks": "Blacks", "vibrance": "Vibrance", "saturation": "Saturation",
           "temp": "Temperature (K)", "tint": "Tint"}
@@ -66,20 +73,59 @@ def summarize(records: list[dict], camera: str | None = None) -> list[dict]:
         rows.append({"key": k, "label": LABELS[k], "photos": len(recs), "changed": len(a),
                      "mean": mean, "agree": agree,
                      "suggest": len(a) >= MIN_PHOTOS and agree >= MIN_AGREE and abs(mean) >= floor})
+    kr = key_row(recs)
+    if kr is not None:
+        rows.append(kr)
     return rows
 
 
-def apply_to_options(opts, rows: list[dict], keys: set) -> list[str]:
-    """Fold the chosen suggestions into My auto settings (AutoOptions). Returns what changed."""
+def key_row(recs: list[dict]) -> dict | None:
+    """The bright/dark-scene row: do your Exposure corrections depend on the scene's key?
+    Uses every corrected photo that has a scene key (no Exposure change counts as 0)."""
+    pts = [(float(r["key"]), float(r.get("diffs", {}).get("exposure", 0.0)))
+           for r in recs if r.get("key") is not None]
+    if len(pts) < 3:
+        return None
+    x, y = (np.array(v, float) for v in zip(*pts))
+    if float(x.max() - x.min()) < 0.3 or float(np.std(y)) < 1e-6:
+        return None
+    b, a = np.polyfit(x, y, 1)
+    r = float(np.corrcoef(x, y)[0, 1])
+    agree = r * r
+    return {"key": "key_follow", "label": "Exposure in bright / dark scenes", "photos": len(recs),
+            "changed": len(pts), "mean": float(b), "intercept": float(a), "agree": agree,
+            "suggest": (len(pts) >= KEY_MIN_PHOTOS and float(x.max() - x.min()) >= KEY_MIN_SPAN
+                        and abs(b) >= KEY_MIN_SLOPE and abs(r) >= KEY_MIN_CORR)}
+
+
+def apply_to_options(opts, rows: list[dict], keys: set, camera: str | None = None,
+                     tuning: dict | None = None) -> list[str]:
+    """Fold the chosen suggestions into My auto settings (AutoOptions). Returns what changed.
+    camera: the corrections came from this camera alone, so an Exposure correction goes to that
+    camera's own bias (tuning["camera_bias"]) instead of Brightness for every camera.
+    tuning: {"camera_bias": {camera: EV}, "key_follow": float}, updated in place."""
     done = []
     rules = dict(opts.rules or {})
+    tuning = tuning if tuning is not None else {}
+    kr = next((r for r in rows if r["key"] == "key_follow"), None)
     for r in rows:
         k, m = r["key"], r["mean"]
         if k not in keys:
             continue
-        if k == "exposure":
-            opts.exposure_bias = round(round((opts.exposure_bias + m) / 0.05) * 0.05, 2)
-            done.append(f"Brightness {opts.exposure_bias:+.2f} EV")
+        if k == "key_follow":
+            kf = float(np.clip(tuning.get("key_follow", 0.35) + m, 0.0, 0.8))
+            tuning["key_follow"] = round(kf, 2)
+            done.append(f"Bright / dark scenes: exposure follows the scene {tuning['key_follow']:.2f} EV per stop")
+        elif k == "exposure":
+            if kr is not None and "key_follow" in keys:      # the line's intercept, not the plain median
+                m = kr["intercept"]
+            if camera:
+                cb = tuning.setdefault("camera_bias", {})
+                cb[camera] = round(round((cb.get(camera, 0.0) + m) / 0.05) * 0.05, 2)
+                done.append(f"Brightness for {camera} {cb[camera]:+.2f} EV")
+            else:
+                opts.exposure_bias = round(round((opts.exposure_bias + m) / 0.05) * 0.05, 2)
+                done.append(f"Brightness {opts.exposure_bias:+.2f} EV")
         elif k == "contrast":
             opts.punch = float(np.clip(round(opts.punch + m / 0.4), -50, 50))     # punch adds 0.4 contrast per step
             done.append(f"Punch {opts.punch:+.0f}")

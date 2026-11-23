@@ -43,19 +43,43 @@ def find_pairs(raw_paths: list[str], export_dir: str) -> list[tuple[str, str]]:
     return pairs
 
 
-def summarize(results: list[dict], current: dict) -> list[dict]:
+SLOPE_MIN_PAIRS = 3    # photos before a slope with Exposure is fitted...
+SLOPE_MIN_SPAN = 0.75  # ...and they must cover at least this range of Exposure (stops)
+SLOPE_LIMIT = 0.3      # stops of offset per stop of Exposure, at most
+
+
+def summarize(results: list[dict], current: dict, current_slope: dict | None = None) -> list[dict]:
     """
-    results: [{"camera": str, "offset": float}] (offset = stops Lightroom is brighter than the
-    preview, measured with the current calibration applied). Returns per camera: photos,
-    change (median), spread (interquartile range), new (current + change), ok.
+    results: [{"camera": str, "offset": float, "exposure": float (optional)}] (offset = stops
+    Lightroom is brighter than the preview, measured with the current calibration applied).
+    Returns per camera: photos, change (median), spread (interquartile range), new (current + change),
+    slope / new_slope (offset per stop of Exposure), ok.
+
+    When the exports cover a range of Exposure values (export a few photos at Exposure 0, +1 and +2),
+    the offset is fitted as a line in Exposure instead of one number: Lightroom's Exposure rolls the
+    highlights off as it goes up, so an offset measured at 0 drifts at the +0.5..+1 auto writes.
+    The spread is then measured around that line.
     """
+    current_slope = current_slope or {}
     rows = []
     for cam in sorted({r["camera"] for r in results}):
-        v = np.array([r["offset"] for r in results if r["camera"] == cam], float)
-        change = float(np.median(v))
-        spread = float(np.subtract(*np.percentile(v, [75, 25]))) if len(v) > 1 else 0.0
+        rs = [r for r in results if r["camera"] == cam]
+        v = np.array([r["offset"] for r in rs], float)
+        x = np.array([float(r.get("exposure", 0.0) or 0.0) for r in rs], float)
         cur = float(current.get(cam, 0.0))
+        cur_slope = float(current_slope.get(cam, 0.0))
+        slope = 0.0
+        if len(v) >= SLOPE_MIN_PAIRS and float(x.max() - x.min()) >= SLOPE_MIN_SPAN:
+            b, a = np.polyfit(x, v, 1)
+            slope = float(np.clip(b, -SLOPE_LIMIT, SLOPE_LIMIT))
+            resid = v - slope * x
+            change = float(np.median(resid))
+            spread = float(np.subtract(*np.percentile(resid, [75, 25])))
+        else:
+            change = float(np.median(v))
+            spread = float(np.subtract(*np.percentile(v, [75, 25]))) if len(v) > 1 else 0.0
         rows.append({"camera": cam, "photos": len(v), "change": round(change, 2), "spread": round(spread, 2),
                      "current": cur, "new": round(cur + change, 2),
+                     "slope": round(slope, 3), "new_slope": round(cur_slope + slope, 3),
                      "ok": len(v) >= MIN_PAIRS and spread <= MAX_SPREAD and cam != ""})
     return rows
